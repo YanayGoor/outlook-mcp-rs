@@ -25,8 +25,9 @@ use chrono::Datelike;
 use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
-    CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate,
-    OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate,
+    CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, InlineImage,
+    InlineImageSource, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate,
+    ValidatedInlineImage, validate_inline_images,
 };
 
 /// Matches `MAX_EMAIL_COUNT` in `client.py`.
@@ -690,6 +691,99 @@ fn attach_files(mail: &IDispatch, paths: &[String]) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// Owns the temp dirs holding decoded inline-image data and removes them
+/// when dropped, so they're cleaned up after `Save`/`Send` and on every
+/// error path alike.
+#[derive(Default)]
+struct InlineTempDirs(Vec<std::path::PathBuf>);
+
+impl InlineTempDirs {
+    /// Create a fresh, uniquely named dir under the system temp dir (one per
+    /// image, so equal filenames can't collide) and track it for cleanup.
+    fn create(&mut self) -> Result<std::path::PathBuf, ToolError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "outlook-mcp-rs-inline-{}-{nanos}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir)
+            .map_err(|e| ToolError::new(format!("could not create temp dir for inline image: {e}")))?;
+        self.0.push(dir.clone());
+        Ok(dir)
+    }
+}
+
+impl Drop for InlineTempDirs {
+    fn drop(&mut self) {
+        for dir in &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Validate `inline_images` (if any) before any COM item is created.
+fn validated_inline_images(images: Option<&[InlineImage]>, html: bool)
+    -> Result<Vec<ValidatedInlineImage>, ToolError> {
+    match images {
+        Some(images) if !images.is_empty() => validate_inline_images(images, html),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Attach validated inline images as hidden Content-ID attachments the HTML
+/// body references via `cid:CONTENT_ID`. Base64 data is written to a temp
+/// file first (tracked in `temp` for cleanup), since `Attachments.Add` only
+/// takes a path.
+fn attach_inline_images(
+    mail: &IDispatch,
+    images: &[ValidatedInlineImage],
+    temp: &mut InlineTempDirs,
+) -> Result<(), ToolError> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let atts = to_disp(get_property(mail, "Attachments")?)?;
+    for img in images {
+        let path = match &img.source {
+            InlineImageSource::Path(p) => p.clone(),
+            InlineImageSource::Data(bytes) => {
+                let file = temp.create()?.join(&img.filename);
+                std::fs::write(&file, bytes).map_err(|e| {
+                    ToolError::new(format!("could not write inline image {:?} to a temp file: {e}", img.content_id))
+                })?;
+                file.to_string_lossy().into_owned()
+            }
+        };
+        // Position 0: don't render an attachment icon in the body.
+        let att = to_disp(call_method(&atts, "Add", &mut [
+            variant_from_str(&path),
+            variant_from_i32(c::OL_BY_VALUE),
+            variant_from_i32(0),
+            variant_from_str(&img.filename),
+        ])?)?;
+        let pa = to_disp(get_property(&att, "PropertyAccessor")?)?;
+        call_method(&pa, "SetProperty", &mut [
+            variant_from_str(c::PR_ATTACH_CONTENT_ID),
+            variant_from_str(&img.content_id),
+        ])?;
+        call_method(&pa, "SetProperty", &mut [
+            variant_from_str(c::PR_ATTACH_MIME_TAG),
+            variant_from_str(&img.mime_type),
+        ])?;
+        call_method(&pa, "SetProperty", &mut [
+            variant_from_str(c::PR_ATTACHMENT_HIDDEN),
+            variant_from_bool(true),
+        ])?;
+    }
+    Ok(())
+}
+
 impl OutlookClient for WindowsOutlookClient {
     // ---- Email (implemented in Task 12) --------------------------------
 
@@ -945,18 +1039,23 @@ impl OutlookClient for WindowsOutlookClient {
         bcc: Option<Vec<String>>,
         html: bool,
         attachments: Option<Vec<String>>,
+        inline_images: Option<Vec<InlineImage>>,
     ) -> Result<Value, ToolError> {
         if to.is_empty() {
             return Err(ToolError::new(
                 "send_email requires at least one recipient in 'to'.",
             ));
         }
+        let images = validated_inline_images(inline_images.as_deref(), html)?;
         self.with_com(|| {
             let (app, _ns) = mapi()?;
             let mail = compose(&app, &to, &subject, &body, cc.as_deref(), bcc.as_deref(), html)?;
             if let Some(atts) = attachments.as_deref() {
                 attach_files(&mail, atts)?;
             }
+            // Dropped at the end of this closure: temp files outlive Send.
+            let mut temp = InlineTempDirs::default();
+            attach_inline_images(&mail, &images, &mut temp)?;
             call_method(&mail, "Send", &mut [])?;
             Ok(json!({"status": "sent", "to": to.join("; "), "subject": subject}))
         })
@@ -971,13 +1070,18 @@ impl OutlookClient for WindowsOutlookClient {
         bcc: Option<Vec<String>>,
         html: bool,
         attachments: Option<Vec<String>>,
+        inline_images: Option<Vec<InlineImage>>,
     ) -> Result<Value, ToolError> {
+        let images = validated_inline_images(inline_images.as_deref(), html)?;
         self.with_com(|| {
             let (app, _ns) = mapi()?;
             let mail = compose(&app, &to, &subject, &body, cc.as_deref(), bcc.as_deref(), html)?;
             if let Some(atts) = attachments.as_deref() {
                 attach_files(&mail, atts)?;
             }
+            // Dropped at the end of this closure: temp files outlive Save.
+            let mut temp = InlineTempDirs::default();
+            attach_inline_images(&mail, &images, &mut temp)?;
             call_method(&mail, "Save", &mut [])?; // Save first so EntryID exists
             let id = make_id(&mail)?;
             Ok(json!({"status": "draft_saved", "id": id, "subject": subject}))

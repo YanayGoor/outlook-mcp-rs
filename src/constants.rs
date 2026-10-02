@@ -95,6 +95,14 @@ pub const OL_NOTE_COLOR_PINK: i32 = 2;
 pub const OL_NOTE_COLOR_YELLOW: i32 = 3;
 pub const OL_NOTE_COLOR_WHITE: i32 = 4;
 
+// OlAttachmentType (Attachments.Add)
+pub const OL_BY_VALUE: i32 = 1;
+
+// MAPI attachment properties (PropertyAccessor schema names)
+pub const PR_ATTACH_CONTENT_ID: &str = "http://schemas.microsoft.com/mapi/proptag/0x3712001F";
+pub const PR_ATTACH_MIME_TAG: &str = "http://schemas.microsoft.com/mapi/proptag/0x370E001F";
+pub const PR_ATTACHMENT_HIDDEN: &str = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B";
+
 pub fn folder_name_to_id(name: &str) -> Option<i32> {
     match name.to_lowercase().as_str() {
         "inbox" => Some(OL_FOLDER_INBOX),

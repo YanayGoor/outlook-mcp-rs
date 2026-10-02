@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.103"
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4.45"
 constant_time_eq = "0.3"

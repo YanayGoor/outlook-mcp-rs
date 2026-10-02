@@ -40,6 +40,51 @@ pub struct EmailUpdate {
     pub importance: Option<String>,         // "low" | "normal" | "high"
 }
 
+/// One image to embed in an HTML body as a hidden Content-ID attachment
+/// (`send_email` / `create_draft` `inline_images`). The body references it
+/// as `<img src="cid:CONTENT_ID">`. Also the tool-layer argument type, so
+/// the field docs below are the public schema descriptions.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct InlineImage {
+    /// Content-ID the HTML body references as <img src="cid:CONTENT_ID">, e.g. "logo".
+    pub content_id: String,
+    /// Local image file path. Give exactly one of `path` or `data_base64`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Base64-encoded image bytes (a "data:image/png;base64," prefix is
+    /// accepted). Give exactly one of `path` or `data_base64`.
+    #[serde(default)]
+    pub data_base64: Option<String>,
+    /// Attachment file name; defaults to the path's file name, or
+    /// CONTENT_ID plus an extension.
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// MIME type like "image/png"; guessed from the file name or the data
+    /// when omitted.
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+/// Where a validated inline image's bytes come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineImageSource {
+    /// An existing local file, attached as-is.
+    Path(String),
+    /// Decoded base64 bytes; the COM layer writes them to a temp file first,
+    /// since `Attachments.Add` only takes a path.
+    Data(Vec<u8>),
+}
+
+/// An [`InlineImage`] after [`validate_inline_images`]: normalized
+/// content id, resolved bytes source, safe filename and MIME type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedInlineImage {
+    pub content_id: String,
+    pub source: InlineImageSource,
+    pub filename: String,
+    pub mime_type: String,
+}
+
 /// All changes `update_task` can apply to one existing task. Every field
 /// except `task_id` is optional; supplying several applies all of them.
 /// `mark_complete: Some(true)` replaces the retired standalone
@@ -198,10 +243,12 @@ pub trait OutlookClient: Send + Sync {
         -> Result<EmailDetail, ToolError>;
     fn send_email(&self, to: Vec<String>, subject: String, body: String,
         cc: Option<Vec<String>>, bcc: Option<Vec<String>>, html: bool,
-        attachments: Option<Vec<String>>) -> Result<Value, ToolError>;
+        attachments: Option<Vec<String>>, inline_images: Option<Vec<InlineImage>>)
+        -> Result<Value, ToolError>;
     fn create_draft(&self, to: Vec<String>, subject: String, body: String,
         cc: Option<Vec<String>>, bcc: Option<Vec<String>>, html: bool,
-        attachments: Option<Vec<String>>) -> Result<Value, ToolError>;
+        attachments: Option<Vec<String>>, inline_images: Option<Vec<InlineImage>>)
+        -> Result<Value, ToolError>;
     fn reply_email(&self, email_id: String, body: String, reply_all: bool,
         html: bool, send: bool, attachments: Option<Vec<String>>)
         -> Result<Value, ToolError>;
@@ -403,6 +450,155 @@ pub fn common_free(people: &[PersonAvailability], treat_as_free: &[String]) -> V
         });
     }
     windows
+}
+
+
+// ---- inline images (send_email / create_draft) --------------------------
+
+/// `"<cid:logo>"` / `"cid:logo"` / `"logo"` -> `"logo"`.
+pub fn normalize_content_id(raw: &str) -> String {
+    let mut cid = raw.trim();
+    if cid.len() >= 2 && cid.starts_with('<') && cid.ends_with('>') {
+        cid = cid[1..cid.len() - 1].trim();
+    }
+    if cid.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:")) {
+        cid = cid[4..].trim();
+    }
+    cid.to_string()
+}
+
+/// Strictly decode inline-image base64, accepting an optional
+/// `data:<mime>;base64,` prefix and embedded whitespace/newlines.
+pub fn decode_inline_base64(raw: &str, cid: &str) -> Result<Vec<u8>, ToolError> {
+    use base64::Engine as _;
+    let mut text = raw.trim();
+    if text.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
+        match text.split_once(',') {
+            Some((header, rest)) if header.to_ascii_lowercase().contains(";base64") => text = rest,
+            _ => {
+                return Err(ToolError::new(format!(
+                    "inline image {cid:?}: data URI must be base64-encoded"
+                )))
+            }
+        }
+    }
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|_| ToolError::new(format!("inline image {cid:?}: data_base64 is not valid base64")))?;
+    if data.is_empty() {
+        return Err(ToolError::new(format!("inline image {cid:?}: data_base64 is empty")));
+    }
+    Ok(data)
+}
+
+/// Magic-number sniffing for base64 images given without filename/mime_type.
+pub fn sniff_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// MIME type from a file name's extension (common image types only).
+pub fn mime_from_filename(filename: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(filename).extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" | "jpe" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "ico" => "image/x-icon",
+        _ => return None,
+    })
+}
+
+/// File extension (with the dot) for a MIME type, or `""` if unknown.
+pub fn extension_for_mime(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/png" => ".png",
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/bmp" => ".bmp",
+        "image/svg+xml" => ".svg",
+        "image/tiff" => ".tif",
+        "image/x-icon" | "image/vnd.microsoft.icon" => ".ico",
+        _ => "",
+    }
+}
+
+/// Validate every inline image FIRST (so a bad one fails before any COM
+/// item is created, sent or saved) and normalize each to a
+/// [`ValidatedInlineImage`]. Requires `html`; each entry needs a non-empty
+/// content id (unique, case-insensitively) and exactly one of
+/// `path` (must exist) / `data_base64` (must decode). The MIME type comes
+/// from `mime_type`, else the filename extension, else the data's magic
+/// bytes, else `application/octet-stream`.
+pub fn validate_inline_images(images: &[InlineImage], html: bool)
+    -> Result<Vec<ValidatedInlineImage>, ToolError> {
+    if !html {
+        return Err(ToolError::new(
+            "inline_images requires html=true (reference them in the HTML body as <img src=\"cid:CONTENT_ID\">).",
+        ));
+    }
+    let non_empty = |v: &Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let mut out = Vec::with_capacity(images.len());
+    let mut seen = std::collections::HashSet::new();
+    for img in images {
+        let cid = normalize_content_id(&img.content_id);
+        if cid.is_empty() {
+            return Err(ToolError::new("inline image is missing a content_id"));
+        }
+        if !seen.insert(cid.to_lowercase()) {
+            return Err(ToolError::new(format!("duplicate inline image content_id: {cid:?}")));
+        }
+        let mut filename = non_empty(&img.filename);
+        let source = match (non_empty(&img.path), img.data_base64.as_deref().filter(|s| !s.trim().is_empty())) {
+            (Some(path), None) => {
+                if !std::path::Path::new(&path).is_file() {
+                    return Err(ToolError::new(format!("inline image not found: {path}")));
+                }
+                if filename.is_none() {
+                    filename = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned());
+                }
+                InlineImageSource::Path(path)
+            }
+            (None, Some(data)) => InlineImageSource::Data(decode_inline_base64(data, &cid)?),
+            _ => {
+                return Err(ToolError::new(format!(
+                    "inline image {cid:?}: give exactly one of 'path' or 'data_base64'"
+                )))
+            }
+        };
+        let mime_type = non_empty(&img.mime_type)
+            .or_else(|| filename.as_deref().and_then(mime_from_filename).map(str::to_string))
+            .or_else(|| match &source {
+                InlineImageSource::Data(d) => sniff_image_mime(d).map(str::to_string),
+                InlineImageSource::Path(_) => None,
+            })
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let filename = filename.unwrap_or_else(|| format!("{cid}{}", extension_for_mime(&mime_type)));
+        out.push(ValidatedInlineImage {
+            content_id: cid,
+            source,
+            filename: com::safe_filename(&filename),
+            mime_type,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -629,5 +825,176 @@ mod tests {
     fn common_free_empty_when_no_one_resolved() {
         let people = vec![avail("alice", false, &[])];
         assert_eq!(common_free(&people, &["free".to_string()]), vec![]);
+    }
+}
+
+#[cfg(test)]
+mod inline_image_tests {
+    use super::{
+        decode_inline_base64, extension_for_mime, mime_from_filename, normalize_content_id,
+        sniff_image_mime, validate_inline_images, InlineImage, InlineImageSource,
+    };
+
+    /// A 1x1 transparent PNG.
+    const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    fn b64(cid: &str, data: &str) -> InlineImage {
+        InlineImage { content_id: cid.into(), data_base64: Some(data.into()), ..Default::default() }
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("outlook-mcp-rs-unit-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn err(images: &[InlineImage], html: bool) -> String {
+        validate_inline_images(images, html).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn normalize_content_id_strips_brackets_and_cid_prefix() {
+        assert_eq!(normalize_content_id("logo"), "logo");
+        assert_eq!(normalize_content_id("  <logo> "), "logo");
+        assert_eq!(normalize_content_id("cid:logo"), "logo");
+        assert_eq!(normalize_content_id("CID: logo"), "logo");
+        assert_eq!(normalize_content_id("<cid:logo>"), "logo");
+        assert_eq!(normalize_content_id("<>"), "");
+        assert_eq!(normalize_content_id("cid:"), "");
+    }
+
+    #[test]
+    fn decode_accepts_data_uri_prefix_and_whitespace() {
+        let plain = decode_inline_base64(PNG_1X1_B64, "x").unwrap();
+        let uri = decode_inline_base64(&format!("data:image/png;base64,{PNG_1X1_B64}"), "x").unwrap();
+        let spaced = format!(" {}\n{} \r\n", &PNG_1X1_B64[..20], &PNG_1X1_B64[20..]);
+        assert_eq!(plain, uri);
+        assert_eq!(plain, decode_inline_base64(&spaced, "x").unwrap());
+        assert_eq!(sniff_image_mime(&plain), Some("image/png"));
+    }
+
+    #[test]
+    fn decode_rejects_invalid_or_empty_data() {
+        assert!(decode_inline_base64("not base64!!", "x").unwrap_err().to_string().contains("not valid base64"));
+        // Missing padding is rejected (strict decoding).
+        assert!(decode_inline_base64("aGk", "x").is_err());
+        assert!(decode_inline_base64("data:image/png,aGk=", "x").unwrap_err().to_string().contains("data URI"));
+        assert!(decode_inline_base64("data:image/png;base64", "x").is_err());
+        assert!(decode_inline_base64("data:image/png;base64,", "x").unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn sniff_and_extension_helpers() {
+        assert_eq!(sniff_image_mime(b"\xff\xd8\xff\xe0rest"), Some("image/jpeg"));
+        assert_eq!(sniff_image_mime(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(sniff_image_mime(b"GIF87a..."), Some("image/gif"));
+        assert_eq!(sniff_image_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_image_mime(b"RIFF"), None);
+        assert_eq!(sniff_image_mime(b"hello"), None);
+        assert_eq!(mime_from_filename("a.PNG"), Some("image/png"));
+        assert_eq!(mime_from_filename("a.jpeg"), Some("image/jpeg"));
+        assert_eq!(mime_from_filename("noext"), None);
+        assert_eq!(mime_from_filename("a.txt"), None);
+        assert_eq!(extension_for_mime("image/jpeg"), ".jpg");
+        assert_eq!(extension_for_mime("application/octet-stream"), "");
+    }
+
+    #[test]
+    fn requires_html() {
+        assert!(err(&[b64("logo", PNG_1X1_B64)], false).contains("html=true"));
+    }
+
+    #[test]
+    fn rejects_empty_content_id() {
+        assert!(err(&[b64("  <cid:> ", PNG_1X1_B64)], true).contains("missing a content_id"));
+    }
+
+    #[test]
+    fn requires_exactly_one_source() {
+        let neither = InlineImage { content_id: "a".into(), ..Default::default() };
+        assert!(err(&[neither], true).contains("exactly one"));
+        let path = temp_file("both.png", b"x");
+        let both = InlineImage {
+            content_id: "a".into(),
+            path: Some(path.to_string_lossy().into_owned()),
+            data_base64: Some(PNG_1X1_B64.into()),
+            ..Default::default()
+        };
+        assert!(err(&[both], true).contains("exactly one"));
+        // Empty strings count as absent.
+        let empty = InlineImage { content_id: "a".into(), path: Some("".into()), data_base64: Some(" ".into()), ..Default::default() };
+        assert!(err(&[empty], true).contains("exactly one"));
+    }
+
+    #[test]
+    fn rejects_missing_path() {
+        let img = InlineImage { content_id: "a".into(), path: Some("/definitely/not/here.png".into()), ..Default::default() };
+        assert!(err(&[img], true).contains("inline image not found"));
+    }
+
+    #[test]
+    fn rejects_bad_base64() {
+        assert!(err(&[b64("a", "@@@")], true).contains("not valid base64"));
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_case_insensitively() {
+        let e = err(&[b64("Logo", PNG_1X1_B64), b64("<cid:LOGO>", PNG_1X1_B64)], true);
+        assert!(e.contains("duplicate"), "{e}");
+    }
+
+    #[test]
+    fn base64_image_gets_sniffed_mime_and_default_filename() {
+        let v = validate_inline_images(&[b64("<cid:chart>", PNG_1X1_B64)], true).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].content_id, "chart");
+        assert_eq!(v[0].mime_type, "image/png");
+        assert_eq!(v[0].filename, "chart.png");
+        assert!(matches!(&v[0].source, InlineImageSource::Data(d) if d.starts_with(b"\x89PNG")));
+    }
+
+    #[test]
+    fn unknown_data_falls_back_to_octet_stream() {
+        let v = validate_inline_images(&[b64("blob", "aGVsbG8=")], true).unwrap();
+        assert_eq!(v[0].mime_type, "application/octet-stream");
+        assert_eq!(v[0].filename, "blob");
+    }
+
+    #[test]
+    fn explicit_mime_and_filename_win_and_filename_is_sanitized() {
+        let img = InlineImage {
+            content_id: "x".into(),
+            data_base64: Some(PNG_1X1_B64.into()),
+            filename: Some("my:pic.gif".into()),
+            mime_type: Some("image/custom".into()),
+            ..Default::default()
+        };
+        let v = validate_inline_images(&[img], true).unwrap();
+        assert_eq!(v[0].mime_type, "image/custom");
+        assert_eq!(v[0].filename, "my_pic.gif");
+        // Filename extension beats sniffing when no mime_type is given.
+        let img = InlineImage { content_id: "y".into(), data_base64: Some(PNG_1X1_B64.into()), filename: Some("pic.gif".into()), ..Default::default() };
+        assert_eq!(validate_inline_images(&[img], true).unwrap()[0].mime_type, "image/gif");
+        // Unsafe characters in a cid-derived filename are sanitized too.
+        let v = validate_inline_images(&[b64("a/b", PNG_1X1_B64)], true).unwrap();
+        assert_eq!(v[0].content_id, "a/b");
+        assert_eq!(v[0].filename, "a_b.png");
+    }
+
+    #[test]
+    fn path_image_uses_file_name_and_extension_mime() {
+        let path = temp_file("photo.JPG", b"\xff\xd8\xff");
+        let img = InlineImage { content_id: "p".into(), path: Some(path.to_string_lossy().into_owned()), ..Default::default() };
+        let v = validate_inline_images(&[img], true).unwrap();
+        assert_eq!(v[0].filename, "photo.JPG");
+        assert_eq!(v[0].mime_type, "image/jpeg");
+        assert_eq!(v[0].source, InlineImageSource::Path(path.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn empty_list_is_ok() {
+        assert!(validate_inline_images(&[], true).unwrap().is_empty());
     }
 }
