@@ -853,3 +853,37 @@ fn delete_note_removes_it() {
     let deleted = c.delete_note(id).expect("delete_note should succeed");
     assert_eq!(deleted["status"], "deleted");
 }
+
+/// Issue #3: Hebrew written through COM comes back byte-identical, both via
+/// `get_email` and via a Hebrew `list_emails` query (Restrict filter text).
+#[test]
+#[ignore]
+fn hebrew_subject_and_body_round_trip_through_com() {
+    let c = client();
+    let subject = "[outlook-mcp-rs utf8 live] מייל שיקוף".to_string();
+    let body = "סיכום עשייה — שורה ראשונה".to_string();
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        subject.clone(), body.clone(), None, None, false, None,
+    ).expect("create_draft should succeed");
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let detail = c.get_email(id.clone(), false);
+    let found = c.list_emails(EmailQuery {
+        query: Some("מייל שיקוף".to_string()), folder: "drafts".into(), count: 25,
+        unread_only: false, from: None, category: None, received_after: None,
+        received_before: None, since_days: None, has_attachments: None,
+        flagged: false, high_importance: false,
+    });
+
+    c.delete_email(id.clone()).expect("cleanup: delete the draft");
+
+    let detail = detail.expect("get_email should succeed");
+    assert_eq!(detail.summary.subject.as_bytes(), subject.as_bytes());
+    assert!(
+        detail.body.contains(&body),
+        "body should contain the Hebrew text verbatim, got {:?}", detail.body
+    );
+    let found = found.expect("list_emails with a Hebrew query should succeed");
+    assert!(found.iter().any(|e| e.id == id && e.subject == subject));
+}

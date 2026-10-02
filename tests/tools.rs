@@ -117,6 +117,154 @@ async fn get_email_includes_item_type() {
     assert_eq!(result_json(&result)["is_meeting"], false);
 }
 
+// ---- Non-ASCII (Hebrew) round trip, issue #3 ----------------------------
+
+const HE_SUBJECT: &str = "מייל שיקוף";
+const HE_SENDER: &str = "עדה לאבלייס";
+const HE_BODY: &str = "סיכום עשייה\nשורה שנייה";
+
+/// The raw text of a tool result: the exact JSON string rmcp puts on the wire.
+fn result_text(result: &CallToolResult) -> String {
+    result.content[0].as_text().expect("expected text content").text.clone()
+}
+
+/// Hebrew must appear as literal UTF-8 in the JSON, never as `\u05xx` escapes.
+fn assert_raw_utf8(text: &str, expected: &[&str]) {
+    for s in expected {
+        assert!(text.contains(s), "{s:?} not found verbatim in {text}");
+    }
+    assert!(!text.contains("\\u05"), "unexpected \\u escape in {text}");
+}
+
+#[tokio::test]
+async fn list_emails_returns_hebrew_text_verbatim() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_email_text(HE_SUBJECT, HE_SENDER, HE_BODY);
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({})).unwrap();
+    let result = server.list_emails(Parameters(params)).await.unwrap();
+    let text = result_text(&result);
+    assert_raw_utf8(&text, &[HE_SUBJECT, HE_SENDER]);
+    let json = result_json(&result);
+    assert_eq!(json[0]["subject"].as_str().unwrap().as_bytes(), HE_SUBJECT.as_bytes());
+    assert_eq!(json[0]["sender"].as_str().unwrap().as_bytes(), HE_SENDER.as_bytes());
+}
+
+#[tokio::test]
+async fn get_email_returns_hebrew_text_verbatim() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_email_text(HE_SUBJECT, HE_SENDER, HE_BODY);
+    let server = OutlookMcpServer::new(fake.clone());
+    let result = server
+        .get_email(Parameters(GetEmailParams {
+            email_id: EMAIL_ID.to_string(),
+            prefer_html: false,
+        }))
+        .await
+        .unwrap();
+    // The newline in the body is escaped as `\n` in JSON; check the line.
+    assert_raw_utf8(&result_text(&result), &[HE_SUBJECT, HE_SENDER, "סיכום עשייה"]);
+    let json = result_json(&result);
+    assert_eq!(json["subject"].as_str().unwrap().as_bytes(), HE_SUBJECT.as_bytes());
+    assert_eq!(json["sender"].as_str().unwrap().as_bytes(), HE_SENDER.as_bytes());
+    assert_eq!(json["body"].as_str().unwrap().as_bytes(), HE_BODY.as_bytes());
+}
+
+#[tokio::test]
+async fn hebrew_arguments_reach_the_client_unchanged() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "query": HE_SUBJECT, "from": HE_SENDER, "category": "סיכום עשייה"
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    server
+        .create_draft(Parameters(CreateDraftParams {
+            to: vec!["a@example.com".to_string()],
+            subject: HE_SUBJECT.to_string(),
+            body: HE_BODY.to_string(),
+            cc: None,
+            bcc: None,
+            html: false,
+            attachments: None,
+        }))
+        .await
+        .unwrap();
+    let calls = fake.calls();
+    assert_eq!(calls[0].1["query"], HE_SUBJECT);
+    assert_eq!(calls[0].1["from"], HE_SENDER);
+    assert_eq!(calls[0].1["category"], "סיכום עשייה");
+    assert_eq!(calls[1].1["subject"], HE_SUBJECT);
+    assert_eq!(calls[1].1["body"], HE_BODY);
+}
+
+/// End to end over the same newline-delimited JSON-RPC codec that rmcp's
+/// stdio transport uses (an in-memory duplex pipe stands in for
+/// stdin/stdout): Hebrew in the request reaches the client, and Hebrew in the
+/// result leaves the server as raw UTF-8 bytes.
+#[tokio::test]
+async fn hebrew_round_trips_as_raw_utf8_over_the_stdio_codec() {
+    use rmcp::ServiceExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_email_text(HE_SUBJECT, HE_SENDER, HE_BODY);
+    let server = OutlookMcpServer::new(fake.clone());
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let (read_half, mut write_half) = tokio::io::split(client_io);
+    let mut reader = BufReader::new(read_half);
+
+    // Reads raw bytes up to the next response carrying `id`.
+    async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, id: u64) -> Vec<u8> {
+        loop {
+            let mut line = Vec::new();
+            assert!(reader.read_until(b'\n', &mut line).await.unwrap() > 0, "server closed");
+            let msg: Value = serde_json::from_slice(&line).unwrap();
+            if msg["id"] == id {
+                return line;
+            }
+        }
+    }
+
+    let requests = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "utf8-test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "list_emails", "arguments": {"query": HE_SUBJECT}}}),
+    ];
+    for (i, req) in requests.iter().enumerate() {
+        // serde_json writes the Hebrew as raw UTF-8, like a real client would.
+        let mut bytes = serde_json::to_vec(req).unwrap();
+        bytes.push(b'\n');
+        write_half.write_all(&bytes).await.unwrap();
+        if i == 0 {
+            read_response(&mut reader, 1).await;
+        }
+    }
+    let line = read_response(&mut reader, 2).await;
+
+    // Strict UTF-8 decode of the wire bytes; the tool result is JSON text
+    // nested in a JSON string, so its Hebrew is still raw, not `\u` escaped.
+    let wire = String::from_utf8(line).expect("server output must be valid UTF-8");
+    assert_raw_utf8(&wire, &[HE_SUBJECT, HE_SENDER]);
+    let msg: Value = serde_json::from_str(&wire).unwrap();
+    let emails: Value =
+        serde_json::from_str(msg["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(emails[0]["subject"], HE_SUBJECT);
+    assert_eq!(emails[0]["sender"], HE_SENDER);
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "list_emails");
+    assert_eq!(args["query"], HE_SUBJECT);
+}
+
 #[tokio::test]
 async fn send_email_passes_recipients_and_html_flag() {
     let fake = Arc::new(FakeOutlookClient::new());
