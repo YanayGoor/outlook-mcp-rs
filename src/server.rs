@@ -47,6 +47,10 @@ pub struct ListEmailsParams {
     pub folder: String,
     #[serde(default = "default_count")]
     pub count: i32,
+    /// Matches to skip before this page starts (default 0). To page, call
+    /// again with offset += count until fewer than count results come back.
+    #[serde(default)]
+    pub offset: i32,
     #[serde(default)]
     pub unread_only: bool,
     #[serde(default)]
@@ -466,14 +470,15 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Find emails in a folder with optional text query and filters (sender, category, date range, attachments, flagged, importance).")]
+    #[tool(description = "Find emails in a folder (newest first) with optional text query and filters (sender, category, date range, attachments, flagged, importance). count is capped at 200. To page through more, call again with offset += count until fewer than count results come back.")]
     pub async fn list_emails(
         &self,
         Parameters(p): Parameters<ListEmailsParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
         let q = EmailQuery {
-            query: p.query, folder: p.folder, count: p.count, unread_only: p.unread_only,
+            query: p.query, folder: p.folder, count: p.count, offset: p.offset,
+            unread_only: p.unread_only,
             from: p.from, category: p.category, received_after: p.received_after,
             received_before: p.received_before, since_days: p.since_days,
             has_attachments: p.has_attachments, flagged: p.flagged,

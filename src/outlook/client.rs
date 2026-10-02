@@ -24,13 +24,14 @@ use crate::outlook::types::*;
 use chrono::Datelike;
 use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
-    parse_freebusy_slots, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
+    parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
     CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate,
     OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate,
 };
 
-/// Matches `MAX_EMAIL_COUNT` in `client.py`.
-const MAX_EMAIL_COUNT: i32 = 50;
+/// Matches `MAX_EMAIL_COUNT` in `client.py`. Larger result sets are paged
+/// with `EmailQuery::offset`.
+const MAX_EMAIL_COUNT: i32 = 200;
 /// Matches `MAX_CALENDAR_ITEMS` in `client.py`. Caps `list_events` because a
 /// recurring appointment without an end date expands forever under
 /// `IncludeRecurrences`.
@@ -827,40 +828,41 @@ impl OutlookClient for WindowsOutlookClient {
             )?;
 
             // Client-side fuzzy filters: category + has_attachments + flagged.
-            // Iterate, build each summary, keep it only if it passes, stop at count.
+            // Lazily build each summary and keep it only if it passes; then
+            // `take_page` skips the first `offset` matches (after these
+            // filters, so pages line up) and stops at count.
             let cat_want = q.category.as_deref().map(|c| c.to_lowercase());
             let total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
-            let mut results = Vec::new();
-            for i in 1..=total {
-                let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
-                let summary = email_summary(&item)?;
-                if let Some(want) = &cat_want {
-                    if !summary.categories.iter().any(|c| c.to_lowercase() == *want) {
-                        continue;
+            let matches = (1..=total).filter_map(|i| {
+                (|| -> Result<Option<EmailSummary>, ToolError> {
+                    let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                    let summary = email_summary(&item)?;
+                    if let Some(want) = &cat_want {
+                        if !summary.categories.iter().any(|c| c.to_lowercase() == *want) {
+                            return Ok(None);
+                        }
                     }
-                }
-                if let Some(want_att) = q.has_attachments {
-                    if summary.has_attachments != want_att {
-                        continue;
+                    if let Some(want_att) = q.has_attachments {
+                        if summary.has_attachments != want_att {
+                            return Ok(None);
+                        }
                     }
-                }
-                if q.flagged {
-                    // "Flagged" means any non-zero FlagStatus: both a
-                    // follow-up flag (OL_FLAG_MARKED = 2) and a completed
-                    // flag (OL_FLAG_COMPLETE = 1) count; 0 = no flag/cleared.
-                    let flag_status =
-                        variant_to_i32(&get_property(&item, "FlagStatus").unwrap_or_default())
-                            .unwrap_or(0);
-                    if flag_status == 0 {
-                        continue;
+                    if q.flagged {
+                        // "Flagged" means any non-zero FlagStatus: both a
+                        // follow-up flag (OL_FLAG_MARKED = 2) and a completed
+                        // flag (OL_FLAG_COMPLETE = 1) count; 0 = no flag/cleared.
+                        let flag_status =
+                            variant_to_i32(&get_property(&item, "FlagStatus").unwrap_or_default())
+                                .unwrap_or(0);
+                        if flag_status == 0 {
+                            return Ok(None);
+                        }
                     }
-                }
-                results.push(summary);
-                if results.len() as i32 >= count {
-                    break;
-                }
-            }
-            Ok(results)
+                    Ok(Some(summary))
+                })()
+                .transpose()
+            });
+            take_page(matches, q.offset, count)
         })
     }
 
