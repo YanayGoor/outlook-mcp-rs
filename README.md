@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **26 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **27 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 26 tools below become available.
+already running, and the 27 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 26 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 27 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
@@ -130,7 +130,7 @@ The Outlook tools then appear in that client.
 
 ## Available tools
 
-26 MCP tools, grouped by category:
+27 MCP tools, grouped by category:
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
@@ -140,6 +140,7 @@ The Outlook tools then appear in that client.
 - `create_draft` — create a draft email without sending it
 - `reply_email` — reply to an email, optionally to all recipients, optionally as a draft
 - `update_email` — change an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, set importance
+- `update_draft` — edit an unsent draft's subject, body/HTML body, To/CC/BCC (each replaces that line; `[]` clears it), or append attachments; saves but never sends
 - `delete_email` — delete an email (moves it to Deleted Items)
 
 **Calendar**

@@ -9,7 +9,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::error::ToolError;
-use crate::outlook::{CheckAvailabilityInput, CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate};
+use crate::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate};
 
 /// Runs a blocking `OutlookClient` call on a dedicated blocking thread so the
 /// tokio scheduler never migrates it mid-call (COM apartment-threading
@@ -142,6 +142,33 @@ pub struct UpdateEmailParams {
     /// "low" | "normal" | "high".
     #[serde(default)]
     pub importance: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateDraftParams {
+    /// Id of an unsent draft (e.g. from create_draft or reply_email with send=false).
+    pub draft_id: String,
+    /// New subject (replaces the current one).
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// New plain-text body (replaces the current body). Not with html_body.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// New HTML body (replaces the current body). Not with body.
+    #[serde(default)]
+    pub html_body: Option<String>,
+    /// Replaces the whole To line; an empty list clears it.
+    #[serde(default)]
+    pub to: Option<Vec<String>>,
+    /// Replaces the whole CC line; an empty list clears it.
+    #[serde(default)]
+    pub cc: Option<Vec<String>>,
+    /// Replaces the whole BCC line; an empty list clears it.
+    #[serde(default)]
+    pub bcc: Option<Vec<String>>,
+    /// Local file paths appended to the existing attachments.
+    #[serde(default)]
+    pub attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -535,6 +562,20 @@ impl OutlookMcpServer {
             remove_categories: p.remove_categories, importance: p.importance,
         };
         let result = run_blocking(move || client.update_email(u)).await?;
+        Ok(CallToolResult::success(vec![json_content(&result)?]))
+    }
+
+    #[tool(description = "Edit an existing unsent draft (e.g. one from create_draft or reply_email with send=false) and save it. The draft is NOT sent. Only the fields you pass change: subject, body (plain text) and html_body replace the current values (pass body or html_body, not both); to/cc/bcc replace that recipient line entirely (an empty list clears it); attachments are local file paths appended to the existing ones. Sent or received emails are rejected. Returns the draft id and the list of changed fields.")]
+    pub async fn update_draft(
+        &self,
+        Parameters(p): Parameters<UpdateDraftParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = self.client.clone();
+        let u = DraftUpdate {
+            draft_id: p.draft_id, subject: p.subject, body: p.body, html_body: p.html_body,
+            to: p.to, cc: p.cc, bcc: p.bcc, attachments: p.attachments,
+        };
+        let result = run_blocking(move || client.update_draft(u)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 

@@ -6,7 +6,7 @@ use outlook_mcp_rs::server::{
     DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams, GetEventParams, GetNoteParams, ListAttachmentsParams,
     ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
-    SendEmailParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
+    SendEmailParams, UpdateDraftParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -189,6 +189,55 @@ async fn send_email_forwards_attachments() {
     server.send_email(Parameters(params)).await.unwrap();
     let (_, args) = &fake.calls()[0];
     assert_eq!(args["attachments"], serde_json::json!(["C:/tmp/a.pdf", "C:/tmp/b.png"]));
+}
+
+#[tokio::test]
+async fn update_draft_forwards_fields_and_lists_changes_in_apply_order() {
+    let path = std::env::temp_dir().join("outlook-mcp-rs-tools-update-draft.txt");
+    std::fs::write(&path, b"x").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: UpdateDraftParams = serde_json::from_value(json!({
+        "draft_id": EMAIL_ID, "attachments": [path_str], "bcc": [],
+        "to": ["a@x.com", "b@x.com"], "html_body": "<p>hi</p>", "subject": "New"
+    })).unwrap();
+    let result = server.update_draft(Parameters(params)).await;
+    let _ = std::fs::remove_file(&path);
+    let v = result_json(&result.unwrap());
+    assert_eq!(v["status"], "draft_updated");
+    assert_eq!(v["id"], EMAIL_ID);
+    assert_eq!(v["changed"], json!(["subject", "html_body", "to", "bcc", "attachments"]));
+    let (name, args) = fake.calls().pop().unwrap();
+    assert_eq!(name, "update_draft");
+    assert_eq!(args["draft_id"], EMAIL_ID);
+    assert_eq!(args["subject"], "New");
+    assert_eq!(args["html_body"], "<p>hi</p>");
+    assert_eq!(args["body"], Value::Null);
+    assert_eq!(args["to"], json!(["a@x.com", "b@x.com"]));
+    assert_eq!(args["cc"], Value::Null);
+    assert_eq!(args["bcc"], json!([]));
+    assert_eq!(args["attachments"], json!([path_str]));
+}
+
+#[tokio::test]
+async fn update_draft_rejects_body_and_html_body_together() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: UpdateDraftParams = serde_json::from_value(json!({
+        "draft_id": EMAIL_ID, "body": "plain", "html_body": "<p>html</p>"
+    })).unwrap();
+    assert!(server.update_draft(Parameters(params)).await.is_err());
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn update_draft_rejects_an_empty_update() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: UpdateDraftParams = serde_json::from_value(json!({"draft_id": EMAIL_ID})).unwrap();
+    assert!(server.update_draft(Parameters(params)).await.is_err());
+    assert!(fake.calls().is_empty());
 }
 
 #[tokio::test]

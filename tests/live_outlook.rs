@@ -9,7 +9,7 @@
 //! can't be undone — see TESTING.md for how to test those by hand.
 
 use outlook_mcp_rs::outlook::client::WindowsOutlookClient;
-use outlook_mcp_rs::outlook::{CheckAvailabilityInput, CreateEventInput, EmailQuery, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate};
+use outlook_mcp_rs::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate};
 
 fn client() -> WindowsOutlookClient {
     WindowsOutlookClient::new()
@@ -424,6 +424,41 @@ fn update_email_applies_state_then_moves() {
     assert_eq!(moved["changed"], serde_json::json!(["move_to"]));
     let new_id = moved["id"].as_str().expect("moved id").to_string();
     c.delete_email(new_id).expect("cleanup delete");
+}
+
+#[test]
+#[ignore]
+fn update_draft_edits_subject_body_and_recipients() {
+    let c = WindowsOutlookClient::new();
+    // A draft is a safe, disposable target. update_draft only saves; it never sends.
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        "outlook-mcp-rs update_draft live test".to_string(),
+        "original body".to_string(),
+        None, None, false, None,
+    ).expect("create_draft");
+    let id = created["id"].as_str().expect("draft id").to_string();
+
+    let res = c.update_draft(DraftUpdate {
+        draft_id: id.clone(),
+        subject: Some("outlook-mcp-rs update_draft live test (edited)".to_string()),
+        body: Some("edited body zzdraftedit5521".to_string()),
+        to: Some(vec!["someone-else@example.invalid".to_string()]),
+        ..Default::default()
+    });
+    // Read back before asserting so a failure still cleans up.
+    let detail = c.get_email(id.clone(), false);
+    c.delete_email(id.clone()).expect("cleanup: delete the draft");
+
+    let res = res.expect("update_draft");
+    assert_eq!(res["status"], "draft_updated");
+    assert_eq!(res["changed"], serde_json::json!(["subject", "body", "to"]));
+    let dv = serde_json::to_value(detail.expect("get_email")).unwrap();
+    assert_eq!(dv["subject"], "outlook-mcp-rs update_draft live test (edited)");
+    assert!(dv["body"].as_str().unwrap().contains("zzdraftedit5521"));
+    let to = dv["to"].as_str().unwrap();
+    assert!(to.contains("someone-else@example.invalid"), "to was {to:?}");
+    assert!(!to.contains("nobody@example.invalid"), "to was {to:?}");
 }
 
 #[test]
