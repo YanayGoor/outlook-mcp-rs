@@ -24,7 +24,8 @@ use crate::outlook::types::*;
 use chrono::Datelike;
 use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
-    parse_freebusy_slots, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
+    parse_freebusy_slots, permanent_delete_needs_move, require_empty_confirm, validate_recurrence,
+    validate_recurrence_update, CheckAvailabilityInput,
     CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate,
     OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate,
 };
@@ -114,6 +115,25 @@ fn get_item(ns: &IDispatch, item_id: &str) -> Result<IDispatch, ToolError> {
         ))
     })?;
     to_disp(item)
+}
+
+/// The Deleted Items folder of the item's own store, so a hard delete of an
+/// item in a secondary mailbox/PST stays in that store. Falls back to the
+/// default store's Deleted Items when the store can't be resolved.
+fn deleted_items_for(ns: &IDispatch, item: &IDispatch) -> Result<IDispatch, ToolError> {
+    let own = || -> Result<IDispatch, ToolError> {
+        let parent = to_disp(get_property(item, "Parent")?)?;
+        let store = to_disp(get_property(&parent, "Store")?)?;
+        to_disp(call_method(
+            &store, "GetDefaultFolder", &mut [variant_from_i32(c::OL_FOLDER_DELETED_ITEMS)],
+        )?)
+    };
+    match own() {
+        Ok(folder) => Ok(folder),
+        Err(_) => to_disp(call_method(
+            ns, "GetDefaultFolder", &mut [variant_from_i32(c::OL_FOLDER_DELETED_ITEMS)],
+        )?),
+    }
 }
 
 /// `client.py::_resolve_folder`: a well-known folder name maps to a default
@@ -1117,13 +1137,92 @@ impl OutlookClient for WindowsOutlookClient {
         })
     }
 
-    fn delete_email(&self, email_id: String) -> Result<Value, ToolError> {
+    fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &email_id)?;
             let subject = variant_to_string(&get_property(&item, "Subject")?);
-            call_method(&item, "Delete", &mut [])?;
-            Ok(json!({"status": "deleted", "subject": subject, "note": "Moved to Deleted Items."}))
+            if !permanent {
+                call_method(&item, "Delete", &mut [])?;
+                return Ok(json!({
+                    "status": "deleted", "subject": subject, "permanent": false,
+                    "note": "Moved to Deleted Items.",
+                }));
+            }
+
+            // OOM has no hard-delete call; Delete() on an item already in
+            // Deleted Items is permanent, so move it there first (Outlook's
+            // shift+delete).
+            let deleted = deleted_items_for(&ns, &item)?;
+            let deleted_id = variant_to_string(&get_property(&deleted, "EntryID")?);
+            // An unreadable parent id just means "move first" (always safe).
+            let parent_id = (|| -> Result<String, ToolError> {
+                let parent = to_disp(get_property(&item, "Parent")?)?;
+                Ok(variant_to_string(&get_property(&parent, "EntryID")?))
+            })()
+            .unwrap_or_default();
+            if permanent_delete_needs_move(&parent_id, &deleted_id) {
+                // Move returns the item in its new home; delete that copy.
+                let moved = to_disp(call_method(
+                    &item, "Move", &mut [VARIANT::from(deleted.clone())],
+                )?)?;
+                call_method(&moved, "Delete", &mut [])?;
+            } else {
+                call_method(&item, "Delete", &mut [])?;
+            }
+            Ok(json!({
+                "status": "deleted", "subject": subject, "permanent": true,
+                "note": "Permanently deleted (not recoverable from Deleted Items).",
+            }))
+        })
+    }
+
+    fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError> {
+        require_empty_confirm(confirm)?;
+        self.with_com(|| {
+            let (_app, ns) = mapi()?;
+            let folder = to_disp(call_method(
+                &ns,
+                "GetDefaultFolder",
+                &mut [variant_from_i32(c::OL_FOLDER_DELETED_ITEMS)],
+            )?)?;
+            let (mut items_deleted, mut folders_deleted, mut failed) = (0, 0, 0);
+
+            // Walk backwards: deleting during forward iteration skips items
+            // as the collection re-indexes. One stuck item must not abort
+            // the rest, so per-item errors are only counted.
+            let items = to_disp(get_property(&folder, "Items")?)?;
+            let count = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
+            for i in (1..=count).rev() {
+                let deleted = (|| -> Result<(), ToolError> {
+                    let it = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                    call_method(&it, "Delete", &mut [])?;
+                    Ok(())
+                })();
+                match deleted {
+                    Ok(_) => items_deleted += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+
+            let subfolders = to_disp(get_property(&folder, "Folders")?)?;
+            let count = variant_to_i32(&get_property(&subfolders, "Count")?).unwrap_or(0);
+            for i in (1..=count).rev() {
+                let deleted = (|| -> Result<(), ToolError> {
+                    let f = to_disp(call_method(&subfolders, "Item", &mut [variant_from_i32(i)])?)?;
+                    call_method(&f, "Delete", &mut [])?;
+                    Ok(())
+                })();
+                match deleted {
+                    Ok(_) => folders_deleted += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+
+            Ok(json!({
+                "status": "emptied", "items_deleted": items_deleted,
+                "folders_deleted": folders_deleted, "failed": failed,
+            }))
         })
     }
 

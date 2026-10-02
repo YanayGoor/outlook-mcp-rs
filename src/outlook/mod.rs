@@ -206,7 +206,12 @@ pub trait OutlookClient: Send + Sync {
         html: bool, send: bool, attachments: Option<Vec<String>>)
         -> Result<Value, ToolError>;
     fn update_email(&self, u: EmailUpdate) -> Result<Value, ToolError>;
-    fn delete_email(&self, email_id: String) -> Result<Value, ToolError>;
+    /// `permanent = false` moves the email to Deleted Items; `true`
+    /// hard-deletes it like Outlook's shift+delete.
+    fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError>;
+    /// Permanently delete everything in the default store's Deleted Items.
+    /// Refuses (via [`require_empty_confirm`]) unless `confirm` is true.
+    fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError>;
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError>;
     fn get_event(&self, event_id: String) -> Result<EventDetail, ToolError>;
@@ -234,6 +239,28 @@ pub trait OutlookClient: Send + Sync {
     fn create_note(&self, body: String, categories: Option<Vec<String>>, color: Option<String>) -> Result<Value, ToolError>;
     fn update_note(&self, u: NoteUpdate) -> Result<Value, ToolError>;
     fn delete_note(&self, note_id: String) -> Result<Value, ToolError>;
+}
+
+/// Guard for `empty_deleted_items`: it is irreversible, so it refuses unless
+/// the caller explicitly passed `confirm = true`. Shared by the real and fake
+/// clients so the refusal is the same everywhere.
+pub fn require_empty_confirm(confirm: bool) -> Result<(), ToolError> {
+    if confirm {
+        return Ok(());
+    }
+    Err(ToolError::new(
+        "empty_deleted_items permanently deletes EVERYTHING in Deleted Items \
+         (items and subfolders) and cannot be undone. Call again with \
+         confirm=true to proceed.",
+    ))
+}
+
+/// Whether a permanent `delete_email` must first move the item into Deleted
+/// Items. The object model has no hard-delete call, but `Delete()` on an item
+/// already in Deleted Items is permanent; so move there unless the item's
+/// parent folder already is that folder (EntryIDs compared exactly).
+pub fn permanent_delete_needs_move(parent_entry_id: &str, deleted_items_entry_id: &str) -> bool {
+    parent_entry_id.is_empty() || parent_entry_id != deleted_items_entry_id
 }
 
 /// The status string `create_event` returns: `"meeting_sent"` (attendees +
@@ -409,9 +436,26 @@ pub fn common_free(people: &[PersonAvailability], treat_as_free: &[String]) -> V
 mod tests {
     use super::{
         com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
-        parse_freebusy_slots, validate_recurrence, validate_recurrence_update, EventUpdate, RecurrenceInput,
+        parse_freebusy_slots, permanent_delete_needs_move, require_empty_confirm, validate_recurrence,
+        validate_recurrence_update, EventUpdate, RecurrenceInput,
     };
     use crate::outlook::types::{AvailabilitySlot, FreeWindow, PersonAvailability};
+
+    #[test]
+    fn require_empty_confirm_refuses_without_confirm() {
+        let err = require_empty_confirm(false).unwrap_err();
+        assert!(err.to_string().contains("confirm=true"));
+        assert!(err.to_string().contains("cannot be undone"));
+        assert!(require_empty_confirm(true).is_ok());
+    }
+
+    #[test]
+    fn permanent_delete_skips_move_only_when_already_in_deleted_items() {
+        assert!(!permanent_delete_needs_move("DELETED-ID", "DELETED-ID"));
+        assert!(permanent_delete_needs_move("DRAFTS-ID", "DELETED-ID"));
+        // An unreadable (empty) parent id never counts as "already there".
+        assert!(permanent_delete_needs_move("", ""));
+    }
 
     #[test]
     fn create_event_status_covers_all_three_outcomes() {

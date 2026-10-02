@@ -3,7 +3,7 @@ use std::sync::Arc;
 use outlook_mcp_rs::outlook::fake::{FakeOutlookClient, EMAIL_ID};
 use outlook_mcp_rs::server::{
     CheckAvailabilityParams, CreateDraftParams, CreateEventParams, CreateNoteParams, CreateTaskParams,
-    DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams, GetEventParams, GetNoteParams, ListAttachmentsParams,
+    DeleteEmailParams, DeleteEventParams, EmptyDeletedItemsParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams, GetEventParams, GetNoteParams, ListAttachmentsParams,
     ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
     SendEmailParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
@@ -238,16 +238,63 @@ async fn update_email_state_only_keeps_same_id_and_lists_changes() {
 }
 
 #[tokio::test]
-async fn delete_email_records_call() {
+async fn delete_email_defaults_to_soft_delete() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
-        .delete_email(Parameters(DeleteEmailParams { email_id: EMAIL_ID.to_string() }))
-        .await
-        .unwrap();
+    // permanent omitted → serde default false.
+    let params: DeleteEmailParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID})).unwrap();
+    let result = server.delete_email(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["permanent"], false);
     assert_eq!(
         fake.calls(),
-        vec![("delete_email".to_string(), json!({"email_id": EMAIL_ID}))]
+        vec![("delete_email".to_string(), json!({"email_id": EMAIL_ID, "permanent": false}))]
+    );
+}
+
+#[tokio::test]
+async fn delete_email_forwards_permanent() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: DeleteEmailParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "permanent": true})).unwrap();
+    let result = server.delete_email(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["permanent"], true);
+    assert_eq!(
+        fake.calls(),
+        vec![("delete_email".to_string(), json!({"email_id": EMAIL_ID, "permanent": true}))]
+    );
+}
+
+#[tokio::test]
+async fn empty_deleted_items_refuses_without_confirm() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // confirm omitted → serde default false → the refusal surfaces as an error.
+    let params: EmptyDeletedItemsParams = serde_json::from_value(json!({})).unwrap();
+    let err = server.empty_deleted_items(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("confirm=true"));
+    assert_eq!(
+        fake.calls(),
+        vec![("empty_deleted_items".to_string(), json!({"confirm": false}))]
+    );
+}
+
+#[tokio::test]
+async fn empty_deleted_items_with_confirm_returns_counts() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: EmptyDeletedItemsParams =
+        serde_json::from_value(json!({"confirm": true})).unwrap();
+    let result = server.empty_deleted_items(Parameters(params)).await.unwrap();
+    let v = result_json(&result);
+    assert_eq!(v["status"], "emptied");
+    assert!(v["items_deleted"].is_number());
+    assert!(v["folders_deleted"].is_number());
+    assert!(v["failed"].is_number());
+    assert_eq!(
+        fake.calls(),
+        vec![("empty_deleted_items".to_string(), json!({"confirm": true}))]
     );
 }
 

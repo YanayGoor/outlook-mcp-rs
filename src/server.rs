@@ -147,6 +147,18 @@ pub struct UpdateEmailParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteEmailParams {
     pub email_id: String,
+    /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
+    /// moves the email to Deleted Items.
+    #[serde(default)]
+    pub permanent: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EmptyDeletedItemsParams {
+    /// Must be true, or the call is refused. Only pass true when the user
+    /// has explicitly asked to empty Deleted Items.
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 // ---- Calendar ----
@@ -538,13 +550,23 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Delete an email (moves it to Deleted Items).")]
+    #[tool(description = "Delete an email. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
     pub async fn delete_email(
         &self,
-        Parameters(DeleteEmailParams { email_id }): Parameters<DeleteEmailParams>,
+        Parameters(DeleteEmailParams { email_id, permanent }): Parameters<DeleteEmailParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.delete_email(email_id)).await?;
+        let result = run_blocking(move || client.delete_email(email_id, permanent)).await?;
+        Ok(CallToolResult::success(vec![json_content(&result)?]))
+    }
+
+    #[tool(description = "Permanently delete EVERYTHING in the default mailbox's Deleted Items folder (items and subfolders). IRREVERSIBLE: refuses unless confirm=true; only pass confirm=true when the user has explicitly asked to empty Deleted Items. Returns counts of items and folders deleted and failures. On Exchange/Microsoft 365 with retention, items may still be held in Recoverable Items per server policy.")]
+    pub async fn empty_deleted_items(
+        &self,
+        Parameters(EmptyDeletedItemsParams { confirm }): Parameters<EmptyDeletedItemsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = self.client.clone();
+        let result = run_blocking(move || client.empty_deleted_items(confirm)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
