@@ -79,6 +79,21 @@ async fn list_emails_forwards_query_and_filters() {
 }
 
 #[tokio::test]
+async fn list_emails_forwards_hebrew_query_unchanged() {
+    // Issue #2: the non-ASCII query must reach the client intact (the
+    // DASL/fallback handling lives in the COM client).
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "query": "מייל שיקוף Q3"
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    let (_, args) = &fake.calls()[0];
+    assert_eq!(args["query"], "מייל שיקוף Q3");
+}
+
+#[tokio::test]
 async fn list_emails_returns_categories() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
