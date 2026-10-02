@@ -71,9 +71,11 @@ impl OutlookClient for FakeOutlookClient {
         }])
     }
 
-    fn get_email(&self, email_id: String, prefer_html: bool)
+    fn get_email(&self, email_id: String, prefer_html: bool, max_body_chars: Option<u32>)
         -> Result<EmailDetail, ToolError> {
-        self.record("get_email", json!({"email_id": email_id, "prefer_html": prefer_html}))?;
+        self.record("get_email", json!({
+            "email_id": email_id, "prefer_html": prefer_html, "max_body_chars": max_body_chars,
+        }))?;
         Ok(EmailDetail {
             summary: EmailSummary {
                 id: email_id, subject: "Hello".into(), sender: "".into(),
@@ -81,7 +83,11 @@ impl OutlookClient for FakeOutlookClient {
                 unread: false, has_attachments: false, categories: vec![],
             },
             cc: "".into(), bcc: "".into(), body: "Hi there".into(),
-            html_body: None, attachments: vec![],
+            body_truncated: false, body_length: 8,
+            html_body: if prefer_html { Some("<p>Hi there</p>".into()) } else { None },
+            html_truncated: if prefer_html { Some(false) } else { None },
+            html_length: if prefer_html { Some(15) } else { None },
+            attachments: vec![],
             item_type: "email".to_string(),
             is_meeting: false,
             meeting: None,
@@ -167,6 +173,7 @@ impl OutlookClient for FakeOutlookClient {
                 required_attendees: "".into(), optional_attendees: "".into(),
             },
             body: "".into(),
+            body_truncated: false,
             recurrence: None,
         })
     }
@@ -335,6 +342,7 @@ impl OutlookClient for FakeOutlookClient {
         Ok(NoteDetail {
             summary: NoteSummary { id: note_id, subject: "Ideas".into(), created: None, categories: vec![] },
             body: "Ideas\n- one".into(),
+            body_truncated: false,
             modified: None,
         })
     }

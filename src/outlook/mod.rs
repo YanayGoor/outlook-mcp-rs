@@ -194,7 +194,9 @@ pub struct RecurrenceInput {
 pub trait OutlookClient: Send + Sync {
     fn list_folders(&self) -> Result<Vec<FolderInfo>, ToolError>;
     fn list_emails(&self, q: EmailQuery) -> Result<Vec<EmailSummary>, ToolError>;
-    fn get_email(&self, email_id: String, prefer_html: bool)
+    /// `max_body_chars`: `None` = the 100,000-char default; other values are
+    /// clamped to 1,000..=5,000,000.
+    fn get_email(&self, email_id: String, prefer_html: bool, max_body_chars: Option<u32>)
         -> Result<EmailDetail, ToolError>;
     fn send_email(&self, to: Vec<String>, subject: String, body: String,
         cc: Option<Vec<String>>, bcc: Option<Vec<String>>, html: bool,

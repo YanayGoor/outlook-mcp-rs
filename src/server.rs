@@ -74,6 +74,10 @@ pub struct GetEmailParams {
     pub email_id: String,
     #[serde(default)]
     pub prefer_html: bool,
+    /// Cut body/html_body at this many characters. Default 100,000;
+    /// clamped to 1,000..=5,000,000.
+    #[serde(default)]
+    pub max_body_chars: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -483,13 +487,13 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Get the full body and attachment list of one email by id.")]
+    #[tool(description = "Get the full body and attachment list of one email by id. Set prefer_html to also get html_body. body (and html_body) are cut at max_body_chars characters (default 100,000; allowed 1,000-5,000,000). The result always reports body_truncated and body_length (the full original length in characters), plus html_truncated and html_length when prefer_html is set. If a *_truncated flag is true, the cut may fall mid-tag or mid-image-data: call again with max_body_chars of at least the reported length (max 5,000,000) to get the complete text.")]
     pub async fn get_email(
         &self,
-        Parameters(GetEmailParams { email_id, prefer_html }): Parameters<GetEmailParams>,
+        Parameters(GetEmailParams { email_id, prefer_html, max_body_chars }): Parameters<GetEmailParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.get_email(email_id, prefer_html)).await?;
+        let result = run_blocking(move || client.get_email(email_id, prefer_html, max_body_chars)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 

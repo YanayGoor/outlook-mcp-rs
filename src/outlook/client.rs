@@ -35,8 +35,14 @@ const MAX_EMAIL_COUNT: i32 = 50;
 /// recurring appointment without an end date expands forever under
 /// `IncludeRecurrences`.
 const MAX_CALENDAR_ITEMS: usize = 250;
-/// Matches `MAX_BODY_CHARS` in `client.py`.
+/// Matches `MAX_BODY_CHARS` in `client.py`. The default body cut, and the
+/// fixed cut for `get_event`/`get_note`.
 const MAX_BODY_CHARS: usize = 100_000;
+/// Bounds for `get_email`'s caller-chosen `max_body_chars` (large HTML mail
+/// with inline images can run to megabytes). Match `MIN_BODY_CHARS_LIMIT` /
+/// `MAX_BODY_CHARS_LIMIT` in `client.py`.
+const MIN_BODY_CHARS_LIMIT: usize = 1_000;
+const MAX_BODY_CHARS_LIMIT: usize = 5_000_000;
 
 /// Lets `?` turn a `windows::core::Error` into a [`ToolError`] anywhere in
 /// this module, so COM-plumbing calls (`call_method`, `get_property`, …) and
@@ -177,14 +183,26 @@ fn resolve_save_dir(save_dir: &str) -> std::path::PathBuf {
     std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
-/// `client.py::_truncate`: cap long bodies at `MAX_BODY_CHARS` *characters*
-/// (not bytes) so multi-byte UTF-8 content is never split mid-codepoint.
-fn truncate(text: &str) -> String {
-    if text.chars().count() > MAX_BODY_CHARS {
-        let head: String = text.chars().take(MAX_BODY_CHARS).collect();
-        format!("{head}\n\n[... truncated at {MAX_BODY_CHARS} characters]")
+/// `client.py::_truncate`: cap long bodies at `limit` *characters* (not
+/// bytes) so multi-byte UTF-8 content is never split mid-codepoint. The cut
+/// is a hard one and may land mid-tag or mid-base64 in HTML; the returned
+/// flag says whether it happened so callers can re-request with a larger
+/// limit. Returns `(text, truncated)`.
+fn truncate(text: &str, limit: usize) -> (String, bool) {
+    if text.chars().count() > limit {
+        let head: String = text.chars().take(limit).collect();
+        (format!("{head}\n\n[... truncated at {limit} characters]"), true)
     } else {
-        text.to_string()
+        (text.to_string(), false)
+    }
+}
+
+/// `client.py::_clamp_body_limit`: `None` means `MAX_BODY_CHARS`; any other
+/// value is clamped into `[MIN_BODY_CHARS_LIMIT, MAX_BODY_CHARS_LIMIT]`.
+fn clamp_body_limit(max_body_chars: Option<u32>) -> usize {
+    match max_body_chars {
+        None => MAX_BODY_CHARS,
+        Some(n) => (n as usize).clamp(MIN_BODY_CHARS_LIMIT, MAX_BODY_CHARS_LIMIT),
     }
 }
 
@@ -864,7 +882,9 @@ impl OutlookClient for WindowsOutlookClient {
         })
     }
 
-    fn get_email(&self, email_id: String, prefer_html: bool) -> Result<EmailDetail, ToolError> {
+    fn get_email(&self, email_id: String, prefer_html: bool, max_body_chars: Option<u32>)
+        -> Result<EmailDetail, ToolError> {
+        let limit = clamp_body_limit(max_body_chars);
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &email_id)?;
@@ -874,13 +894,17 @@ impl OutlookClient for WindowsOutlookClient {
             // Body/HTMLBody yields graceful partial detail rather than a COM error.
             let cc = variant_to_string(&get_property(&item, "CC").unwrap_or_default());
             let bcc = variant_to_string(&get_property(&item, "BCC").unwrap_or_default());
-            let body = truncate(&variant_to_string(&get_property(&item, "Body").unwrap_or_default()));
-            let html_body = if prefer_html {
-                Some(truncate(&variant_to_string(
-                    &get_property(&item, "HTMLBody").unwrap_or_default(),
-                )))
+            // `*_length` is the full original length in chars, so a caller
+            // that sees a `*_truncated` flag knows what limit to ask for.
+            let full_body = variant_to_string(&get_property(&item, "Body").unwrap_or_default());
+            let body_length = full_body.chars().count();
+            let (body, body_truncated) = truncate(&full_body, limit);
+            let (html_body, html_truncated, html_length) = if prefer_html {
+                let full_html = variant_to_string(&get_property(&item, "HTMLBody").unwrap_or_default());
+                let (html, truncated) = truncate(&full_html, limit);
+                (Some(html), Some(truncated), Some(full_html.chars().count()))
             } else {
-                None
+                (None, None, None)
             };
             // `getattr(item, "Attachments", None)` then `attachments and attachments.Count`:
             // tolerate an item that has no `Attachments` collection at all (falls back
@@ -927,7 +951,11 @@ impl OutlookClient for WindowsOutlookClient {
                 cc,
                 bcc,
                 body,
+                body_truncated,
+                body_length,
                 html_body,
+                html_truncated,
+                html_length,
                 attachments,
                 item_type,
                 is_meeting,
@@ -1209,9 +1237,14 @@ impl OutlookClient for WindowsOutlookClient {
             let item = get_item(&ns, &event_id)?;
             let summary = event_summary(&item, None)?;
             let recurrence = recurrence_info(&item)?;
+            let (body, body_truncated) = truncate(
+                &variant_to_string(&get_property(&item, "Body").unwrap_or_default()),
+                MAX_BODY_CHARS,
+            );
             Ok(EventDetail {
                 summary,
-                body: truncate(&variant_to_string(&get_property(&item, "Body").unwrap_or_default())),
+                body,
+                body_truncated,
                 recurrence,
             })
         })
@@ -1838,9 +1871,12 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             let note = get_item(&ns, &note_id)?;
             let summary = note_summary(&note)?;
+            let (body, body_truncated) =
+                truncate(&variant_to_string(&get_property(&note, "Body")?), MAX_BODY_CHARS);
             Ok(NoteDetail {
                 summary,
-                body: truncate(&variant_to_string(&get_property(&note, "Body")?)),
+                body,
+                body_truncated,
                 modified: variant_to_iso_string(&get_property(&note, "LastModificationTime").unwrap_or_default()),
             })
         })
@@ -2429,5 +2465,45 @@ mod task_filter_tests {
             ..Default::default()
         };
         assert!(!task_matches("budget numbers", &summary, &query));
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_leaves_short_text_untouched() {
+        assert_eq!(truncate("hello", 10), ("hello".to_string(), false));
+        // Exactly at the limit is not truncated.
+        assert_eq!(truncate("hello", 5), ("hello".to_string(), false));
+        assert_eq!(truncate("", 5), (String::new(), false));
+    }
+
+    #[test]
+    fn truncate_cuts_long_text_and_flags_it() {
+        let (text, truncated) = truncate("abcdefghij", 4);
+        assert!(truncated);
+        assert_eq!(text, "abcd\n\n[... truncated at 4 characters]");
+    }
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        // Each "é" is 2 bytes; a byte-based cut would split a codepoint.
+        let (text, truncated) = truncate("ééééé", 3);
+        assert!(truncated);
+        assert!(text.starts_with("ééé\n\n"));
+        assert_eq!(truncate("ééé", 3), ("ééé".to_string(), false));
+    }
+
+    #[test]
+    fn clamp_body_limit_defaults_and_clamps() {
+        assert_eq!(clamp_body_limit(None), MAX_BODY_CHARS);
+        assert_eq!(clamp_body_limit(Some(0)), MIN_BODY_CHARS_LIMIT);
+        assert_eq!(clamp_body_limit(Some(999)), MIN_BODY_CHARS_LIMIT);
+        assert_eq!(clamp_body_limit(Some(1_000)), 1_000);
+        assert_eq!(clamp_body_limit(Some(250_000)), 250_000);
+        assert_eq!(clamp_body_limit(Some(5_000_000)), MAX_BODY_CHARS_LIMIT);
+        assert_eq!(clamp_body_limit(Some(u32::MAX)), MAX_BODY_CHARS_LIMIT);
     }
 }
