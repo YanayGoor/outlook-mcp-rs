@@ -152,8 +152,8 @@ The Outlook tools then appear in that client.
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**
-- `list_attachments` — list an email's attachments (filename and size)
-- `save_attachments` — save an email's attachments to a local directory
+- `list_attachments` — list an email's attachments with metadata: index, filename, size, type (file/link/item/ole), Content-ID (for `cid:` references in HTML bodies), MIME type, and hidden flag
+- `save_attachments` — save an email's attachments to a local directory (each result carries the same metadata plus `saved_to`/`status`)
 
 **Tasks**
 - `list_tasks` — list Outlook tasks (filter by category, importance, or a text query matching subject or body)

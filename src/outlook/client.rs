@@ -15,8 +15,8 @@ use windows::Win32::System::Variant::VARIANT;
 use crate::constants as c;
 use crate::error::ToolError;
 use crate::outlook::com::{
-    call_method, create_com_object, format_com_error, get_item_categories, get_property,
-    has_member, jet_datetime, make_item_id, parse_item_id, put_property, safe_filename,
+    call_method, clean_content_id, create_com_object, format_com_error, get_item_categories,
+    get_mapi_prop, get_property, guess_mime, has_member, jet_datetime, make_item_id, parse_item_id, put_property, safe_filename,
     set_item_categories, variant_from_bool, variant_from_datetime, variant_from_i32, variant_from_str,
     variant_to_bool, variant_to_i32, variant_to_iso_string, variant_to_string, ComGuard,
 };
@@ -672,6 +672,41 @@ fn compose(
         put_property(&mail, "Body", variant_from_str(body))?;
     }
     Ok(mail)
+}
+
+/// Metadata for one attachment (`index` is COM's 1-based position). Shared by
+/// `list_attachments` and `save_attachments`. `FileName`/`Size` are required;
+/// the MAPI properties are optional (absent -> `None`/`false`).
+fn attachment_info(att: &IDispatch, index: i32) -> Result<AttachmentInfo, ToolError> {
+    let filename = variant_to_string(&get_property(att, "FileName")?);
+    let size = variant_to_i32(&get_property(att, "Size")?).unwrap_or(0);
+    let att_type = get_property(att, "Type")
+        .ok()
+        .and_then(|v| variant_to_i32(&v))
+        .unwrap_or(c::OL_BY_VALUE);
+    let content_id = get_mapi_prop(att, c::PR_ATTACH_CONTENT_ID).map(|v| variant_to_string(&v));
+    let mime_tag = get_mapi_prop(att, c::PR_ATTACH_MIME_TAG).map(|v| variant_to_string(&v));
+    let hidden = get_mapi_prop(att, c::PR_ATTACHMENT_HIDDEN)
+        .and_then(|v| variant_to_bool(&v))
+        .unwrap_or(false);
+    Ok(AttachmentInfo {
+        index,
+        mime_type: guess_mime(mime_tag.as_deref(), &filename),
+        filename,
+        size,
+        att_type: c::attachment_type_name(att_type).to_string(),
+        content_id: clean_content_id(content_id.as_deref()),
+        hidden,
+    })
+}
+
+/// Shallow-merge `extra`'s keys into `base` (both JSON objects; a non-object
+/// `extra` is ignored). Used to append per-call fields to a serialized struct.
+fn merge_json_objects(mut base: Value, extra: Value) -> Value {
+    if let (Value::Object(fields), Value::Object(more)) = (&mut base, extra) {
+        fields.extend(more);
+    }
+    base
 }
 
 /// Attach local files to a mail/reply item. Validates every path exists
@@ -1543,11 +1578,7 @@ impl OutlookClient for WindowsOutlookClient {
             for i in 1..=count {
                 // COM collections are 1-based.
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                results.push(AttachmentInfo {
-                    index: i,
-                    filename: variant_to_string(&get_property(&att, "FileName")?),
-                    size: variant_to_i32(&get_property(&att, "Size")?).unwrap_or(0),
-                });
+                results.push(attachment_info(&att, i)?);
             }
             Ok(results)
         })
@@ -1586,33 +1617,26 @@ impl OutlookClient for WindowsOutlookClient {
             let mut results = Vec::new();
             for i in 1..=count {
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                let raw = variant_to_string(&get_property(&att, "FileName")?);
-                let filename = if raw.is_empty() {
-                    format!("attachment-{i}")
-                } else {
-                    raw
-                };
+                let mut info = attachment_info(&att, i)?;
+                if info.filename.is_empty() {
+                    info.filename = format!("attachment-{i}");
+                }
                 if let Some(wanted) = &wanted {
-                    if !wanted.contains(&filename.to_lowercase()) {
+                    if !wanted.contains(&info.filename.to_lowercase()) {
                         continue;
                     }
                 }
-                let target = dir.join(safe_filename(&filename));
+                let target = dir.join(safe_filename(&info.filename));
                 let target_str = target.to_string_lossy().into_owned();
+                // Each entry is the attachment's metadata (`index` stays its
+                // original COM position even when filtering) plus the outcome.
                 // A COM failure saving one file is collected per-file and does
                 // NOT abort the batch (mirrors the per-file try/except in Python).
-                match call_method(&att, "SaveAsFile", &mut [variant_from_str(&target_str)]) {
-                    Ok(_) => results.push(json!({
-                        "filename": filename,
-                        "saved_to": target_str,
-                        "status": "saved",
-                    })),
-                    Err(e) => results.push(json!({
-                        "filename": filename,
-                        "status": "failed",
-                        "error": format_com_error(&e),
-                    })),
-                }
+                let outcome = match call_method(&att, "SaveAsFile", &mut [variant_from_str(&target_str)]) {
+                    Ok(_) => json!({"saved_to": target_str, "status": "saved"}),
+                    Err(e) => json!({"status": "failed", "error": format_com_error(&e)}),
+                };
+                results.push(merge_json_objects(json!(info), outcome));
             }
             if results.is_empty() {
                 return Err(ToolError::new(
@@ -2429,5 +2453,48 @@ mod task_filter_tests {
             ..Default::default()
         };
         assert!(!task_matches("budget numbers", &summary, &query));
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn info() -> AttachmentInfo {
+        AttachmentInfo {
+            index: 3,
+            filename: "logo.png".to_string(),
+            size: 42,
+            att_type: "file".to_string(),
+            content_id: Some("logo@x".to_string()),
+            mime_type: Some("image/png".to_string()),
+            hidden: true,
+        }
+    }
+
+    #[test]
+    fn attachment_info_serializes_type_key() {
+        let v = json!(info());
+        assert_eq!(v["type"], "file");
+        assert!(v.get("att_type").is_none());
+        assert_eq!(v["content_id"], "logo@x");
+        assert_eq!(v["mime_type"], "image/png");
+        assert_eq!(v["hidden"], true);
+    }
+
+    #[test]
+    fn save_entry_is_info_plus_outcome() {
+        let v = merge_json_objects(json!(info()), json!({"saved_to": "C:/x/logo.png", "status": "saved"}));
+        assert_eq!(v["index"], 3);
+        assert_eq!(v["filename"], "logo.png");
+        assert_eq!(v["type"], "file");
+        assert_eq!(v["saved_to"], "C:/x/logo.png");
+        assert_eq!(v["status"], "saved");
+    }
+
+    #[test]
+    fn merge_ignores_non_object_extra() {
+        let v = merge_json_objects(json!({"a": 1}), json!("nope"));
+        assert_eq!(v, json!({"a": 1}));
     }
 }
