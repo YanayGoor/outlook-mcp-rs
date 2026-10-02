@@ -687,6 +687,7 @@ async fn get_inline_image_forwards_args_and_returns_data_uri() {
         .get_inline_image(Parameters(GetInlineImageParams {
             email_id: EMAIL_ID.to_string(),
             content_id: "cid:logo@example".to_string(),
+            context_lines: None,
         }))
         .await
         .unwrap();
@@ -694,7 +695,7 @@ async fn get_inline_image_forwards_args_and_returns_data_uri() {
         fake.calls(),
         vec![(
             "get_inline_image".to_string(),
-            json!({"email_id": EMAIL_ID, "content_id": "cid:logo@example"})
+            json!({"email_id": EMAIL_ID, "content_id": "cid:logo@example", "context_lines": null})
         )]
     );
     let v = result_json(&result);
@@ -703,6 +704,45 @@ async fn get_inline_image_forwards_args_and_returns_data_uri() {
     assert_eq!(v["mime_type"], "image/png");
     assert_eq!(v["size"], 4);
     assert_eq!(v["data_uri"], "data:image/png;base64,iVBORw==");
+    // Not requested: no `context` key at all.
+    assert!(v.get("context").is_none(), "{v}");
+}
+
+#[tokio::test]
+async fn get_inline_image_forwards_context_lines_and_returns_context() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let result = server
+        .get_inline_image(Parameters(GetInlineImageParams {
+            email_id: EMAIL_ID.to_string(),
+            content_id: "logo@example".to_string(),
+            context_lines: Some(3),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls(),
+        vec![(
+            "get_inline_image".to_string(),
+            json!({"email_id": EMAIL_ID, "content_id": "logo@example", "context_lines": 3})
+        )]
+    );
+    let v = result_json(&result);
+    assert_eq!(v["context"], "Here is our new logo:");
+    assert_eq!(v["data_uri"], "data:image/png;base64,iVBORw==");
+}
+
+#[test]
+fn get_inline_image_params_context_lines_defaults_to_none() {
+    let p: GetInlineImageParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "content_id": "a@b"})).unwrap();
+    assert_eq!(p.context_lines, None);
+    let p: GetInlineImageParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "content_id": "a@b", "context_lines": 5})).unwrap();
+    assert_eq!(p.context_lines, Some(5));
+    let negative = serde_json::from_value::<GetInlineImageParams>(
+        json!({"email_id": EMAIL_ID, "content_id": "a@b", "context_lines": -1}));
+    assert!(negative.is_err());
 }
 
 #[test]
@@ -722,6 +762,7 @@ async fn get_inline_image_surfaces_client_errors() {
         .get_inline_image(Parameters(GetInlineImageParams {
             email_id: EMAIL_ID.to_string(),
             content_id: "x@y".to_string(),
+            context_lines: None,
         }))
         .await
         .unwrap_err();

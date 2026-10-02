@@ -154,7 +154,7 @@ The Outlook tools then appear in that client.
 **Attachments**
 - `list_attachments` — list an email's attachments with metadata: index, filename, size, type (file/link/item/ole), Content-ID (for `cid:` references in HTML bodies), MIME type, and hidden flag
 - `save_attachments` — save an email's attachments to a local directory (each result carries the same metadata plus `saved_to`/`status`)
-- `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB)
+- `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB); optional `context_lines` (max 50) also returns `context`, the plain-text lines just before the image's first `cid:` reference in the HTML body (`""` if it isn't referenced)
 
 **Tasks**
 - `list_tasks` — list Outlook tasks (filter by category, importance, or a text query matching subject or body)

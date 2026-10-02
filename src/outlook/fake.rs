@@ -290,13 +290,16 @@ impl OutlookClient for FakeOutlookClient {
         })])
     }
 
-    fn get_inline_image(&self, email_id: String, content_id: String)
-        -> Result<InlineImage, ToolError> {
-        self.record("get_inline_image", json!({"email_id": email_id, "content_id": content_id}))?;
+    fn get_inline_image(&self, email_id: String, content_id: String,
+        context_lines: Option<u32>) -> Result<InlineImage, ToolError> {
+        self.record("get_inline_image", json!({
+            "email_id": email_id, "content_id": content_id, "context_lines": context_lines,
+        }))?;
         Ok(InlineImage {
             content_id: "logo@example".into(), filename: "logo.png".into(),
             mime_type: "image/png".into(), size: 4,
             data_uri: "data:image/png;base64,iVBORw==".into(),
+            context: context_lines.map(|_| "Here is our new logo:".to_string()),
         })
     }
 
