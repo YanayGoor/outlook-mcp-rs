@@ -16,6 +16,9 @@ pub struct EmailQuery {
     pub count: i32,
     pub unread_only: bool,
     pub from: Option<String>,
+    /// Recipient filter: caseless substring of any To/CC recipient's
+    /// display name or address.
+    pub to: Option<String>,
     pub category: Option<String>,
     pub received_after: Option<String>,
     pub received_before: Option<String>,

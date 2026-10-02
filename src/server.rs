@@ -52,6 +52,8 @@ pub struct ListEmailsParams {
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
     pub received_after: Option<String>,
@@ -466,7 +468,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Find emails in a folder with optional text query and filters (sender, category, date range, attachments, flagged, importance).")]
+    #[tool(description = "Find emails in a folder with optional text query and filters (sender, recipient, category, date range, attachments, flagged, importance). `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring).")]
     pub async fn list_emails(
         &self,
         Parameters(p): Parameters<ListEmailsParams>,
@@ -474,7 +476,7 @@ impl OutlookMcpServer {
         let client = self.client.clone();
         let q = EmailQuery {
             query: p.query, folder: p.folder, count: p.count, unread_only: p.unread_only,
-            from: p.from, category: p.category, received_after: p.received_after,
+            from: p.from, to: p.to, category: p.category, received_after: p.received_after,
             received_before: p.received_before, since_days: p.since_days,
             has_attachments: p.has_attachments, flagged: p.flagged,
             high_importance: p.high_importance,

@@ -56,6 +56,23 @@ async fn list_emails_uses_defaults() {
     assert_eq!(args["folder"], "inbox");
     assert_eq!(args["count"], 10);
     assert_eq!(args["unread_only"], false);
+    assert!(args["to"].is_null());
+}
+
+#[tokio::test]
+async fn list_emails_forwards_recipient_filter() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "folder": "sent", "to": "ada@x.com", "from": "me@x.com"
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "list_emails");
+    assert_eq!(args["folder"], "sent");
+    assert_eq!(args["to"], "ada@x.com");
+    assert_eq!(args["from"], "me@x.com");
 }
 
 #[tokio::test]

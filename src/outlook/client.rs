@@ -31,6 +31,12 @@ use crate::outlook::{
 
 /// Matches `MAX_EMAIL_COUNT` in `client.py`.
 const MAX_EMAIL_COUNT: i32 = 50;
+/// How many items (newest first, after every other filter) `list_emails`
+/// will open one by one when the `to` filter falls back to scanning each
+/// item's `Recipients` collection. Bounds the cost of a per-item COM walk.
+const RECIPIENT_SCAN_LIMIT: i32 = 2000;
+/// MAPI `PR_SMTP_ADDRESS` (Unicode), read through `Recipient.PropertyAccessor`.
+const PR_SMTP_ADDRESS: &str = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F";
 /// Matches `MAX_CALENDAR_ITEMS` in `client.py`. Caps `list_events` because a
 /// recurring appointment without an end date expands forever under
 /// `IncludeRecurrences`.
@@ -398,6 +404,54 @@ fn recurrence_info(item: &IDispatch) -> Result<Option<RecurrenceInfo>, ToolError
         occurrences,
         no_end,
     }))
+}
+
+/// True if `needle` is a case-insensitive substring of any of `candidates`
+/// (a recipient's display name, address, SMTP address, …). Callers skip
+/// the filter entirely for an empty needle.
+fn recipient_matches(needle: &str, candidates: &[String]) -> bool {
+    let needle = needle.to_lowercase();
+    candidates.iter().any(|c| c.to_lowercase().contains(&needle))
+}
+
+/// Every name/address string for the To (Type 1) and CC (Type 2) recipients
+/// of `item`: `Recipient.Name`, `Recipient.Address`, and the SMTP address
+/// from `PropertyAccessor` (for an Exchange recipient `Address` is the X.500
+/// legacy DN, so the SMTP form is only available through PR_SMTP_ADDRESS).
+/// Best-effort: an item without `Recipients` (e.g. some report items) or a
+/// recipient whose properties can't be read just contributes fewer strings.
+fn recipient_strings(item: &IDispatch) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(recipients) = get_property(item, "Recipients").ok().and_then(|v| to_disp(v).ok()) else {
+        return out;
+    };
+    let n = variant_to_i32(&get_property(&recipients, "Count").unwrap_or_default()).unwrap_or(0);
+    for i in 1..=n {
+        let Some(r) = call_method(&recipients, "Item", &mut [variant_from_i32(i)])
+            .ok()
+            .and_then(|v| to_disp(v).ok())
+        else {
+            continue;
+        };
+        let kind = variant_to_i32(&get_property(&r, "Type").unwrap_or_default()).unwrap_or(0);
+        if kind != 1 && kind != 2 {
+            continue; // BCC (3) and originator (0) aren't in displayto/displaycc either.
+        }
+        for prop in ["Name", "Address"] {
+            out.push(variant_to_string(&get_property(&r, prop).unwrap_or_default()));
+        }
+        let smtp = get_property(&r, "PropertyAccessor")
+            .ok()
+            .and_then(|v| to_disp(v).ok())
+            .and_then(|pa| {
+                call_method(&pa, "GetProperty", &mut [variant_from_str(PR_SMTP_ADDRESS)]).ok()
+            });
+        if let Some(v) = smtp {
+            out.push(variant_to_string(&v));
+        }
+    }
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 /// True if `summary` passes every filter set on `q`. All comparisons are
@@ -820,6 +874,34 @@ impl OutlookClient for WindowsOutlookClient {
                 items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&f)])?)?;
             }
 
+            // Recipient: applied last so the fallback below scans an
+            // already-narrowed set. First try DASL on the To/CC display
+            // strings (fast, evaluated by the store, no per-item COM calls).
+            // Those strings are what Outlook shows in the To/CC lines: for
+            // resolved Exchange/contact recipients that's the display NAME
+            // ("Ada Lovelace"), not the address, so an address needle can
+            // match nothing even though the mail was sent to that address.
+            // So when the DASL restrict comes back empty, fall back to
+            // scanning each item's Recipients (Name, Address, SMTP address)
+            // client-side, over at most RECIPIENT_SCAN_LIMIT newest items.
+            // A non-empty DASL result is kept as-is: every hit genuinely has
+            // the needle in its To/CC line, and it avoids the per-item walk.
+            let mut to_scan: Option<&str> = None;
+            if let Some(to) = q.to.as_deref().filter(|s| !s.is_empty()) {
+                let e = to.replace('\'', "''");
+                let dasl = format!(
+                    "@SQL=(\"urn:schemas:httpmail:displayto\" LIKE '%{e}%' \
+                     OR \"urn:schemas:httpmail:displaycc\" LIKE '%{e}%')"
+                );
+                let restricted =
+                    to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
+                if variant_to_i32(&get_property(&restricted, "Count")?).unwrap_or(0) > 0 {
+                    items = restricted;
+                } else {
+                    to_scan = Some(to);
+                }
+            }
+
             call_method(
                 &items,
                 "Sort",
@@ -832,7 +914,13 @@ impl OutlookClient for WindowsOutlookClient {
             let total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
             let mut results = Vec::new();
             for i in 1..=total {
+                if to_scan.is_some() && i > RECIPIENT_SCAN_LIMIT {
+                    break;
+                }
                 let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                if to_scan.is_some_and(|to| !recipient_matches(to, &recipient_strings(&item))) {
+                    continue;
+                }
                 let summary = email_summary(&item)?;
                 if let Some(want) = &cat_want {
                     if !summary.categories.iter().any(|c| c.to_lowercase() == *want) {
@@ -2429,5 +2517,39 @@ mod task_filter_tests {
             ..Default::default()
         };
         assert!(!task_matches("budget numbers", &summary, &query));
+    }
+}
+
+#[cfg(test)]
+mod recipient_filter_tests {
+    use super::recipient_matches;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn matches_name_substring_caselessly() {
+        assert!(recipient_matches("lovelace", &strs(&["Ada Lovelace", "/o=ExchangeLabs/cn=ada"])));
+        assert!(recipient_matches("ADA", &strs(&["Ada Lovelace"])));
+    }
+
+    #[test]
+    fn matches_smtp_address_when_name_differs() {
+        let c = strs(&["Ada Lovelace", "/o=ExchangeLabs/cn=ada", "Ada.Lovelace@Example.com"]);
+        assert!(recipient_matches("ada.lovelace@example.com", &c));
+        assert!(recipient_matches("@example.com", &c));
+    }
+
+    #[test]
+    fn rejects_when_no_candidate_contains_needle() {
+        let c = strs(&["nobody@example.invalid"]);
+        assert!(!recipient_matches("someone-else@example.invalid", &c));
+        assert!(!recipient_matches("ada", &[]));
+    }
+
+    #[test]
+    fn empty_needle_matches_anything_with_a_candidate() {
+        assert!(recipient_matches("", &strs(&["x"])));
     }
 }
