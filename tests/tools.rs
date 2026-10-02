@@ -650,9 +650,11 @@ async fn list_attachments_returns_filename() {
     assert!(v[0]["content_id"].is_null());
     assert_eq!(v[0]["mime_type"], "application/pdf");
     assert_eq!(v[0]["hidden"], false);
+    assert_eq!(v[0]["is_inline"], false);
     assert_eq!(v[1]["content_id"], "logo@example");
     assert_eq!(v[1]["mime_type"], "image/png");
     assert_eq!(v[1]["hidden"], true);
+    assert_eq!(v[1]["is_inline"], true);
 }
 
 #[tokio::test]
@@ -674,7 +676,7 @@ async fn save_attachments_passes_dir_and_names() {
     assert_eq!(v[0]["filename"], "report.pdf");
     assert_eq!(v[0]["status"], "saved");
     assert_eq!(v[0]["saved_to"], "/tmp/x");
-    for key in ["index", "size", "type", "content_id", "mime_type", "hidden"] {
+    for key in ["index", "size", "type", "content_id", "mime_type", "hidden", "is_inline"] {
         assert!(v[0].get(key).is_some(), "missing {key}");
     }
 }

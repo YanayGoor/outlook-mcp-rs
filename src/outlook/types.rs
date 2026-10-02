@@ -190,6 +190,10 @@ pub struct AttachmentInfo {
     pub mime_type: Option<String>,
     /// MAPI `PR_ATTACHMENT_HIDDEN`; false when the property is absent.
     pub hidden: bool,
+    /// Inline (`cid:`-referenced) content rather than a standalone attachment:
+    /// has a Content-ID and is either hidden or referenced by the HTML body
+    /// (see `com::is_inline`).
+    pub is_inline: bool,
 }
 
 #[cfg(test)]
