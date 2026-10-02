@@ -340,6 +340,14 @@ pub struct SaveAttachmentsParams {
     pub attachment_names: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetInlineImageParams {
+    pub email_id: String,
+    /// The attachment's Content-ID (`content_id` from list_attachments, or the
+    /// `cid:...` reference from the HTML body). A `cid:` prefix and `<>` are accepted.
+    pub content_id: String,
+}
+
 // ---- Tasks ----
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -678,6 +686,16 @@ impl OutlookMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
         let result = run_blocking(move || client.save_attachments(email_id, save_dir, attachment_names)).await?;
+        Ok(CallToolResult::success(vec![json_content(&result)?]))
+    }
+
+    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files.")]
+    pub async fn get_inline_image(
+        &self,
+        Parameters(GetInlineImageParams { email_id, content_id }): Parameters<GetInlineImageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = self.client.clone();
+        let result = run_blocking(move || client.get_inline_image(email_id, content_id)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 

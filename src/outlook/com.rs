@@ -61,6 +61,19 @@ pub fn clean_content_id(raw: Option<&str>) -> Option<String> {
     if inner.is_empty() { None } else { Some(inner.to_string()) }
 }
 
+/// Normalize a caller-supplied Content-ID the way an HTML body might spell it:
+/// trim whitespace, drop a leading `cid:` (any case), then strip `<>` as
+/// `clean_content_id` does. `None` when nothing is left. Compare the result
+/// case-insensitively.
+pub fn normalize_cid_request(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let rest = match trimmed.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("cid:") => &trimmed[4..],
+        _ => trimmed,
+    };
+    clean_content_id(Some(rest))
+}
+
 /// An attachment's MIME type: its own MIME tag (`PR_ATTACH_MIME_TAG`),
 /// lowercased, when present; otherwise a guess from the file extension.
 /// `None` when neither yields anything.
@@ -147,6 +160,24 @@ mod tests {
         assert_eq!(clean_content_id(Some("   ")), None);
         assert_eq!(clean_content_id(Some("")), None);
         assert_eq!(clean_content_id(None), None);
+    }
+
+    #[test]
+    fn normalize_cid_request_strips_cid_prefix_and_brackets() {
+        assert_eq!(normalize_cid_request("image001.png@01D9"), Some("image001.png@01D9".to_string()));
+        assert_eq!(normalize_cid_request("cid:image001.png@01D9"), Some("image001.png@01D9".to_string()));
+        assert_eq!(normalize_cid_request("  CID:<abc@x>  "), Some("abc@x".to_string()));
+        assert_eq!(normalize_cid_request("Cid: <abc@x>"), Some("abc@x".to_string()));
+        assert_eq!(normalize_cid_request("<abc@x>"), Some("abc@x".to_string()));
+        // Only a leading prefix is stripped, and case is preserved.
+        assert_eq!(normalize_cid_request("Logo-cid:A@B"), Some("Logo-cid:A@B".to_string()));
+        assert_eq!(normalize_cid_request("cid:"), None);
+        assert_eq!(normalize_cid_request("cid:<>"), None);
+        assert_eq!(normalize_cid_request("  "), None);
+        assert_eq!(normalize_cid_request(""), None);
+        // Multi-byte input shorter than / straddling the prefix length is fine.
+        assert_eq!(normalize_cid_request("é@x"), Some("é@x".to_string()));
+        assert_eq!(normalize_cid_request("ciéd"), Some("ciéd".to_string()));
     }
 
     #[test]
