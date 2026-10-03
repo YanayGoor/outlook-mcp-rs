@@ -1368,11 +1368,22 @@ impl OutlookClient for WindowsOutlookClient {
             })()
             .unwrap_or_default();
             if permanent_delete_needs_move(&parent_id, &deleted_id) {
-                // Move returns the item in its new home; delete that copy.
+                // Move returns the item in its new home, but Delete() on that
+                // returned object is a silent no-op (confirmed with a raw
+                // PowerShell COM probe on an Outlook.com store, with or
+                // without a delay): the item stays in Deleted Items. Re-open
+                // the moved item by EntryID and delete that fresh object.
                 let moved = to_disp(call_method(
                     &item, "Move", &mut [VARIANT::from(deleted.clone())],
                 )?)?;
-                call_method(&moved, "Delete", &mut [])?;
+                let moved_id = variant_to_string(&get_property(&moved, "EntryID")?);
+                let store_id = variant_to_string(&get_property(&deleted, "StoreID")?);
+                let fresh = to_disp(call_method(
+                    &ns,
+                    "GetItemFromID",
+                    &mut [variant_from_str(&moved_id), variant_from_str(&store_id)],
+                )?)?;
+                call_method(&fresh, "Delete", &mut [])?;
             } else {
                 call_method(&item, "Delete", &mut [])?;
             }
