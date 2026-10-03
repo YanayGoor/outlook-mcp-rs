@@ -28,6 +28,27 @@ Run them with:
 cargo test --test live_outlook -- --ignored
 ```
 
+## Full system tests (one run across many tools)
+
+Besides the per-feature live tests above, there are larger system tests. Each
+one seeds tagged test data, checks many tools in a single run, and always
+cleans up. Like the live tests, they are `#[ignore]`d and need a running
+Outlook:
+
+| Test | Covers | Plan / results |
+|---|---|---|
+| `cargo test --test system_test -- --ignored --nocapture` | Plans 1–9 (email + calendar) | `SYSTEM_TEST_PLAN_2026-07-16.md`, `SYSTEM_TEST_RESULTS_2026-07-16.md` |
+| `cargo test --test system_test_p10_12 -- --ignored --nocapture` | Plans 10–12 (availability, tasks, notes) | `SYSTEM_TEST_PLAN_2026-07-16-P10-12.md`, `SYSTEM_TEST_RESULTS_2026-07-16-P10-12.md` |
+| `cargo test --test system_test_prs -- --ignored --nocapture` | PRs #14–#25: `list_emails` offset/`to`/non-ASCII search, `get_email` truncation flags, `update_draft`, permanent delete, attachment metadata, inline images, `get_inline_image` | `SYSTEM_TEST_PLAN_2026-10-03-PRS.md`, `SYSTEM_TEST_RESULTS_2026-10-03-PRS.md` |
+
+`system_test_prs` sends **one** real email, a self-loop to the mailbox
+owner's own address (`SELF_ADDR` in the test; change it before running on
+another mailbox). Everything else is a draft addressed to
+`nobody@example.invalid`. It never calls `empty_deleted_items(confirm=true)`.
+
+How these are planned, run, and root-caused is described in the
+`live-outlook-system-test` skill (`.claude/skills/live-outlook-system-test/SKILL.md`).
+
 ## Manual-only tests (not automated at all)
 
 `send_email`, `respond_to_meeting`, and `create_event` with `send: true` have
