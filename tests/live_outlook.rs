@@ -341,6 +341,43 @@ fn create_draft_with_attachment_round_trips() {
 
 #[test]
 #[ignore]
+fn list_attachments_reports_metadata_for_a_draft_attachment() {
+    let dir = std::env::temp_dir();
+    let path = dir.join("outlook-mcp-rs-live-attach-meta.txt");
+    std::fs::write(&path, b"live attachment metadata test").expect("write temp file");
+    let path_str = path.to_string_lossy().to_string();
+
+    let c = WindowsOutlookClient::new();
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        "outlook-mcp-rs attachment metadata test".to_string(),
+        "see attached".to_string(),
+        None, None, false,
+        Some(vec![path_str]),
+    ).expect("create_draft with attachment should succeed");
+    let id = created["id"].as_str().expect("draft id").to_string();
+
+    // Capture the result before cleanup so a failed assertion doesn't leak the draft.
+    let listed = c.list_attachments(id.clone());
+    c.delete_email(id).expect("cleanup: delete the draft");
+    let _ = std::fs::remove_file(&path);
+
+    let atts = listed.expect("list_attachments should succeed");
+    assert_eq!(atts.len(), 1);
+    let v = serde_json::to_value(&atts[0]).unwrap();
+    assert_eq!(v["index"], 1);
+    assert_eq!(v["filename"], "outlook-mcp-rs-live-attach-meta.txt");
+    assert!(v["size"].as_i64().unwrap() > 0);
+    assert_eq!(v["type"], "file");
+    // A plain file attachment has no Content-ID; its MIME type comes from the
+    // tag or the .txt extension.
+    assert!(v["content_id"].is_null());
+    assert_eq!(v["mime_type"], "text/plain");
+    assert_eq!(v["hidden"], false);
+}
+
+#[test]
+#[ignore]
 fn get_email_reports_item_type_for_real_inbox_item() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {

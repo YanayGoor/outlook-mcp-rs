@@ -267,14 +267,27 @@ impl OutlookClient for FakeOutlookClient {
     fn list_attachments(&self, email_id: String)
         -> Result<Vec<AttachmentInfo>, ToolError> {
         self.record("list_attachments", json!({"email_id": email_id}))?;
-        Ok(vec![AttachmentInfo { index: 1, filename: "report.pdf".into(), size: 1234 }])
+        Ok(vec![
+            AttachmentInfo {
+                index: 1, filename: "report.pdf".into(), size: 1234, att_type: "file".into(),
+                content_id: None, mime_type: Some("application/pdf".into()), hidden: false,
+            },
+            AttachmentInfo {
+                index: 2, filename: "logo.png".into(), size: 512, att_type: "file".into(),
+                content_id: Some("logo@example".into()), mime_type: Some("image/png".into()), hidden: true,
+            },
+        ])
     }
 
     fn save_attachments(&self, email_id: String, save_dir: String,
         attachment_names: Option<Vec<String>>) -> Result<Vec<Value>, ToolError> {
         self.record("save_attachments",
             json!({"email_id": email_id, "save_dir": save_dir, "attachment_names": attachment_names}))?;
-        Ok(vec![json!({"filename": "report.pdf", "saved_to": save_dir, "status": "saved"})])
+        Ok(vec![json!({
+            "index": 1, "filename": "report.pdf", "size": 1234, "type": "file",
+            "content_id": null, "mime_type": "application/pdf", "hidden": false,
+            "saved_to": save_dir, "status": "saved",
+        })])
     }
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError> {

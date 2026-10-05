@@ -642,14 +642,24 @@ async fn list_attachments_returns_filename() {
         .list_attachments(Parameters(ListAttachmentsParams { email_id: EMAIL_ID.to_string() }))
         .await
         .unwrap();
-    assert_eq!(result_json(&result)[0]["filename"], "report.pdf");
+    let v = result_json(&result);
+    assert_eq!(v[0]["filename"], "report.pdf");
+    assert_eq!(v[0]["index"], 1);
+    assert_eq!(v[0]["size"], 1234);
+    assert_eq!(v[0]["type"], "file");
+    assert!(v[0]["content_id"].is_null());
+    assert_eq!(v[0]["mime_type"], "application/pdf");
+    assert_eq!(v[0]["hidden"], false);
+    assert_eq!(v[1]["content_id"], "logo@example");
+    assert_eq!(v[1]["mime_type"], "image/png");
+    assert_eq!(v[1]["hidden"], true);
 }
 
 #[tokio::test]
 async fn save_attachments_passes_dir_and_names() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
+    let result = server
         .save_attachments(Parameters(SaveAttachmentsParams {
             email_id: EMAIL_ID.to_string(),
             save_dir: "/tmp/x".to_string(),
@@ -660,6 +670,13 @@ async fn save_attachments_passes_dir_and_names() {
     let (_, args) = &fake.calls()[0];
     assert_eq!(args["save_dir"], "/tmp/x");
     assert_eq!(args["attachment_names"], json!(["report.pdf"]));
+    let v = result_json(&result);
+    assert_eq!(v[0]["filename"], "report.pdf");
+    assert_eq!(v[0]["status"], "saved");
+    assert_eq!(v[0]["saved_to"], "/tmp/x");
+    for key in ["index", "size", "type", "content_id", "mime_type", "hidden"] {
+        assert!(v[0].get(key).is_some(), "missing {key}");
+    }
 }
 
 // ---- Tasks ----

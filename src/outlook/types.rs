@@ -173,11 +173,23 @@ pub struct NoteDetail {
     pub modified: Option<String>,
 }
 
+/// Metadata for one attachment, shared by `list_attachments` and (flattened,
+/// plus `saved_to`/`status`/`error`) `save_attachments`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentInfo {
+    /// COM's 1-based position in the item's `Attachments` collection.
     pub index: i32,
     pub filename: String,
     pub size: i32,
+    /// `"file"`, `"link"`, `"item"`, `"ole"` or `"unknown"` (see
+    /// `constants::attachment_type_name`).
+    #[serde(rename = "type")]
+    pub att_type: String,
+    /// Content-ID without `<>`, as an HTML body references it (`cid:...`).
+    pub content_id: Option<String>,
+    pub mime_type: Option<String>,
+    /// MAPI `PR_ATTACHMENT_HIDDEN`; false when the property is absent.
+    pub hidden: bool,
 }
 
 #[cfg(test)]
