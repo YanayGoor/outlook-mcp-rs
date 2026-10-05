@@ -26,7 +26,7 @@ fn list_folders_returns_at_least_inbox() {
 #[ignore]
 fn list_emails_returns_inbox_items() {
     let emails = client().list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 5, unread_only: false,
+        query: None, folder: "inbox".into(), count: 5, offset: 0, unread_only: false,
         from: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list_emails should succeed against a live Outlook");
@@ -35,6 +35,27 @@ fn list_emails_returns_inbox_items() {
     for email in &emails {
         assert!(!email.id.is_empty());
     }
+}
+
+#[test]
+#[ignore]
+fn list_emails_offset_pages_tile_without_overlap() {
+    let c = client();
+    let page = |count: i32, offset: i32| -> Vec<String> {
+        c.list_emails(EmailQuery {
+            query: None, folder: "inbox".into(), count, offset, unread_only: false,
+            from: None, category: None, received_after: None, received_before: None,
+            since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        }).expect("list_emails should succeed against a live Outlook")
+            .into_iter().map(|e| e.id).collect()
+    };
+    let p1 = page(5, 0);
+    let p2 = page(5, 5);
+    let both = page(10, 0);
+    // Pages are disjoint, and together they are exactly one count=10 call
+    // (assumes no mail arrives in the inbox mid-test).
+    assert!(p1.iter().all(|id| !p2.contains(id)), "page 1 and page 2 overlap");
+    assert_eq!([p1, p2].concat(), both);
 }
 
 #[test]
@@ -274,14 +295,14 @@ fn list_emails_query_filter_narrows_results() {
     use outlook_mcp_rs::outlook::EmailQuery;
     let c = WindowsOutlookClient::new();
     let all = c.list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 25, unread_only: false,
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
         from: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("plain list should work");
     // A query that almost certainly matches nothing should return <= all.
     let filtered = c.list_emails(EmailQuery {
         query: Some("zzqx-improbable-token-9137".into()),
-        folder: "inbox".into(), count: 25, unread_only: false,
+        folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
         from: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("query list should work");
@@ -302,7 +323,7 @@ fn list_emails_query_matches_real_body_text() {
     let id = created["id"].as_str().unwrap().to_string();
 
     let found = c.list_emails(EmailQuery {
-        query: Some(token.to_string()), folder: "drafts".into(), count: 25,
+        query: Some(token.to_string()), folder: "drafts".into(), count: 25, offset: 0,
         unread_only: false, from: None, category: None, received_after: None,
         received_before: None, since_days: None, has_attachments: None,
         flagged: false, high_importance: false,
@@ -381,7 +402,7 @@ fn list_attachments_reports_metadata_for_a_draft_attachment() {
 fn inline_flag_consistent_on_a_real_inbox_email() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 25, unread_only: false,
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
         from: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list");
@@ -407,7 +428,7 @@ fn get_inline_image_round_trips_a_real_content_id() {
     use base64::Engine as _;
     let c = WindowsOutlookClient::new();
     let emails = c.list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 25, unread_only: false,
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
         from: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list_emails");
@@ -445,7 +466,7 @@ fn get_inline_image_round_trips_a_real_content_id() {
 fn get_email_reports_item_type_for_real_inbox_item() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 1, unread_only: false,
+        query: None, folder: "inbox".into(), count: 1, offset: 0, unread_only: false,
         from: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list");

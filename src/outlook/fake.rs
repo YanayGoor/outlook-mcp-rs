@@ -57,7 +57,7 @@ impl OutlookClient for FakeOutlookClient {
 
     fn list_emails(&self, q: EmailQuery) -> Result<Vec<EmailSummary>, ToolError> {
         self.record("list_emails", json!({
-            "query": q.query, "folder": q.folder, "count": q.count,
+            "query": q.query, "folder": q.folder, "count": q.count, "offset": q.offset,
             "unread_only": q.unread_only, "from": q.from, "category": q.category,
             "received_after": q.received_after, "received_before": q.received_before,
             "since_days": q.since_days, "has_attachments": q.has_attachments,
@@ -397,7 +397,7 @@ mod tests {
 
     fn basic_query() -> EmailQuery {
         EmailQuery {
-            query: None, folder: "inbox".into(), count: 10, unread_only: false,
+            query: None, folder: "inbox".into(), count: 10, offset: 0, unread_only: false,
             from: None, category: None, received_after: None, received_before: None,
             since_days: None, has_attachments: None, flagged: false, high_importance: false,
         }
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(fake.calls(), vec![
             ("list_folders".to_string(), json!({})),
             ("list_emails".to_string(), json!({
-                "query": null, "folder": "inbox", "count": 10, "unread_only": false,
+                "query": null, "folder": "inbox", "count": 10, "offset": 0, "unread_only": false,
                 "from": null, "category": null, "received_after": null,
                 "received_before": null, "since_days": null, "has_attachments": null,
                 "flagged": false, "high_importance": false,

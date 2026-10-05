@@ -7,13 +7,16 @@ use crate::error::ToolError;
 use serde_json::Value;
 use types::*;
 
-/// All filters for `list_emails`. All optional except `folder`/`count`
+/// All filters for `list_emails`. All optional except `folder`/`count`/`offset`
 /// (which the server fills with defaults). Supplying several ANDs them.
 #[derive(Debug, Clone)]
 pub struct EmailQuery {
     pub query: Option<String>,
     pub folder: String,
     pub count: i32,
+    /// Matches to skip before the page starts (after every filter). Negative
+    /// values are treated as 0.
+    pub offset: i32,
     pub unread_only: bool,
     pub from: Option<String>,
     pub category: Option<String>,
@@ -577,12 +580,84 @@ pub fn text_before_cid(html: &str, cid: &str, lines: u32) -> Option<String> {
     Some(all[all.len().saturating_sub(n)..].join("\n"))
 }
 
+/// One page of a lazy stream of filter matches: drops the first `offset`
+/// (negative treated as 0), then keeps up to `count`, and stops pulling from
+/// `matches` once the page is full. An error from any pulled item, including
+/// a skipped one, is returned as-is.
+pub fn take_page<T, E>(
+    matches: impl Iterator<Item = Result<T, E>>,
+    offset: i32,
+    count: i32,
+) -> Result<Vec<T>, E> {
+    let mut matches = matches;
+    for m in matches.by_ref().take(offset.max(0) as usize) {
+        m?;
+    }
+    matches.take(count.max(0) as usize).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
-        parse_freebusy_slots, validate_recurrence, validate_recurrence_update, EventUpdate, RecurrenceInput,
+        parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update, EventUpdate,
+        RecurrenceInput,
     };
+    use std::cell::Cell;
+
+    fn ok_items(n: i32) -> impl Iterator<Item = Result<i32, String>> {
+        (1..=n).map(Ok)
+    }
+
+    #[test]
+    fn take_page_first_page_is_the_first_count_items() {
+        assert_eq!(take_page(ok_items(10), 0, 3), Ok(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn take_page_skips_offset_then_takes_count() {
+        assert_eq!(take_page(ok_items(10), 3, 3), Ok(vec![4, 5, 6]));
+    }
+
+    #[test]
+    fn take_page_consecutive_pages_tile_the_stream() {
+        let p1 = take_page(ok_items(10), 0, 5).unwrap();
+        let p2 = take_page(ok_items(10), 5, 5).unwrap();
+        let both = take_page(ok_items(10), 0, 10).unwrap();
+        assert_eq!([p1, p2].concat(), both);
+    }
+
+    #[test]
+    fn take_page_last_page_is_short_and_past_the_end_is_empty() {
+        assert_eq!(take_page(ok_items(7), 5, 5), Ok(vec![6, 7]));
+        assert_eq!(take_page(ok_items(7), 7, 5), Ok(vec![]));
+        assert_eq!(take_page(ok_items(7), 100, 5), Ok(vec![]));
+    }
+
+    #[test]
+    fn take_page_negative_offset_is_treated_as_zero() {
+        assert_eq!(take_page(ok_items(10), -4, 2), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn take_page_stops_pulling_once_the_page_is_full() {
+        let pulled = Cell::new(0);
+        let it = (1..=100).map(|i| {
+            pulled.set(pulled.get() + 1);
+            Ok::<i32, String>(i)
+        });
+        assert_eq!(take_page(it, 2, 3), Ok(vec![3, 4, 5]));
+        assert_eq!(pulled.get(), 5);
+    }
+
+    #[test]
+    fn take_page_propagates_errors_from_skipped_and_kept_items() {
+        let with_err = |bad: i32| (1..=10).map(move |i| if i == bad { Err(format!("bad {i}")) } else { Ok(i) });
+        assert_eq!(take_page(with_err(2), 3, 3), Err("bad 2".to_string()));
+        assert_eq!(take_page(with_err(5), 3, 3), Err("bad 5".to_string()));
+        // An error beyond the page is never pulled.
+        assert_eq!(take_page(with_err(9), 3, 3), Ok(vec![4, 5, 6]));
+    }
     use crate::outlook::types::{AvailabilitySlot, FreeWindow, PersonAvailability};
 
     #[test]

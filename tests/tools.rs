@@ -34,7 +34,7 @@ async fn list_emails_passes_arguments() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
     let params: ListEmailsParams = serde_json::from_value(json!({
-        "folder": "sent", "count": 5, "unread_only": true
+        "folder": "sent", "count": 5, "offset": 15, "unread_only": true
     }))
     .unwrap();
     server.list_emails(Parameters(params)).await.unwrap();
@@ -42,6 +42,7 @@ async fn list_emails_passes_arguments() {
     assert_eq!(name, "list_emails");
     assert_eq!(args["folder"], "sent");
     assert_eq!(args["count"], 5);
+    assert_eq!(args["offset"], 15);
     assert_eq!(args["unread_only"], true);
 }
 
@@ -55,6 +56,7 @@ async fn list_emails_uses_defaults() {
     assert_eq!(name, "list_emails");
     assert_eq!(args["folder"], "inbox");
     assert_eq!(args["count"], 10);
+    assert_eq!(args["offset"], 0);
     assert_eq!(args["unread_only"], false);
 }
 
