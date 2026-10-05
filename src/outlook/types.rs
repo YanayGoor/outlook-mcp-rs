@@ -173,11 +173,47 @@ pub struct NoteDetail {
     pub modified: Option<String>,
 }
 
+/// Metadata for one attachment, shared by `list_attachments` and (flattened,
+/// plus `saved_to`/`status`/`error`) `save_attachments`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentInfo {
+    /// COM's 1-based position in the item's `Attachments` collection.
     pub index: i32,
     pub filename: String,
     pub size: i32,
+    /// `"file"`, `"link"`, `"item"`, `"ole"` or `"unknown"` (see
+    /// `constants::attachment_type_name`).
+    #[serde(rename = "type")]
+    pub att_type: String,
+    /// Content-ID without `<>`, as an HTML body references it (`cid:...`).
+    pub content_id: Option<String>,
+    pub mime_type: Option<String>,
+    /// MAPI `PR_ATTACHMENT_HIDDEN`; false when the property is absent.
+    pub hidden: bool,
+    /// Inline (`cid:`-referenced) content rather than a standalone attachment:
+    /// has a Content-ID and is either hidden or referenced by the HTML body
+    /// (see `com::is_inline`).
+    pub is_inline: bool,
+}
+
+/// An attachment fetched by Content-ID (`get_inline_image`), inlined as a
+/// base64 `data:` URI.
+#[derive(Debug, Clone, Serialize)]
+pub struct InlineImage {
+    /// The attachment's Content-ID without `<>` (as `list_attachments` shows it).
+    pub content_id: String,
+    pub filename: String,
+    /// From the attachment's metadata, else `application/octet-stream`.
+    pub mime_type: String,
+    /// Actual byte length of the decoded payload.
+    pub size: usize,
+    /// `data:<mime_type>;base64,<payload>`.
+    pub data_uri: String,
+    /// Only when `context_lines` was requested: the plain-text lines just
+    /// before the first `cid:` reference to this image in the HTML body
+    /// (`""` if the body never references it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 #[cfg(test)]
