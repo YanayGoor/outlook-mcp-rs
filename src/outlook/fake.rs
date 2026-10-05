@@ -6,7 +6,8 @@ use crate::error::ToolError;
 use super::types::*;
 use super::{
     require_empty_confirm, validate_recurrence_update, CheckAvailabilityInput, CreateEventInput,
-    EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, TaskQuery, TaskUpdate,
+    EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
+    TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate,
 };
 
 pub const EMAIL_ID: &str = "entry-1|store-1";
@@ -132,6 +133,17 @@ impl OutlookClient for FakeOutlookClient {
             u.email_id.clone()
         };
         Ok(json!({"status": "updated", "id": id, "changed": changed}))
+    }
+
+    fn update_draft(&self, u: DraftUpdate) -> Result<Value, ToolError> {
+        // Same up-front validation as the real client.
+        validate_draft_update(&u)?;
+        self.record("update_draft", json!({
+            "draft_id": u.draft_id, "subject": u.subject, "body": u.body,
+            "html_body": u.html_body, "to": u.to, "cc": u.cc, "bcc": u.bcc,
+            "attachments": u.attachments,
+        }))?;
+        Ok(json!({"status": "draft_updated", "id": u.draft_id, "changed": draft_update_changes(&u)}))
     }
 
     fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError> {

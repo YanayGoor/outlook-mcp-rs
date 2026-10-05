@@ -46,6 +46,25 @@ pub struct EmailUpdate {
     pub importance: Option<String>,         // "low" | "normal" | "high"
 }
 
+/// All changes `update_draft` can apply to one existing, unsent draft.
+/// Every field except `draft_id` is optional; supplying several applies all
+/// of them in field order and then saves once (the draft is never sent).
+/// `subject`, `body` and `html_body` replace the current value (`body` and
+/// `html_body` are mutually exclusive). `to`/`cc`/`bcc` replace that whole
+/// recipient line, and `Some(vec![])` clears it. `attachments` are local file
+/// paths appended to the existing attachments.
+#[derive(Debug, Clone, Default)]
+pub struct DraftUpdate {
+    pub draft_id: String,
+    pub subject: Option<String>,
+    pub body: Option<String>,
+    pub html_body: Option<String>,
+    pub to: Option<Vec<String>>,
+    pub cc: Option<Vec<String>>,
+    pub bcc: Option<Vec<String>>,
+    pub attachments: Option<Vec<String>>,
+}
+
 /// All changes `update_task` can apply to one existing task. Every field
 /// except `task_id` is optional; supplying several applies all of them.
 /// `mark_complete: Some(true)` replaces the retired standalone
@@ -212,6 +231,7 @@ pub trait OutlookClient: Send + Sync {
         html: bool, send: bool, attachments: Option<Vec<String>>)
         -> Result<Value, ToolError>;
     fn update_email(&self, u: EmailUpdate) -> Result<Value, ToolError>;
+    fn update_draft(&self, u: DraftUpdate) -> Result<Value, ToolError>;
     /// `permanent = false` moves the email to Deleted Items; `true`
     /// hard-deletes it like Outlook's shift+delete.
     fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError>;
@@ -340,6 +360,44 @@ pub fn validate_recurrence_update(u: &EventUpdate) -> Result<(), ToolError> {
         ));
     }
     Ok(())
+}
+
+/// Rejects a `DraftUpdate` that can't be applied, before the draft is
+/// touched: `body` and `html_body` together, an update that changes nothing
+/// (an empty `attachments` list counts as nothing), or an attachment path
+/// that isn't an existing file. Called by both `update_draft` implementors.
+pub fn validate_draft_update(u: &DraftUpdate) -> Result<(), ToolError> {
+    if u.body.is_some() && u.html_body.is_some() {
+        return Err(ToolError::new("pass either 'body' or 'html_body', not both"));
+    }
+    let attachments = u.attachments.as_deref().unwrap_or(&[]);
+    if u.subject.is_none() && u.body.is_none() && u.html_body.is_none()
+        && u.to.is_none() && u.cc.is_none() && u.bcc.is_none() && attachments.is_empty()
+    {
+        return Err(ToolError::new(
+            "update_draft needs at least one of: subject, body, html_body, to, cc, bcc, attachments",
+        ));
+    }
+    for p in attachments {
+        if !std::path::Path::new(p).is_file() {
+            return Err(ToolError::new(format!("attachment not found: {p}")));
+        }
+    }
+    Ok(())
+}
+
+/// The `changed` list `update_draft` returns: the supplied fields, in the
+/// order they are applied. Assumes `u` already passed `validate_draft_update`.
+pub fn draft_update_changes(u: &DraftUpdate) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if u.subject.is_some() { changed.push("subject"); }
+    if u.body.is_some() { changed.push("body"); }
+    if u.html_body.is_some() { changed.push("html_body"); }
+    if u.to.is_some() { changed.push("to"); }
+    if u.cc.is_some() { changed.push("cc"); }
+    if u.bcc.is_some() { changed.push("bcc"); }
+    if u.attachments.as_ref().is_some_and(|a| !a.is_empty()) { changed.push("attachments"); }
+    changed
 }
 
 /// Inverse of [`com_recurrence_interval`]: converts a COM `Interval` value
@@ -632,6 +690,7 @@ mod tests {
         com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
         parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
         EventUpdate, RecurrenceInput, permanent_delete_needs_move, require_empty_confirm,
+        draft_update_changes, validate_draft_update, DraftUpdate,
     };
     use std::cell::Cell;
 
@@ -922,6 +981,66 @@ mod tests {
     fn common_free_empty_when_no_one_resolved() {
         let people = vec![avail("alice", false, &[])];
         assert_eq!(common_free(&people, &["free".to_string()]), vec![]);
+    }
+
+    fn draft(id: &str) -> DraftUpdate {
+        DraftUpdate { draft_id: id.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn validate_draft_update_rejects_body_and_html_body_together() {
+        let u = DraftUpdate {
+            body: Some("plain".into()), html_body: Some("<p>html</p>".into()), ..draft("d")
+        };
+        assert!(validate_draft_update(&u).unwrap_err().to_string().contains("not both"));
+    }
+
+    #[test]
+    fn validate_draft_update_rejects_an_empty_update() {
+        assert!(validate_draft_update(&draft("d")).is_err());
+        // An empty attachments list changes nothing either.
+        let u = DraftUpdate { attachments: Some(vec![]), ..draft("d") };
+        assert!(validate_draft_update(&u).is_err());
+    }
+
+    #[test]
+    fn validate_draft_update_accepts_a_single_field() {
+        assert!(validate_draft_update(&DraftUpdate { subject: Some("s".into()), ..draft("d") }).is_ok());
+        assert!(validate_draft_update(&DraftUpdate { html_body: Some("<b>x</b>".into()), ..draft("d") }).is_ok());
+        // `[]` clears a recipient line, so it counts as a change.
+        assert!(validate_draft_update(&DraftUpdate { cc: Some(vec![]), ..draft("d") }).is_ok());
+    }
+
+    #[test]
+    fn validate_draft_update_rejects_a_missing_attachment() {
+        let u = DraftUpdate {
+            subject: Some("s".into()),
+            attachments: Some(vec!["/definitely/not/here/outlook-mcp-rs.txt".into()]),
+            ..draft("d")
+        };
+        assert!(validate_draft_update(&u).unwrap_err().to_string().contains("attachment not found"));
+    }
+
+    #[test]
+    fn validate_draft_update_accepts_an_existing_attachment() {
+        let path = std::env::temp_dir().join("outlook-mcp-rs-validate-draft-update.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let u = DraftUpdate {
+            attachments: Some(vec![path.to_string_lossy().to_string()]), ..draft("d")
+        };
+        let res = validate_draft_update(&u);
+        let _ = std::fs::remove_file(&path);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn draft_update_changes_lists_fields_in_apply_order() {
+        let u = DraftUpdate {
+            bcc: Some(vec![]), subject: Some("s".into()), to: Some(vec!["a@x.com".into()]),
+            body: Some("b".into()), attachments: Some(vec!["a.txt".into()]), ..draft("d")
+        };
+        assert_eq!(draft_update_changes(&u), vec!["subject", "body", "to", "bcc", "attachments"]);
+        assert!(draft_update_changes(&DraftUpdate { attachments: Some(vec![]), ..draft("d") }).is_empty());
     }
 }
 

@@ -26,9 +26,10 @@ use unicode_normalization::UnicodeNormalization;
 use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
-    CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm,
-    CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate,
-    OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid,
+    CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
+    EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
+    RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
+    validate_draft_update, DraftUpdate,
 };
 
 /// Matches `MAX_EMAIL_COUNT` in `client.py`. Larger result sets are paged
@@ -1429,6 +1430,54 @@ impl OutlookClient for WindowsOutlookClient {
             };
 
             Ok(json!({"status": "updated", "id": id, "changed": changed}))
+        })
+    }
+
+    fn update_draft(&self, u: DraftUpdate) -> Result<Value, ToolError> {
+        // Validate everything before the item is touched.
+        validate_draft_update(&u)?;
+        self.with_com(|| {
+            let (_app, ns) = mapi()?;
+            let item = get_item(&ns, &u.draft_id)?;
+            // `Sent` is true for anything sent or received; only an unsent
+            // draft may be edited.
+            if variant_to_bool(&get_property(&item, "Sent")?).unwrap_or(false) {
+                return Err(ToolError::new(
+                    "only unsent drafts can be edited; this item has already been sent or \
+                     received. Use reply_email or create_draft instead.",
+                ));
+            }
+
+            if let Some(subject) = &u.subject {
+                put_property(&item, "Subject", variant_from_str(subject))?;
+            }
+            // Set BodyFormat before the body so Outlook doesn't re-convert it.
+            if let Some(body) = &u.body {
+                put_property(&item, "BodyFormat", variant_from_i32(c::OL_FORMAT_PLAIN))?;
+                put_property(&item, "Body", variant_from_str(body))?;
+            }
+            if let Some(html) = &u.html_body {
+                put_property(&item, "BodyFormat", variant_from_i32(c::OL_FORMAT_HTML))?;
+                put_property(&item, "HTMLBody", variant_from_str(html))?;
+            }
+            // Recipients replace that whole line; an empty list clears it.
+            if let Some(to) = &u.to {
+                put_property(&item, "To", variant_from_str(&to.join("; ")))?;
+            }
+            if let Some(cc) = &u.cc {
+                put_property(&item, "CC", variant_from_str(&cc.join("; ")))?;
+            }
+            if let Some(bcc) = &u.bcc {
+                put_property(&item, "BCC", variant_from_str(&bcc.join("; ")))?;
+            }
+            // Appended; existing attachments are kept.
+            if let Some(atts) = u.attachments.as_deref().filter(|a| !a.is_empty()) {
+                attach_files(&item, atts)?;
+            }
+
+            call_method(&item, "Save", &mut [])?; // one Save for all changes; never Send
+            let id = make_id(&item)?;
+            Ok(json!({"status": "draft_updated", "id": id, "changed": draft_update_changes(&u)}))
         })
     }
 
