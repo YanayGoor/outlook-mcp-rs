@@ -378,6 +378,30 @@ fn list_attachments_reports_metadata_for_a_draft_attachment() {
 
 #[test]
 #[ignore]
+fn inline_flag_consistent_on_a_real_inbox_email() {
+    let c = WindowsOutlookClient::new();
+    let list = c.list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count: 25, unread_only: false,
+        from: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list");
+    let Some(email) = list.iter().find(|e| e.has_attachments) else {
+        eprintln!("skipping: none of the newest 25 inbox emails has attachments");
+        return;
+    };
+    let atts = c.list_attachments(email.id.clone()).expect("list_attachments");
+    for att in &atts {
+        let v = serde_json::to_value(att).unwrap();
+        assert!(v["is_inline"].is_boolean(), "is_inline missing: {v}");
+        // Inline content is always cid:-addressable.
+        if att.is_inline {
+            assert!(att.content_id.is_some(), "inline attachment without a content_id: {v}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
 fn get_inline_image_round_trips_a_real_content_id() {
     // Read-only: looks for an existing inline attachment; never sends mail.
     use base64::Engine as _;

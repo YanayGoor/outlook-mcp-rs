@@ -271,10 +271,12 @@ impl OutlookClient for FakeOutlookClient {
             AttachmentInfo {
                 index: 1, filename: "report.pdf".into(), size: 1234, att_type: "file".into(),
                 content_id: None, mime_type: Some("application/pdf".into()), hidden: false,
+                is_inline: false,
             },
             AttachmentInfo {
                 index: 2, filename: "logo.png".into(), size: 512, att_type: "file".into(),
                 content_id: Some("logo@example".into()), mime_type: Some("image/png".into()), hidden: true,
+                is_inline: true,
             },
         ])
     }
@@ -285,7 +287,7 @@ impl OutlookClient for FakeOutlookClient {
             json!({"email_id": email_id, "save_dir": save_dir, "attachment_names": attachment_names}))?;
         Ok(vec![json!({
             "index": 1, "filename": "report.pdf", "size": 1234, "type": "file",
-            "content_id": null, "mime_type": "application/pdf", "hidden": false,
+            "content_id": null, "mime_type": "application/pdf", "hidden": false, "is_inline": false,
             "saved_to": save_dir, "status": "saved",
         })])
     }
