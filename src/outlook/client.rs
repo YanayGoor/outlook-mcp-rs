@@ -26,7 +26,7 @@ use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
     CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate,
-    OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate,
+    OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid,
 };
 
 /// Matches `MAX_EMAIL_COUNT` in `client.py`.
@@ -1770,7 +1770,8 @@ impl OutlookClient for WindowsOutlookClient {
         })
     }
 
-    fn get_inline_image(&self, email_id: String, content_id: String) -> Result<InlineImage, ToolError> {
+    fn get_inline_image(&self, email_id: String, content_id: String, context_lines: Option<u32>)
+        -> Result<InlineImage, ToolError> {
         let wanted = normalize_cid_request(&content_id).ok_or_else(|| {
             ToolError::new("content_id must be a non-empty Content-ID (e.g. \"image001.png@01D9...\", optionally prefixed with cid:).")
         })?;
@@ -1807,12 +1808,19 @@ impl OutlookClient for WindowsOutlookClient {
                 .mime_type
                 .clone()
                 .unwrap_or_else(|| "application/octet-stream".to_string());
+            // As in get_email, an item without `HTMLBody` reads as empty, so
+            // the image just counts as unreferenced.
+            let context = context_lines.map(|n| {
+                let html = variant_to_string(&get_property(&item, "HTMLBody").unwrap_or_default());
+                text_before_cid(&html, &wanted, n).unwrap_or_default()
+            });
             Ok(InlineImage {
                 content_id: info.content_id.clone().unwrap_or_default(),
                 filename: info.filename.clone(),
                 data_uri: data_uri(&mime_type, &bytes),
                 mime_type,
                 size: bytes.len(),
+                context,
             })
         })
     }

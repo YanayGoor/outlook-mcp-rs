@@ -346,6 +346,10 @@ pub struct GetInlineImageParams {
     /// The attachment's Content-ID (`content_id` from list_attachments, or the
     /// `cid:...` reference from the HTML body). A `cid:` prefix and `<>` are accepted.
     pub content_id: String,
+    /// Also return `context`: up to this many lines (max 50) of plain text
+    /// immediately before the image's first `cid:` reference in the HTML body.
+    #[serde(default)]
+    pub context_lines: Option<u32>,
 }
 
 // ---- Tasks ----
@@ -689,13 +693,13 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files.")]
+    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files. Optional `context_lines` (max 50) also returns `context`: the last that-many non-empty lines of plain text immediately before the image's first `cid:` reference in the HTML body (tags stripped, entities decoded), useful for knowing what the image shows. `context` is \"\" when the HTML body never references the image, and is omitted when `context_lines` is not given.")]
     pub async fn get_inline_image(
         &self,
-        Parameters(GetInlineImageParams { email_id, content_id }): Parameters<GetInlineImageParams>,
+        Parameters(GetInlineImageParams { email_id, content_id, context_lines }): Parameters<GetInlineImageParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.get_inline_image(email_id, content_id)).await?;
+        let result = run_blocking(move || client.get_inline_image(email_id, content_id, context_lines)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 

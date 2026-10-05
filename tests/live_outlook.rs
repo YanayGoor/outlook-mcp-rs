@@ -423,13 +423,21 @@ fn get_inline_image_round_trips_a_real_content_id() {
         return;
     };
     let cid = att.content_id.clone().unwrap();
-    let image = c.get_inline_image(email_id, format!("cid:{cid}")).expect("get_inline_image");
+    let image = c.get_inline_image(email_id.clone(), format!("cid:{cid}"), None).expect("get_inline_image");
     assert_eq!(image.content_id, cid);
     let (header, payload) = image.data_uri.split_once(',').expect("data URI has a comma");
     assert_eq!(header, format!("data:{};base64", image.mime_type));
     let data = base64::engine::general_purpose::STANDARD.decode(payload).expect("valid base64");
     assert_eq!(data.len(), image.size);
     assert!(image.size > 0);
+    assert!(image.context.is_none(), "context only when context_lines is given");
+
+    // Same image with surrounding text requested: `context` is always present
+    // (possibly "" if the HTML body never references this Content-ID).
+    let with_ctx = c.get_inline_image(email_id, cid.clone(), Some(3)).expect("get_inline_image with context");
+    assert_eq!(with_ctx.content_id, cid);
+    let context = with_ctx.context.expect("context requested");
+    assert!(context.lines().count() <= 3, "{context:?}");
 }
 
 #[test]

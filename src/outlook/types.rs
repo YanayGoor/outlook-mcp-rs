@@ -209,6 +209,11 @@ pub struct InlineImage {
     pub size: usize,
     /// `data:<mime_type>;base64,<payload>`.
     pub data_uri: String,
+    /// Only when `context_lines` was requested: the plain-text lines just
+    /// before the first `cid:` reference to this image in the HTML body
+    /// (`""` if the body never references it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 #[cfg(test)]
