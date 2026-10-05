@@ -95,6 +95,33 @@ pub fn guess_mime(mime_tag: Option<&str>, filename: &str) -> Option<String> {
     Some(mime.to_string())
 }
 
+/// Whether an attachment is inline (`cid:`-referenced) content rather than a
+/// standalone attachment. `content_id` is already cleaned of `<>` (see
+/// `clean_content_id`).
+///
+/// Inline when it has a Content-ID and either Outlook marked it hidden or the
+/// HTML body references it as `cid:<content_id>` (case-insensitive, whole id).
+/// A Content-ID the HTML never references is usually a regular attachment some
+/// senders label with a CID anyway; no Content-ID is never inline.
+pub fn is_inline(content_id: Option<&str>, hidden: bool, html_body: &str) -> bool {
+    let Some(id) = content_id.filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if hidden {
+        return true;
+    }
+    let needle = format!("cid:{}", id.to_lowercase());
+    let haystack = html_body.to_lowercase();
+    // The reference must end where the id ends, so `cid:img10@x` does not
+    // count as a reference to `img1@x`.
+    haystack.match_indices(&needle).any(|(start, _)| {
+        haystack[start + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | ')' | '<' | '>'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +203,46 @@ mod tests {
         assert_eq!(guess_mime(None, "archive.xyz"), None);
         assert_eq!(guess_mime(None, "no-extension"), None);
         assert_eq!(guess_mime(None, ""), None);
+    }
+
+    #[test]
+    fn is_inline_needs_a_content_id() {
+        assert!(!is_inline(None, false, r#"<img src="cid:logo@x">"#));
+        assert!(!is_inline(Some(""), false, r#"<img src="cid:logo@x">"#));
+    }
+
+    #[test]
+    fn is_inline_when_referenced_from_html() {
+        assert!(is_inline(Some("logo@x"), false, r#"<img src="cid:logo@x">"#));
+        assert!(is_inline(Some("logo@x"), false, "cid:logo@x"));
+        assert!(is_inline(Some("logo@x"), false, "url(cid:logo@x)"));
+        assert!(is_inline(Some("logo@x"), false, "<img src='cid:logo@x' >"));
+    }
+
+    #[test]
+    fn is_inline_reference_is_case_insensitive() {
+        assert!(is_inline(Some("Image001.PNG@01D9"), false, r#"<img src="CID:image001.png@01d9">"#));
+    }
+
+    #[test]
+    fn is_inline_cid_not_referenced_is_regular() {
+        assert!(!is_inline(Some("logo@x"), false, "<p>no images here</p>"));
+        assert!(!is_inline(Some("logo@x"), false, ""));
+    }
+
+    #[test]
+    fn is_inline_requires_the_whole_id() {
+        // `cid:img10@x` is not a reference to `img1@x`, nor `cid:img1@xyz`.
+        assert!(!is_inline(Some("img1@x"), false, r#"<img src="cid:img10@x">"#));
+        assert!(!is_inline(Some("img1@x"), false, r#"<img src="cid:img1@xyz">"#));
+        // ...but a later whole reference still counts.
+        assert!(is_inline(Some("img1@x"), false, r#"<img src="cid:img1@xyz"><img src="cid:img1@x">"#));
+    }
+
+    #[test]
+    fn is_inline_hidden() {
+        assert!(!is_inline(None, true, ""));
+        assert!(is_inline(Some("logo@x"), true, ""));
     }
 
     #[test]

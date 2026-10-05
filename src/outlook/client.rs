@@ -16,7 +16,7 @@ use crate::constants as c;
 use crate::error::ToolError;
 use crate::outlook::com::{
     call_method, clean_content_id, create_com_object, format_com_error, get_item_categories,
-    get_mapi_prop, get_property, guess_mime, has_member, jet_datetime, make_item_id, parse_item_id, put_property, safe_filename,
+    get_mapi_prop, get_property, guess_mime, has_member, is_inline, jet_datetime, make_item_id, parse_item_id, put_property, safe_filename,
     set_item_categories, variant_from_bool, variant_from_datetime, variant_from_i32, variant_from_str,
     variant_to_bool, variant_to_i32, variant_to_iso_string, variant_to_string, ComGuard,
 };
@@ -676,8 +676,9 @@ fn compose(
 
 /// Metadata for one attachment (`index` is COM's 1-based position). Shared by
 /// `list_attachments` and `save_attachments`. `FileName`/`Size` are required;
-/// the MAPI properties are optional (absent -> `None`/`false`).
-fn attachment_info(att: &IDispatch, index: i32) -> Result<AttachmentInfo, ToolError> {
+/// the MAPI properties are optional (absent -> `None`/`false`). `html_body` is
+/// the owning item's `HTMLBody`, used for `is_inline`.
+fn attachment_info(att: &IDispatch, index: i32, html_body: &str) -> Result<AttachmentInfo, ToolError> {
     let filename = variant_to_string(&get_property(att, "FileName")?);
     let size = variant_to_i32(&get_property(att, "Size")?).unwrap_or(0);
     let att_type = get_property(att, "Type")
@@ -689,15 +690,24 @@ fn attachment_info(att: &IDispatch, index: i32) -> Result<AttachmentInfo, ToolEr
     let hidden = get_mapi_prop(att, c::PR_ATTACHMENT_HIDDEN)
         .and_then(|v| variant_to_bool(&v))
         .unwrap_or(false);
+    let content_id = clean_content_id(content_id.as_deref());
     Ok(AttachmentInfo {
         index,
         mime_type: guess_mime(mime_tag.as_deref(), &filename),
         filename,
         size,
         att_type: c::attachment_type_name(att_type).to_string(),
-        content_id: clean_content_id(content_id.as_deref()),
+        is_inline: is_inline(content_id.as_deref(), hidden, html_body),
+        content_id,
         hidden,
     })
+}
+
+/// An item's `HTMLBody`, or "" when it has none or it can't be read.
+fn item_html_body(item: &IDispatch) -> String {
+    get_property(item, "HTMLBody")
+        .map(|v| variant_to_string(&v))
+        .unwrap_or_default()
 }
 
 /// Shallow-merge `extra`'s keys into `base` (both JSON objects; a non-object
@@ -1574,11 +1584,17 @@ impl OutlookClient for WindowsOutlookClient {
                 _ => return Ok(Vec::new()),
             };
             let count = variant_to_i32(&get_property(&attachments, "Count")?).unwrap_or(0);
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            // Read the HTML body once (only when there are attachments) for
+            // `is_inline`; a plain-text item or an unreadable body counts as "".
+            let html_body = item_html_body(&item);
             let mut results = Vec::new();
             for i in 1..=count {
                 // COM collections are 1-based.
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                results.push(attachment_info(&att, i)?);
+                results.push(attachment_info(&att, i, &html_body)?);
             }
             Ok(results)
         })
@@ -1614,10 +1630,13 @@ impl OutlookClient for WindowsOutlookClient {
             // `{n.lower() for n in attachment_names}`: case-insensitive set membership.
             let wanted: Option<std::collections::HashSet<String>> = attachment_names
                 .map(|names| names.iter().map(|n| n.to_lowercase()).collect());
+            // Read the HTML body once (only when there are attachments) for
+            // `is_inline`; a plain-text item or an unreadable body counts as "".
+            let html_body = item_html_body(&item);
             let mut results = Vec::new();
             for i in 1..=count {
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                let mut info = attachment_info(&att, i)?;
+                let mut info = attachment_info(&att, i, &html_body)?;
                 if info.filename.is_empty() {
                     info.filename = format!("attachment-{i}");
                 }
@@ -2469,6 +2488,7 @@ mod attachment_tests {
             content_id: Some("logo@x".to_string()),
             mime_type: Some("image/png".to_string()),
             hidden: true,
+            is_inline: true,
         }
     }
 
@@ -2480,6 +2500,7 @@ mod attachment_tests {
         assert_eq!(v["content_id"], "logo@x");
         assert_eq!(v["mime_type"], "image/png");
         assert_eq!(v["hidden"], true);
+        assert_eq!(v["is_inline"], true);
     }
 
     #[test]
