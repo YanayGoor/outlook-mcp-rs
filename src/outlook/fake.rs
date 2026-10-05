@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use super::types::*;
 use super::{
-    validate_recurrence_update, CheckAvailabilityInput, CreateEventInput, EmailQuery, EmailUpdate,
-    EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, TaskQuery, TaskUpdate,
+    require_empty_confirm, validate_recurrence_update, CheckAvailabilityInput, CreateEventInput,
+    EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, TaskQuery, TaskUpdate,
 };
 
 pub const EMAIL_ID: &str = "entry-1|store-1";
@@ -134,9 +134,16 @@ impl OutlookClient for FakeOutlookClient {
         Ok(json!({"status": "updated", "id": id, "changed": changed}))
     }
 
-    fn delete_email(&self, email_id: String) -> Result<Value, ToolError> {
-        self.record("delete_email", json!({"email_id": email_id}))?;
-        Ok(json!({"status": "deleted"}))
+    fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError> {
+        self.record("delete_email", json!({"email_id": email_id, "permanent": permanent}))?;
+        Ok(json!({"status": "deleted", "permanent": permanent}))
+    }
+
+    fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError> {
+        // Record first so tests can see the call even when it's refused.
+        self.record("empty_deleted_items", json!({"confirm": confirm}))?;
+        require_empty_confirm(confirm)?;
+        Ok(json!({"status": "emptied", "items_deleted": 2, "folders_deleted": 1, "failed": 0}))
     }
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError> {

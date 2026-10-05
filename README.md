@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **27 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **28 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 27 tools below become available.
+already running, and the 28 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 27 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 28 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
@@ -140,7 +140,8 @@ The Outlook tools then appear in that client.
 - `create_draft` — create a draft email without sending it
 - `reply_email` — reply to an email, optionally to all recipients, optionally as a draft
 - `update_email` — change an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, set importance
-- `delete_email` — delete an email (moves it to Deleted Items)
+- `delete_email` — delete an email (moves it to Deleted Items), or hard-delete it with `permanent=true` (like shift+delete; **irreversible**, not recoverable from Deleted Items)
+- `empty_deleted_items` — **permanently** delete everything in Deleted Items (items and subfolders); **irreversible**, refuses unless `confirm=true`. On Exchange/Microsoft 365, retention policy may still keep items in Recoverable Items
 
 **Calendar**
 - `list_events` — list/search calendar events by date range, text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`

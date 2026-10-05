@@ -69,7 +69,38 @@ fn create_draft_then_delete_round_trips() {
         None, None, false, None,
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().expect("create_draft returns an id").to_string();
-    c.delete_email(id).expect("cleanup: delete_email should succeed");
+    c.delete_email(id, false).expect("cleanup: delete_email should succeed");
+}
+
+#[test]
+#[ignore]
+fn permanent_delete_of_draft_skips_deleted_items() {
+    let c = client();
+    let subject = "outlook-mcp-rs permanent delete probe zzqx-7731";
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        subject.to_string(),
+        "This draft is created and permanently deleted by an automated test.".to_string(),
+        None, None, false, None,
+    ).expect("create_draft should succeed");
+    let id = created["id"].as_str().expect("create_draft returns an id").to_string();
+
+    let result = c.delete_email(id.clone(), true).expect("permanent delete_email should succeed");
+    assert_eq!(result["permanent"], true);
+
+    // The old id must no longer resolve...
+    assert!(c.get_email(id, false).is_err(), "deleted draft's id should no longer resolve");
+    // ...and nothing with that subject may be sitting in Deleted Items.
+    let leftovers = c.list_emails(EmailQuery {
+        query: Some(subject.to_string()), folder: "deleted".into(), count: 50, offset: 0,
+        unread_only: false, from: None, category: None, received_after: None,
+        received_before: None, since_days: None, has_attachments: None,
+        flagged: false, high_importance: false,
+    }).expect("list_emails on Deleted Items should succeed");
+    assert!(
+        !leftovers.iter().any(|e| e.subject == subject),
+        "a permanently deleted draft must not remain in Deleted Items"
+    );
 }
 
 #[test]
@@ -265,7 +296,7 @@ fn list_events_filters_by_query_and_category() {
     assert!(!misses.iter().any(|e| e.id == id), "non-matching query must exclude the probe");
 
     // Cleanup: delete the probe.
-    c.delete_email(id).expect("cleanup delete");
+    c.delete_email(id, false).expect("cleanup delete");
 }
 
 #[test]
@@ -329,7 +360,7 @@ fn list_emails_query_matches_real_body_text() {
         flagged: false, high_importance: false,
     }).expect("list_emails query should succeed");
 
-    c.delete_email(id.clone()).expect("cleanup: delete the draft");
+    c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
 
     assert!(
         found.iter().any(|e| e.id == id),
@@ -397,7 +428,7 @@ fn create_draft_with_attachment_round_trips() {
         Some(vec![path_str]),
     ).expect("create_draft with attachment should succeed");
     let id = created["id"].as_str().expect("draft id").to_string();
-    c.delete_email(id).expect("cleanup: delete the draft");
+    c.delete_email(id, false).expect("cleanup: delete the draft");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -421,7 +452,7 @@ fn list_attachments_reports_metadata_for_a_draft_attachment() {
 
     // Capture the result before cleanup so a failed assertion doesn't leak the draft.
     let listed = c.list_attachments(id.clone());
-    c.delete_email(id).expect("cleanup: delete the draft");
+    c.delete_email(id, false).expect("cleanup: delete the draft");
     let _ = std::fs::remove_file(&path);
 
     let atts = listed.expect("list_attachments should succeed");
@@ -586,7 +617,7 @@ fn update_email_applies_state_then_moves() {
     }).expect("update_email move");
     assert_eq!(moved["changed"], serde_json::json!(["move_to"]));
     let new_id = moved["id"].as_str().expect("moved id").to_string();
-    c.delete_email(new_id).expect("cleanup delete");
+    c.delete_email(new_id, false).expect("cleanup delete");
 }
 
 #[test]
