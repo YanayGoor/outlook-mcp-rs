@@ -27,7 +27,7 @@ fn list_folders_returns_at_least_inbox() {
 fn list_emails_returns_inbox_items() {
     let emails = client().list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 5, offset: 0, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list_emails should succeed against a live Outlook");
     // Not asserting a specific count/content since the real mailbox varies —
@@ -44,7 +44,7 @@ fn list_emails_offset_pages_tile_without_overlap() {
     let page = |count: i32, offset: i32| -> Vec<String> {
         c.list_emails(EmailQuery {
             query: None, folder: "inbox".into(), count, offset, unread_only: false,
-            from: None, category: None, received_after: None, received_before: None,
+            from: None, to: None, category: None, received_after: None, received_before: None,
             since_days: None, has_attachments: None, flagged: false, high_importance: false,
         }).expect("list_emails should succeed against a live Outlook")
             .into_iter().map(|e| e.id).collect()
@@ -93,7 +93,7 @@ fn permanent_delete_of_draft_skips_deleted_items() {
     // ...and nothing with that subject may be sitting in Deleted Items.
     let leftovers = c.list_emails(EmailQuery {
         query: Some(subject.to_string()), folder: "deleted".into(), count: 50, offset: 0,
-        unread_only: false, from: None, category: None, received_after: None,
+        unread_only: false, from: None, to: None, category: None, received_after: None,
         received_before: None, since_days: None, has_attachments: None,
         flagged: false, high_importance: false,
     }).expect("list_emails on Deleted Items should succeed");
@@ -327,14 +327,14 @@ fn list_emails_query_filter_narrows_results() {
     let c = WindowsOutlookClient::new();
     let all = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("plain list should work");
     // A query that almost certainly matches nothing should return <= all.
     let filtered = c.list_emails(EmailQuery {
         query: Some("zzqx-improbable-token-9137".into()),
         folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("query list should work");
     assert!(filtered.len() <= all.len());
@@ -355,7 +355,7 @@ fn list_emails_query_matches_real_body_text() {
 
     let found = c.list_emails(EmailQuery {
         query: Some(token.to_string()), folder: "drafts".into(), count: 25, offset: 0,
-        unread_only: false, from: None, category: None, received_after: None,
+        unread_only: false, from: None, to: None, category: None, received_after: None,
         received_before: None, since_days: None, has_attachments: None,
         flagged: false, high_importance: false,
     }).expect("list_emails query should succeed");
@@ -379,7 +379,7 @@ fn list_emails_hebrew_query_finds_matching_subject() {
     let c = client();
     let inbox = |query: Option<String>| EmailQuery {
         query, folder: "inbox".into(), count: 50, offset: 0, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     };
     let is_hebrew = |ch: char| ('\u{0590}'..='\u{05FF}').contains(&ch);
@@ -475,7 +475,7 @@ fn inline_flag_consistent_on_a_real_inbox_email() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list");
     let Some(email) = list.iter().find(|e| e.has_attachments) else {
@@ -501,7 +501,7 @@ fn get_inline_image_round_trips_a_real_content_id() {
     let c = WindowsOutlookClient::new();
     let emails = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list_emails");
     let found = emails.iter().find_map(|e| {
@@ -539,7 +539,7 @@ fn get_email_reports_item_type_for_real_inbox_item() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 1, offset: 0, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list");
     if let Some(first) = list.first() {
@@ -1046,4 +1046,33 @@ fn delete_note_removes_it() {
 
     let deleted = c.delete_note(id).expect("delete_note should succeed");
     assert_eq!(deleted["status"], "deleted");
+}
+
+#[test]
+#[ignore]
+fn list_emails_to_filter_matches_draft_recipient() {
+    let c = client();
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        "[outlook-mcp-rs to-filter live] draft probe".to_string(),
+        "recipient filter probe; never sent".to_string(),
+        None, None, false, None,
+    ).expect("create_draft should succeed");
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let query = |to: &str| EmailQuery {
+        query: None, folder: "drafts".into(), count: 50, offset: 0, unread_only: false,
+        from: None, to: Some(to.to_string()), category: None, received_after: None,
+        received_before: None, since_days: None, has_attachments: None,
+        flagged: false, high_importance: false,
+    };
+    let hit = c.list_emails(query("nobody@example.invalid"));
+    let miss = c.list_emails(query("someone-else@example.invalid"));
+
+    c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
+
+    let hit = hit.expect("list_emails to=nobody should succeed");
+    let miss = miss.expect("list_emails to=someone-else should succeed");
+    assert!(hit.iter().any(|e| e.id == id), "to filter should find the draft addressed to nobody@example.invalid");
+    assert!(!miss.iter().any(|e| e.id == id), "to filter must not match a different recipient");
 }
