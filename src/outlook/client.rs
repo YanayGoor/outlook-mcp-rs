@@ -22,6 +22,7 @@ use crate::outlook::com::{
 };
 use crate::outlook::types::*;
 use chrono::Datelike;
+use unicode_normalization::UnicodeNormalization;
 use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
@@ -41,6 +42,9 @@ const MAX_BODY_CHARS: usize = 100_000;
 /// Largest attachment `get_inline_image` returns inline (base64 in the tool
 /// result); anything bigger belongs on disk via `save_attachments`.
 const MAX_INLINE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Upper bound on items scanned client-side when the DASL text search for a
+/// non-ASCII query comes back empty (see `list_emails`).
+const MAX_SCAN_ITEMS: i32 = 2000;
 
 /// Lets `?` turn a `windows::core::Error` into a [`ToolError`] anywhere in
 /// this module, so COM-plumbing calls (`call_method`, `get_property`, …) and
@@ -190,6 +194,32 @@ fn truncate(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Normalize text for caseless matching: NFC (so composed and decomposed
+/// forms of the same character compare equal), then lowercase.
+fn fold_text(text: &str) -> String {
+    text.nfc().collect::<String>().to_lowercase()
+}
+
+/// True if `query` occurs (caseless, NFC-normalized) in any of `fields`.
+/// Empty fields are skipped.
+fn text_matches(query: &str, fields: &[&str]) -> bool {
+    let needle = fold_text(query);
+    fields.iter().filter(|f| !f.is_empty()).any(|f| fold_text(f).contains(&needle))
+}
+
+/// Client-side text match for the `list_emails` non-ASCII fallback: subject
+/// and sender name first, then the body only if those miss (Body is the
+/// expensive property to fetch).
+fn email_text_matches(item: &IDispatch, query: &str) -> bool {
+    let subject = variant_to_string(&get_property(item, "Subject").unwrap_or_default());
+    let sender = variant_to_string(&get_property(item, "SenderName").unwrap_or_default());
+    if text_matches(query, &[&subject, &sender]) {
+        return true;
+    }
+    let body = variant_to_string(&get_property(item, "Body").unwrap_or_default());
+    text_matches(query, &[&body])
 }
 
 /// `client.py::_parse_dt`: parse a user-supplied ISO date/datetime. Mirrors
@@ -909,16 +939,6 @@ impl OutlookClient for WindowsOutlookClient {
             let folder_obj = resolve_folder(&ns, Some(&q.folder))?;
             let mut items = to_disp(get_property(&folder_obj, "Items")?)?;
 
-            // Text query: DASL @SQL across subject/sender/body (escaped).
-            if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
-                let e = query.replace('\'', "''");
-                let dasl = format!(
-                    "@SQL=(\"urn:schemas:httpmail:subject\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:fromname\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:textdescription\" LIKE '%{e}%')"
-                );
-                items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
-            }
             // Sender: DASL @SQL against fromname + fromemail.
             if let Some(from) = q.from.as_deref().filter(|s| !s.is_empty()) {
                 let e = from.replace('\'', "''");
@@ -969,21 +989,57 @@ impl OutlookClient for WindowsOutlookClient {
                 items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&f)])?)?;
             }
 
+            // Text query last, so the fallback scan below only walks items
+            // that already passed every other filter. DASL @SQL across
+            // subject/sender/body (escaped).
+            let mut text_fallback: Option<String> = None;
+            if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
+                let query: String = query.nfc().collect();
+                let e = query.replace('\'', "''");
+                let dasl = format!(
+                    "@SQL=(\"urn:schemas:httpmail:subject\" LIKE '%{e}%' \
+                     OR \"urn:schemas:httpmail:fromname\" LIKE '%{e}%' \
+                     OR \"urn:schemas:httpmail:textdescription\" LIKE '%{e}%')"
+                );
+                let matched =
+                    to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
+                let matched_count = variant_to_i32(&get_property(&matched, "Count")?).unwrap_or(0);
+                // DASL LIKE has been observed to return nothing for Hebrew
+                // (and other non-Latin) terms even when matching mail exists
+                // (issue #2). For a non-ASCII query, treat an empty DASL
+                // result as unreliable and scan the pre-filtered items
+                // client-side instead. ASCII queries stay DASL-only.
+                if matched_count == 0 && !query.is_ascii() {
+                    text_fallback = Some(query);
+                } else {
+                    items = matched;
+                }
+            }
+
             call_method(
                 &items,
                 "Sort",
                 &mut [variant_from_str("[ReceivedTime]"), variant_from_bool(true)],
             )?;
 
-            // Client-side fuzzy filters: category + has_attachments + flagged.
-            // Lazily build each summary and keep it only if it passes; then
-            // `take_page` skips the first `offset` matches (after these
-            // filters, so pages line up) and stops at count.
+            // Client-side fuzzy filters: non-ASCII text fallback (if active) +
+            // category + has_attachments + flagged. Lazily build each summary
+            // and keep it only if it passes; then `take_page` skips the first
+            // `offset` matches (after these filters, so pages line up) and
+            // stops at count.
             let cat_want = q.category.as_deref().map(|c| c.to_lowercase());
-            let total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
+            let mut total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
+            if text_fallback.is_some() {
+                // The fallback reads Subject/SenderName (and maybe Body) per
+                // item, so cap how far back it scans (newest first).
+                total = total.min(MAX_SCAN_ITEMS);
+            }
             let matches = (1..=total).filter_map(|i| {
                 (|| -> Result<Option<EmailSummary>, ToolError> {
                     let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                    if text_fallback.as_deref().is_some_and(|query| !email_text_matches(&item, query)) {
+                        return Ok(None);
+                    }
                     let summary = email_summary(&item)?;
                     if let Some(want) = &cat_want {
                         if !summary.categories.iter().any(|c| c.to_lowercase() == *want) {
@@ -2732,5 +2788,55 @@ mod attachment_tests {
         assert_ne!(other.path(), dir.as_path());
         drop(guard);
         assert!(!dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod text_match_tests {
+    use super::*;
+
+    #[test]
+    fn hebrew_matches_subject_or_later_field() {
+        assert!(text_matches("מייל שיקוף", &["Re: מייל שיקוף שבועי"]));
+        assert!(text_matches("סיכום עשייה", &["", "Dana", "גוף: סיכום עשייה Q3"]));
+        assert!(!text_matches("מייל שיקוף", &["Weekly report", "Dana"]));
+    }
+
+    #[test]
+    fn mixed_hebrew_and_english() {
+        assert!(text_matches("Q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
+        assert!(text_matches("q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
+        assert!(!text_matches("Q4 סיכום", &["Weekly Q3 סיכום עשייה"]));
+    }
+
+    #[test]
+    fn matching_is_caseless() {
+        assert!(text_matches("weekly", &["WEEKLY Report"]));
+        assert!(text_matches("ÉCOLE", &["notes from école today"]));
+        assert!(text_matches("ΣΟΦΊΑ", &["σοφία"]));
+    }
+
+    #[test]
+    fn matching_ignores_normalization_form() {
+        // Latin with an accent: composed (NFC) vs decomposed (NFD).
+        let nfc: String = "café".nfc().collect();
+        let nfd: String = "café".nfd().collect();
+        assert_ne!(nfc, nfd);
+        assert!(text_matches(&nfd, &[&format!("subject {nfc}")]));
+        assert!(text_matches(&nfc, &[&format!("subject {nfd}")]));
+        // Hebrew niqqud has no precomposed forms, but the same marks typed
+        // in a different order (shin dot + qamats vs qamats + shin dot) are
+        // canonically equivalent and must still match.
+        let a = "\u{05E9}\u{05C1}\u{05B8}לום";
+        let b = "\u{05E9}\u{05B8}\u{05C1}לום";
+        assert_ne!(a, b);
+        assert!(text_matches(a, &[&format!("subject {b}")]));
+        assert!(text_matches(b, &[&format!("subject {a}")]));
+    }
+
+    #[test]
+    fn empty_fields_never_match() {
+        assert!(!text_matches("שלום", &[]));
+        assert!(!text_matches("שלום", &["", ""]));
     }
 }

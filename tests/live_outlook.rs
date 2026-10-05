@@ -341,6 +341,47 @@ fn list_emails_query_matches_real_body_text() {
 
 #[test]
 #[ignore]
+fn list_emails_hebrew_query_finds_matching_subject() {
+    // Issue #2: take a Hebrew word from a recent inbox subject (or pin one via
+    // OUTLOOK_MCP_LIVE_HEBREW_QUERY) and check list_emails(query=...) finds
+    // that email. Skips (passes) if there's no Hebrew subject to use.
+    let c = client();
+    let inbox = |query: Option<String>| EmailQuery {
+        query, folder: "inbox".into(), count: 50, offset: 0, unread_only: false,
+        from: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    };
+    let is_hebrew = |ch: char| ('\u{0590}'..='\u{05FF}').contains(&ch);
+    let mut term = std::env::var("OUTLOOK_MCP_LIVE_HEBREW_QUERY").ok().filter(|s| !s.is_empty());
+    let mut expected_id = None;
+    if term.is_none() {
+        let recent = c.list_emails(inbox(None)).expect("plain list should work");
+        'outer: for email in &recent {
+            for word in email.subject.split(|ch: char| !is_hebrew(ch)) {
+                if word.chars().count() >= 3 {
+                    term = Some(word.to_string());
+                    expected_id = Some(email.id.clone());
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let Some(term) = term else {
+        eprintln!("skipping: no Hebrew subject in the 50 newest inbox emails");
+        return;
+    };
+    let found = c.list_emails(inbox(Some(term.clone()))).expect("Hebrew query list should work");
+    assert!(!found.is_empty(), "no results for Hebrew query {term:?}");
+    if let Some(id) = expected_id {
+        assert!(
+            found.iter().any(|e| e.id == id),
+            "Hebrew query {term:?} should find the inbox email whose subject it came from"
+        );
+    }
+}
+
+#[test]
+#[ignore]
 fn create_draft_with_attachment_round_trips() {
     let dir = std::env::temp_dir();
     let path = dir.join("outlook-mcp-rs-live-attach.txt");
