@@ -130,7 +130,7 @@ The Outlook tools then appear in that client.
 
 ## Available tools
 
-27 MCP tools, grouped by category:
+29 MCP tools, grouped by category:
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
@@ -215,11 +215,20 @@ The binary is produced at `target/release/outlook-mcp-rs.exe`.
 
 ## Safety and side effects
 
-Most tools are read-only or reversible — deletes move items to Deleted Items rather than
-destroying them. A few have real, outbound effects and are explicit in the tool call:
-`send_email` delivers mail; `respond_to_meeting` notifies an organizer; and
-`create_event`, `update_event`, and `delete_event` notify attendees when their send/update/
-cancellation flag is set. [`TESTING.md`](TESTING.md) spells out exactly which behaviors are
+Most tools are read-only or reversible. By default, deletes move items to Deleted Items
+rather than destroying them. Two deletes are permanent, and both must be asked for
+explicitly:
+
+- `delete_email` with `permanent=true` hard-deletes one email;
+- `empty_deleted_items` with `confirm=true` destroys everything in Deleted Items.
+
+A few tools have real, outbound effects, and these are also explicit in the tool call:
+
+- `send_email` delivers mail;
+- `respond_to_meeting` notifies an organizer;
+- `create_event`, `update_event` and `delete_event` notify attendees when their send/update/cancellation flag is set.
+
+`update_draft` edits a draft but never sends it. [`TESTING.md`](TESTING.md) spells out exactly which behaviors are
 covered by automated tests versus verified by hand precisely because they send real mail.
 
 ## Troubleshooting
@@ -233,10 +242,28 @@ displays the output, typically a Windows console or PowerShell using a non-UTF-8
 code page. Inspect the output in a UTF-8 viewer, or switch the console first with
 `chcp 65001` (cmd) or `[Console]::OutputEncoding = [Text.Encoding]::UTF8` (PowerShell).
 
+## Skills for AI assistants
+
+The [`skills/`](skills) folder has two [Agent Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview)
+that teach an assistant (such as Claude Code) to use these tools well:
+
+- [`using-outlook-mcp`](skills/using-outlook-mcp/SKILL.md) covers:
+  - which calls send mail or destroy data, and when to confirm first;
+  - how ids behave;
+  - paging, truncated bodies, drafts and inline images;
+  - a quick reference for every tool.
+- [`troubleshooting-outlook-mcp`](skills/troubleshooting-outlook-mcp/SKILL.md) maps each
+  error message to its cause and fix, and covers results that look wrong without an error.
+
+To use them with Claude Code, copy both folders into `~/.claude/skills/` (for every
+project) or into a project's `.claude/skills/`.
+
 ## Development
 
 See [`TESTING.md`](TESTING.md) for how to run the unit test suite and the local
-live-Outlook system tests.
+live-Outlook system tests. Maintainers system-testing a change against a real mailbox
+can follow the `live-outlook-system-test` skill in
+[`.claude/skills/`](.claude/skills/live-outlook-system-test/SKILL.md).
 
 ## License
 

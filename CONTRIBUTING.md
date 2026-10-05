@@ -56,7 +56,7 @@ skip-live command before every PR; run the live suite too if your change touches
    cargo clippy --all -- -D warnings
    ```
 3. **Test** with at least `cargo test --all -- --skip live_outlook`.
-4. **Update docs** — if you add or change a tool, update the README tool list and any relevant docs.
+4. **Update docs** — if you add or change a tool, update the README tool list (and its tool count), the user-facing skills in `skills/` (`using-outlook-mcp` quick reference, `troubleshooting-outlook-mcp` for new error messages), and any other relevant docs.
 5. **Open the PR** and fill in the pull request template, including the *Type of change*,
    *Side effects*, and *Testing* sections.
 
