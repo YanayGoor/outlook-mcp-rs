@@ -3,10 +3,12 @@ use std::sync::Arc;
 use outlook_mcp_rs::outlook::fake::{FakeOutlookClient, EMAIL_ID};
 use outlook_mcp_rs::server::{
     CheckAvailabilityParams, CreateDraftParams, CreateEventParams, CreateNoteParams, CreateTaskParams,
-    DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams, GetEventParams, GetNoteParams, ListAttachmentsParams,
+    DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams,
+    GetEventParams, GetInlineImageParams, GetNoteParams, ListAttachmentsParams,
+    EmptyDeletedItemsParams,
     ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
-    SendEmailParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
+    SendEmailParams, UpdateDraftParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -34,7 +36,7 @@ async fn list_emails_passes_arguments() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
     let params: ListEmailsParams = serde_json::from_value(json!({
-        "folder": "sent", "count": 5, "unread_only": true
+        "folder": "sent", "count": 5, "offset": 15, "unread_only": true
     }))
     .unwrap();
     server.list_emails(Parameters(params)).await.unwrap();
@@ -42,6 +44,7 @@ async fn list_emails_passes_arguments() {
     assert_eq!(name, "list_emails");
     assert_eq!(args["folder"], "sent");
     assert_eq!(args["count"], 5);
+    assert_eq!(args["offset"], 15);
     assert_eq!(args["unread_only"], true);
 }
 
@@ -55,7 +58,25 @@ async fn list_emails_uses_defaults() {
     assert_eq!(name, "list_emails");
     assert_eq!(args["folder"], "inbox");
     assert_eq!(args["count"], 10);
+    assert_eq!(args["offset"], 0);
     assert_eq!(args["unread_only"], false);
+    assert!(args["to"].is_null());
+}
+
+#[tokio::test]
+async fn list_emails_forwards_recipient_filter() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "folder": "sent", "to": "ada@x.com", "from": "me@x.com"
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "list_emails");
+    assert_eq!(args["folder"], "sent");
+    assert_eq!(args["to"], "ada@x.com");
+    assert_eq!(args["from"], "me@x.com");
 }
 
 #[tokio::test]
@@ -79,6 +100,21 @@ async fn list_emails_forwards_query_and_filters() {
 }
 
 #[tokio::test]
+async fn list_emails_forwards_hebrew_query_unchanged() {
+    // Issue #2: the non-ASCII query must reach the client intact (the
+    // DASL/fallback handling lives in the COM client).
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "query": "מייל שיקוף Q3"
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    let (_, args) = &fake.calls()[0];
+    assert_eq!(args["query"], "מייל שיקוף Q3");
+}
+
+#[tokio::test]
 async fn list_emails_returns_categories() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
@@ -96,6 +132,7 @@ async fn get_email_returns_body() {
         .get_email(Parameters(GetEmailParams {
             email_id: EMAIL_ID.to_string(),
             prefer_html: false,
+            max_body_chars: None,
         }))
         .await
         .unwrap();
@@ -110,11 +147,219 @@ async fn get_email_includes_item_type() {
         .get_email(Parameters(GetEmailParams {
             email_id: EMAIL_ID.to_string(),
             prefer_html: false,
+            max_body_chars: None,
         }))
         .await
         .unwrap();
     assert_eq!(result_json(&result)["item_type"], "email");
     assert_eq!(result_json(&result)["is_meeting"], false);
+}
+
+// ---- Non-ASCII (Hebrew) round trip, issue #3 ----------------------------
+
+const HE_SUBJECT: &str = "מייל שיקוף";
+const HE_SENDER: &str = "עדה לאבלייס";
+const HE_BODY: &str = "סיכום עשייה\nשורה שנייה";
+
+/// The raw text of a tool result: the exact JSON string rmcp puts on the wire.
+fn result_text(result: &CallToolResult) -> String {
+    result.content[0].as_text().expect("expected text content").text.clone()
+}
+
+/// Hebrew must appear as literal UTF-8 in the JSON, never as `\u05xx` escapes.
+fn assert_raw_utf8(text: &str, expected: &[&str]) {
+    for s in expected {
+        assert!(text.contains(s), "{s:?} not found verbatim in {text}");
+    }
+    assert!(!text.contains("\\u05"), "unexpected \\u escape in {text}");
+}
+
+#[tokio::test]
+async fn list_emails_returns_hebrew_text_verbatim() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_email_text(HE_SUBJECT, HE_SENDER, HE_BODY);
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({})).unwrap();
+    let result = server.list_emails(Parameters(params)).await.unwrap();
+    let text = result_text(&result);
+    assert_raw_utf8(&text, &[HE_SUBJECT, HE_SENDER]);
+    let json = result_json(&result);
+    assert_eq!(json[0]["subject"].as_str().unwrap().as_bytes(), HE_SUBJECT.as_bytes());
+    assert_eq!(json[0]["sender"].as_str().unwrap().as_bytes(), HE_SENDER.as_bytes());
+}
+
+#[tokio::test]
+async fn get_email_returns_hebrew_text_verbatim() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_email_text(HE_SUBJECT, HE_SENDER, HE_BODY);
+    let server = OutlookMcpServer::new(fake.clone());
+    let result = server
+        .get_email(Parameters(GetEmailParams {
+            email_id: EMAIL_ID.to_string(),
+            prefer_html: false,
+            max_body_chars: None,
+        }))
+        .await
+        .unwrap();
+    // The newline in the body is escaped as `\n` in JSON; check the line.
+    assert_raw_utf8(&result_text(&result), &[HE_SUBJECT, HE_SENDER, "סיכום עשייה"]);
+    let json = result_json(&result);
+    assert_eq!(json["subject"].as_str().unwrap().as_bytes(), HE_SUBJECT.as_bytes());
+    assert_eq!(json["sender"].as_str().unwrap().as_bytes(), HE_SENDER.as_bytes());
+    assert_eq!(json["body"].as_str().unwrap().as_bytes(), HE_BODY.as_bytes());
+}
+
+#[tokio::test]
+async fn hebrew_arguments_reach_the_client_unchanged() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "query": HE_SUBJECT, "from": HE_SENDER, "category": "סיכום עשייה"
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    server
+        .create_draft(Parameters(CreateDraftParams {
+            to: vec!["a@example.com".to_string()],
+            subject: HE_SUBJECT.to_string(),
+            body: HE_BODY.to_string(),
+            cc: None,
+            bcc: None,
+            html: false,
+            attachments: None,
+            inline_images: None,
+        }))
+        .await
+        .unwrap();
+    let calls = fake.calls();
+    assert_eq!(calls[0].1["query"], HE_SUBJECT);
+    assert_eq!(calls[0].1["from"], HE_SENDER);
+    assert_eq!(calls[0].1["category"], "סיכום עשייה");
+    assert_eq!(calls[1].1["subject"], HE_SUBJECT);
+    assert_eq!(calls[1].1["body"], HE_BODY);
+}
+
+/// End to end over the same newline-delimited JSON-RPC codec that rmcp's
+/// stdio transport uses (an in-memory duplex pipe stands in for
+/// stdin/stdout): Hebrew in the request reaches the client, and Hebrew in the
+/// result leaves the server as raw UTF-8 bytes.
+#[tokio::test]
+async fn hebrew_round_trips_as_raw_utf8_over_the_stdio_codec() {
+    use rmcp::ServiceExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_email_text(HE_SUBJECT, HE_SENDER, HE_BODY);
+    let server = OutlookMcpServer::new(fake.clone());
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let (read_half, mut write_half) = tokio::io::split(client_io);
+    let mut reader = BufReader::new(read_half);
+
+    // Reads raw bytes up to the next response carrying `id`.
+    async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, id: u64) -> Vec<u8> {
+        loop {
+            let mut line = Vec::new();
+            assert!(reader.read_until(b'\n', &mut line).await.unwrap() > 0, "server closed");
+            let msg: Value = serde_json::from_slice(&line).unwrap();
+            if msg["id"] == id {
+                return line;
+            }
+        }
+    }
+
+    let requests = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "utf8-test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "list_emails", "arguments": {"query": HE_SUBJECT}}}),
+    ];
+    for (i, req) in requests.iter().enumerate() {
+        // serde_json writes the Hebrew as raw UTF-8, like a real client would.
+        let mut bytes = serde_json::to_vec(req).unwrap();
+        bytes.push(b'\n');
+        write_half.write_all(&bytes).await.unwrap();
+        if i == 0 {
+            read_response(&mut reader, 1).await;
+        }
+    }
+    let line = read_response(&mut reader, 2).await;
+
+    // Strict UTF-8 decode of the wire bytes; the tool result is JSON text
+    // nested in a JSON string, so its Hebrew is still raw, not `\u` escaped.
+    let wire = String::from_utf8(line).expect("server output must be valid UTF-8");
+    assert_raw_utf8(&wire, &[HE_SUBJECT, HE_SENDER]);
+    let msg: Value = serde_json::from_str(&wire).unwrap();
+    let emails: Value =
+        serde_json::from_str(msg["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(emails[0]["subject"], HE_SUBJECT);
+    assert_eq!(emails[0]["sender"], HE_SENDER);
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "list_emails");
+    assert_eq!(args["query"], HE_SUBJECT);
+}
+
+#[tokio::test]
+async fn get_email_max_body_chars_defaults_to_none() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: GetEmailParams = serde_json::from_value(json!({"email_id": EMAIL_ID})).unwrap();
+    assert_eq!(params.max_body_chars, None);
+    server.get_email(Parameters(params)).await.unwrap();
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "get_email");
+    assert_eq!(args["max_body_chars"], Value::Null);
+}
+
+#[tokio::test]
+async fn get_email_forwards_max_body_chars() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: GetEmailParams = serde_json::from_value(json!({
+        "email_id": EMAIL_ID, "prefer_html": true, "max_body_chars": 2_000_000
+    }))
+    .unwrap();
+    server.get_email(Parameters(params)).await.unwrap();
+    let (_, args) = &fake.calls()[0];
+    assert_eq!(args["prefer_html"], true);
+    assert_eq!(args["max_body_chars"], 2_000_000);
+}
+
+#[tokio::test]
+async fn get_email_reports_truncation_fields() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // Plain: body flags present, html ones omitted.
+    let params: GetEmailParams = serde_json::from_value(json!({"email_id": EMAIL_ID})).unwrap();
+    let json = result_json(&server.get_email(Parameters(params)).await.unwrap());
+    assert_eq!(json["body_truncated"], false);
+    assert_eq!(json["body_length"], 8);
+    assert!(json.get("html_truncated").is_none());
+    assert!(json.get("html_length").is_none());
+    // prefer_html: html flags present too.
+    let params: GetEmailParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "prefer_html": true})).unwrap();
+    let json = result_json(&server.get_email(Parameters(params)).await.unwrap());
+    assert_eq!(json["html_truncated"], false);
+    assert_eq!(json["html_length"], 15);
+}
+
+#[tokio::test]
+async fn get_event_and_get_note_report_body_truncated() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: GetEventParams = serde_json::from_value(json!({"event_id": "x"})).unwrap();
+    let json = result_json(&server.get_event(Parameters(params)).await.unwrap());
+    assert_eq!(json["body_truncated"], false);
+    let params: GetNoteParams = serde_json::from_value(json!({"note_id": "x"})).unwrap();
+    let json = result_json(&server.get_note(Parameters(params)).await.unwrap());
+    assert_eq!(json["body_truncated"], false);
 }
 
 #[tokio::test]
@@ -130,6 +375,7 @@ async fn send_email_passes_recipients_and_html_flag() {
             bcc: None,
             html: false,
             attachments: None,
+            inline_images: None,
         }))
         .await
         .unwrap();
@@ -152,6 +398,7 @@ async fn create_draft_returns_draft_saved_status() {
             bcc: None,
             html: false,
             attachments: None,
+            inline_images: None,
         }))
         .await
         .unwrap();
@@ -189,6 +436,119 @@ async fn send_email_forwards_attachments() {
     server.send_email(Parameters(params)).await.unwrap();
     let (_, args) = &fake.calls()[0];
     assert_eq!(args["attachments"], serde_json::json!(["C:/tmp/a.pdf", "C:/tmp/b.png"]));
+}
+
+#[tokio::test]
+async fn update_draft_forwards_fields_and_lists_changes_in_apply_order() {
+    let path = std::env::temp_dir().join("outlook-mcp-rs-tools-update-draft.txt");
+    std::fs::write(&path, b"x").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: UpdateDraftParams = serde_json::from_value(json!({
+        "draft_id": EMAIL_ID, "attachments": [path_str], "bcc": [],
+        "to": ["a@x.com", "b@x.com"], "html_body": "<p>hi</p>", "subject": "New"
+    })).unwrap();
+    let result = server.update_draft(Parameters(params)).await;
+    let _ = std::fs::remove_file(&path);
+    let v = result_json(&result.unwrap());
+    assert_eq!(v["status"], "draft_updated");
+    assert_eq!(v["id"], EMAIL_ID);
+    assert_eq!(v["changed"], json!(["subject", "html_body", "to", "bcc", "attachments"]));
+    let (name, args) = fake.calls().pop().unwrap();
+    assert_eq!(name, "update_draft");
+    assert_eq!(args["draft_id"], EMAIL_ID);
+    assert_eq!(args["subject"], "New");
+    assert_eq!(args["html_body"], "<p>hi</p>");
+    assert_eq!(args["body"], Value::Null);
+    assert_eq!(args["to"], json!(["a@x.com", "b@x.com"]));
+    assert_eq!(args["cc"], Value::Null);
+    assert_eq!(args["bcc"], json!([]));
+    assert_eq!(args["attachments"], json!([path_str]));
+}
+
+#[tokio::test]
+async fn update_draft_rejects_body_and_html_body_together() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: UpdateDraftParams = serde_json::from_value(json!({
+        "draft_id": EMAIL_ID, "body": "plain", "html_body": "<p>html</p>"
+    })).unwrap();
+    assert!(server.update_draft(Parameters(params)).await.is_err());
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn update_draft_rejects_an_empty_update() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: UpdateDraftParams = serde_json::from_value(json!({"draft_id": EMAIL_ID})).unwrap();
+    assert!(server.update_draft(Parameters(params)).await.is_err());
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn send_email_forwards_inline_images() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: SendEmailParams = serde_json::from_value(json!({
+        "to": ["a@x.com"], "subject": "Hi", "html": true,
+        "body": "<img src=\"cid:logo\">",
+        "inline_images": [
+            {"content_id": "logo", "path": "C:/img/logo.png"},
+            {"content_id": "chart", "data_base64": "aGk=", "filename": "chart.png", "mime_type": "image/png"}
+        ]
+    })).unwrap();
+    server.send_email(Parameters(params)).await.unwrap();
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "send_email");
+    assert_eq!(args["html"], true);
+    let imgs = &args["inline_images"];
+    assert_eq!(imgs[0]["content_id"], "logo");
+    assert_eq!(imgs[0]["path"], "C:/img/logo.png");
+    assert_eq!(imgs[0]["data_base64"], Value::Null);
+    assert_eq!(imgs[1]["content_id"], "chart");
+    assert_eq!(imgs[1]["data_base64"], "aGk=");
+    assert_eq!(imgs[1]["filename"], "chart.png");
+    assert_eq!(imgs[1]["mime_type"], "image/png");
+}
+
+#[tokio::test]
+async fn create_draft_forwards_inline_images_and_defaults_to_none() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: CreateDraftParams = serde_json::from_value(json!({
+        "to": ["a@x.com"], "subject": "Hi", "body": "<img src=\"cid:logo\">", "html": true,
+        "inline_images": [{"content_id": "logo", "data_base64": "aGk="}]
+    })).unwrap();
+    let result = server.create_draft(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["status"], "draft_saved");
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "create_draft");
+    assert_eq!(args["inline_images"][0]["content_id"], "logo");
+    assert_eq!(args["inline_images"][0]["data_base64"], "aGk=");
+
+    // Omitted -> None (recorded as null).
+    let params: CreateDraftParams = serde_json::from_value(json!({
+        "to": ["a@x.com"], "subject": "Hi", "body": "plain"
+    })).unwrap();
+    server.create_draft(Parameters(params)).await.unwrap();
+    assert_eq!(fake.calls()[1].1["inline_images"], Value::Null);
+}
+
+#[test]
+fn inline_images_appear_in_send_and_draft_schemas() {
+    for schema in [schemars::schema_for!(SendEmailParams), schemars::schema_for!(CreateDraftParams)] {
+        let v = serde_json::to_value(&schema).unwrap();
+        let prop = &v["properties"]["inline_images"];
+        assert!(prop.is_object(), "inline_images missing from schema: {v}");
+        assert!(prop["description"].as_str().unwrap_or("").contains("cid:CONTENT_ID"), "{prop}");
+        let def = &v["$defs"]["InlineImage"];
+        for field in ["content_id", "path", "data_base64", "filename", "mime_type"] {
+            assert!(def["properties"][field]["description"].is_string(), "InlineImage.{field} lacks a description: {def}");
+        }
+        assert_eq!(def["required"], json!(["content_id"]));
+    }
 }
 
 #[tokio::test]
@@ -238,16 +598,63 @@ async fn update_email_state_only_keeps_same_id_and_lists_changes() {
 }
 
 #[tokio::test]
-async fn delete_email_records_call() {
+async fn delete_email_defaults_to_soft_delete() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
-        .delete_email(Parameters(DeleteEmailParams { email_id: EMAIL_ID.to_string() }))
-        .await
-        .unwrap();
+    // permanent omitted → serde default false.
+    let params: DeleteEmailParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID})).unwrap();
+    let result = server.delete_email(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["permanent"], false);
     assert_eq!(
         fake.calls(),
-        vec![("delete_email".to_string(), json!({"email_id": EMAIL_ID}))]
+        vec![("delete_email".to_string(), json!({"email_id": EMAIL_ID, "permanent": false}))]
+    );
+}
+
+#[tokio::test]
+async fn delete_email_forwards_permanent() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: DeleteEmailParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "permanent": true})).unwrap();
+    let result = server.delete_email(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["permanent"], true);
+    assert_eq!(
+        fake.calls(),
+        vec![("delete_email".to_string(), json!({"email_id": EMAIL_ID, "permanent": true}))]
+    );
+}
+
+#[tokio::test]
+async fn empty_deleted_items_refuses_without_confirm() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // confirm omitted → serde default false → the refusal surfaces as an error.
+    let params: EmptyDeletedItemsParams = serde_json::from_value(json!({})).unwrap();
+    let err = server.empty_deleted_items(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("confirm=true"));
+    assert_eq!(
+        fake.calls(),
+        vec![("empty_deleted_items".to_string(), json!({"confirm": false}))]
+    );
+}
+
+#[tokio::test]
+async fn empty_deleted_items_with_confirm_returns_counts() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: EmptyDeletedItemsParams =
+        serde_json::from_value(json!({"confirm": true})).unwrap();
+    let result = server.empty_deleted_items(Parameters(params)).await.unwrap();
+    let v = result_json(&result);
+    assert_eq!(v["status"], "emptied");
+    assert!(v["items_deleted"].is_number());
+    assert!(v["folders_deleted"].is_number());
+    assert!(v["failed"].is_number());
+    assert_eq!(
+        fake.calls(),
+        vec![("empty_deleted_items".to_string(), json!({"confirm": true}))]
     );
 }
 
@@ -642,14 +1049,26 @@ async fn list_attachments_returns_filename() {
         .list_attachments(Parameters(ListAttachmentsParams { email_id: EMAIL_ID.to_string() }))
         .await
         .unwrap();
-    assert_eq!(result_json(&result)[0]["filename"], "report.pdf");
+    let v = result_json(&result);
+    assert_eq!(v[0]["filename"], "report.pdf");
+    assert_eq!(v[0]["index"], 1);
+    assert_eq!(v[0]["size"], 1234);
+    assert_eq!(v[0]["type"], "file");
+    assert!(v[0]["content_id"].is_null());
+    assert_eq!(v[0]["mime_type"], "application/pdf");
+    assert_eq!(v[0]["hidden"], false);
+    assert_eq!(v[0]["is_inline"], false);
+    assert_eq!(v[1]["content_id"], "logo@example");
+    assert_eq!(v[1]["mime_type"], "image/png");
+    assert_eq!(v[1]["hidden"], true);
+    assert_eq!(v[1]["is_inline"], true);
 }
 
 #[tokio::test]
 async fn save_attachments_passes_dir_and_names() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
+    let result = server
         .save_attachments(Parameters(SaveAttachmentsParams {
             email_id: EMAIL_ID.to_string(),
             save_dir: "/tmp/x".to_string(),
@@ -660,6 +1079,103 @@ async fn save_attachments_passes_dir_and_names() {
     let (_, args) = &fake.calls()[0];
     assert_eq!(args["save_dir"], "/tmp/x");
     assert_eq!(args["attachment_names"], json!(["report.pdf"]));
+    let v = result_json(&result);
+    assert_eq!(v[0]["filename"], "report.pdf");
+    assert_eq!(v[0]["status"], "saved");
+    assert_eq!(v[0]["saved_to"], "/tmp/x");
+    for key in ["index", "size", "type", "content_id", "mime_type", "hidden", "is_inline"] {
+        assert!(v[0].get(key).is_some(), "missing {key}");
+    }
+}
+
+#[tokio::test]
+async fn get_inline_image_forwards_args_and_returns_data_uri() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let result = server
+        .get_inline_image(Parameters(GetInlineImageParams {
+            email_id: EMAIL_ID.to_string(),
+            content_id: "cid:logo@example".to_string(),
+            context_lines: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls(),
+        vec![(
+            "get_inline_image".to_string(),
+            json!({"email_id": EMAIL_ID, "content_id": "cid:logo@example", "context_lines": null})
+        )]
+    );
+    let v = result_json(&result);
+    assert_eq!(v["content_id"], "logo@example");
+    assert_eq!(v["filename"], "logo.png");
+    assert_eq!(v["mime_type"], "image/png");
+    assert_eq!(v["size"], 4);
+    assert_eq!(v["data_uri"], "data:image/png;base64,iVBORw==");
+    // Not requested: no `context` key at all.
+    assert!(v.get("context").is_none(), "{v}");
+}
+
+#[tokio::test]
+async fn get_inline_image_forwards_context_lines_and_returns_context() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let result = server
+        .get_inline_image(Parameters(GetInlineImageParams {
+            email_id: EMAIL_ID.to_string(),
+            content_id: "logo@example".to_string(),
+            context_lines: Some(3),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls(),
+        vec![(
+            "get_inline_image".to_string(),
+            json!({"email_id": EMAIL_ID, "content_id": "logo@example", "context_lines": 3})
+        )]
+    );
+    let v = result_json(&result);
+    assert_eq!(v["context"], "Here is our new logo:");
+    assert_eq!(v["data_uri"], "data:image/png;base64,iVBORw==");
+}
+
+#[test]
+fn get_inline_image_params_context_lines_defaults_to_none() {
+    let p: GetInlineImageParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "content_id": "a@b"})).unwrap();
+    assert_eq!(p.context_lines, None);
+    let p: GetInlineImageParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "content_id": "a@b", "context_lines": 5})).unwrap();
+    assert_eq!(p.context_lines, Some(5));
+    let negative = serde_json::from_value::<GetInlineImageParams>(
+        json!({"email_id": EMAIL_ID, "content_id": "a@b", "context_lines": -1}));
+    assert!(negative.is_err());
+}
+
+#[test]
+fn get_inline_image_params_require_content_id() {
+    let missing = serde_json::from_value::<GetInlineImageParams>(json!({"email_id": EMAIL_ID}));
+    assert!(missing.is_err());
+    let missing = serde_json::from_value::<GetInlineImageParams>(json!({"content_id": "a@b"}));
+    assert!(missing.is_err());
+}
+
+#[tokio::test]
+async fn get_inline_image_surfaces_client_errors() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_fail_with("Content-ID 'x@y' not found.");
+    let server = OutlookMcpServer::new(fake.clone());
+    let err = server
+        .get_inline_image(Parameters(GetInlineImageParams {
+            email_id: EMAIL_ID.to_string(),
+            content_id: "x@y".to_string(),
+            context_lines: None,
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("Content-ID 'x@y' not found."));
 }
 
 // ---- Tasks ----
