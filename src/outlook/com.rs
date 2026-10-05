@@ -48,6 +48,93 @@ pub fn join_categories(cats: &[String]) -> String {
     cats.join(", ")
 }
 
+/// Normalize an attachment Content-ID (`PR_ATTACH_CONTENT_ID`): trim whitespace
+/// and one pair of surrounding `<>`, so it matches the `cid:` references in an
+/// HTML body. Empty (or missing) becomes `None`.
+pub fn clean_content_id(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    let inner = trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed)
+        .trim();
+    if inner.is_empty() { None } else { Some(inner.to_string()) }
+}
+
+/// Normalize a caller-supplied Content-ID the way an HTML body might spell it:
+/// trim whitespace, drop a leading `cid:` (any case), then strip `<>` as
+/// `clean_content_id` does. `None` when nothing is left. Compare the result
+/// case-insensitively.
+pub fn normalize_cid_request(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let rest = match trimmed.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("cid:") => &trimmed[4..],
+        _ => trimmed,
+    };
+    clean_content_id(Some(rest))
+}
+
+/// An attachment's MIME type: its own MIME tag (`PR_ATTACH_MIME_TAG`),
+/// lowercased, when present; otherwise a guess from the file extension.
+/// `None` when neither yields anything.
+pub fn guess_mime(mime_tag: Option<&str>, filename: &str) -> Option<String> {
+    if let Some(tag) = mime_tag.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(tag.to_lowercase());
+    }
+    let (_, ext) = filename.rsplit_once('.')?;
+    let mime = match ext.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "eml" => "message/rfc822",
+        "msg" => "application/vnd.ms-outlook",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// Whether an attachment is inline (`cid:`-referenced) content rather than a
+/// standalone attachment. `content_id` is already cleaned of `<>` (see
+/// `clean_content_id`).
+///
+/// Inline when it has a Content-ID and either Outlook marked it hidden or the
+/// HTML body references it as `cid:<content_id>` (case-insensitive, whole id).
+/// A Content-ID the HTML never references is usually a regular attachment some
+/// senders label with a CID anyway; no Content-ID is never inline.
+pub fn is_inline(content_id: Option<&str>, hidden: bool, html_body: &str) -> bool {
+    let Some(id) = content_id.filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if hidden {
+        return true;
+    }
+    let needle = format!("cid:{}", id.to_lowercase());
+    let haystack = html_body.to_lowercase();
+    // The reference must end where the id ends, so `cid:img10@x` does not
+    // count as a reference to `img1@x`.
+    haystack.match_indices(&needle).any(|(start, _)| {
+        haystack[start + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | ')' | '<' | '>'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +174,106 @@ mod tests {
         assert_eq!(parse_categories(""), Vec::<String>::new());
         assert_eq!(join_categories(&["Work".into(), "Personal".into()]), "Work, Personal");
         assert_eq!(join_categories(&[]), "");
+    }
+
+    #[test]
+    fn clean_content_id_strips_whitespace_and_angle_brackets() {
+        assert_eq!(clean_content_id(Some("<image001.png@01D9>")), Some("image001.png@01D9".to_string()));
+        assert_eq!(clean_content_id(Some("  < abc@x >  ")), Some("abc@x".to_string()));
+        assert_eq!(clean_content_id(Some("plain-id")), Some("plain-id".to_string()));
+        // Only a matched pair is stripped.
+        assert_eq!(clean_content_id(Some("<half")), Some("<half".to_string()));
+        assert_eq!(clean_content_id(Some("<>")), None);
+        assert_eq!(clean_content_id(Some("   ")), None);
+        assert_eq!(clean_content_id(Some("")), None);
+        assert_eq!(clean_content_id(None), None);
+    }
+
+    #[test]
+    fn normalize_cid_request_strips_cid_prefix_and_brackets() {
+        assert_eq!(normalize_cid_request("image001.png@01D9"), Some("image001.png@01D9".to_string()));
+        assert_eq!(normalize_cid_request("cid:image001.png@01D9"), Some("image001.png@01D9".to_string()));
+        assert_eq!(normalize_cid_request("  CID:<abc@x>  "), Some("abc@x".to_string()));
+        assert_eq!(normalize_cid_request("Cid: <abc@x>"), Some("abc@x".to_string()));
+        assert_eq!(normalize_cid_request("<abc@x>"), Some("abc@x".to_string()));
+        // Only a leading prefix is stripped, and case is preserved.
+        assert_eq!(normalize_cid_request("Logo-cid:A@B"), Some("Logo-cid:A@B".to_string()));
+        assert_eq!(normalize_cid_request("cid:"), None);
+        assert_eq!(normalize_cid_request("cid:<>"), None);
+        assert_eq!(normalize_cid_request("  "), None);
+        assert_eq!(normalize_cid_request(""), None);
+        // Multi-byte input shorter than / straddling the prefix length is fine.
+        assert_eq!(normalize_cid_request("é@x"), Some("é@x".to_string()));
+        assert_eq!(normalize_cid_request("ciéd"), Some("ciéd".to_string()));
+    }
+
+    #[test]
+    fn guess_mime_prefers_the_tag_lowercased() {
+        assert_eq!(guess_mime(Some(" Image/PNG "), "photo.jpg"), Some("image/png".to_string()));
+        assert_eq!(guess_mime(Some("  "), "photo.jpg"), Some("image/jpeg".to_string()));
+        assert_eq!(guess_mime(None, "photo.jpg"), Some("image/jpeg".to_string()));
+    }
+
+    #[test]
+    fn guess_mime_maps_common_extensions_case_insensitively() {
+        assert_eq!(guess_mime(None, "a.PNG"), Some("image/png".to_string()));
+        assert_eq!(guess_mime(None, "a.jpeg"), Some("image/jpeg".to_string()));
+        assert_eq!(guess_mime(None, "a.svg"), Some("image/svg+xml".to_string()));
+        assert_eq!(guess_mime(None, "report.final.pdf"), Some("application/pdf".to_string()));
+        assert_eq!(guess_mime(None, "notes.txt"), Some("text/plain".to_string()));
+        assert_eq!(
+            guess_mime(None, "deck.pptx"),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string())
+        );
+        assert_eq!(guess_mime(None, "fwd.eml"), Some("message/rfc822".to_string()));
+        assert_eq!(guess_mime(None, "fwd.msg"), Some("application/vnd.ms-outlook".to_string()));
+    }
+
+    #[test]
+    fn guess_mime_returns_none_when_unknown() {
+        assert_eq!(guess_mime(None, "archive.xyz"), None);
+        assert_eq!(guess_mime(None, "no-extension"), None);
+        assert_eq!(guess_mime(None, ""), None);
+    }
+
+    #[test]
+    fn is_inline_needs_a_content_id() {
+        assert!(!is_inline(None, false, r#"<img src="cid:logo@x">"#));
+        assert!(!is_inline(Some(""), false, r#"<img src="cid:logo@x">"#));
+    }
+
+    #[test]
+    fn is_inline_when_referenced_from_html() {
+        assert!(is_inline(Some("logo@x"), false, r#"<img src="cid:logo@x">"#));
+        assert!(is_inline(Some("logo@x"), false, "cid:logo@x"));
+        assert!(is_inline(Some("logo@x"), false, "url(cid:logo@x)"));
+        assert!(is_inline(Some("logo@x"), false, "<img src='cid:logo@x' >"));
+    }
+
+    #[test]
+    fn is_inline_reference_is_case_insensitive() {
+        assert!(is_inline(Some("Image001.PNG@01D9"), false, r#"<img src="CID:image001.png@01d9">"#));
+    }
+
+    #[test]
+    fn is_inline_cid_not_referenced_is_regular() {
+        assert!(!is_inline(Some("logo@x"), false, "<p>no images here</p>"));
+        assert!(!is_inline(Some("logo@x"), false, ""));
+    }
+
+    #[test]
+    fn is_inline_requires_the_whole_id() {
+        // `cid:img10@x` is not a reference to `img1@x`, nor `cid:img1@xyz`.
+        assert!(!is_inline(Some("img1@x"), false, r#"<img src="cid:img10@x">"#));
+        assert!(!is_inline(Some("img1@x"), false, r#"<img src="cid:img1@xyz">"#));
+        // ...but a later whole reference still counts.
+        assert!(is_inline(Some("img1@x"), false, r#"<img src="cid:img1@xyz"><img src="cid:img1@x">"#));
+    }
+
+    #[test]
+    fn is_inline_hidden() {
+        assert!(!is_inline(None, true, ""));
+        assert!(is_inline(Some("logo@x"), true, ""));
     }
 
     #[test]
@@ -233,6 +420,15 @@ pub fn put_property(disp: &IDispatch, name: &str, value: VARIANT) -> WinResult<(
 
 pub fn call_method(disp: &IDispatch, name: &str, args: &mut [VARIANT]) -> WinResult<VARIANT> {
     invoke(disp, name, DISPATCH_METHOD, args)
+}
+
+/// Read a MAPI property by DASL schema name via
+/// `disp.PropertyAccessor.GetProperty(schema)`. Returns `None` on any error:
+/// Outlook raises a COM error for a property that isn't set, and some objects
+/// have no `PropertyAccessor` at all.
+pub fn get_mapi_prop(disp: &IDispatch, schema: &str) -> Option<VARIANT> {
+    let accessor = IDispatch::try_from(&get_property(disp, "PropertyAccessor").ok()?).ok()?;
+    call_method(&accessor, "GetProperty", &mut [variant_from_str(schema)]).ok()
 }
 
 /// Read an item's color categories (empty vec if the property is missing or blank).

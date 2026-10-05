@@ -26,7 +26,7 @@ fn list_folders_returns_at_least_inbox() {
 #[ignore]
 fn list_emails_returns_inbox_items() {
     let emails = client().list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 5, unread_only: false,
+        query: None, folder: "inbox".into(), count: 5, offset: 0, unread_only: false,
         from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list_emails should succeed against a live Outlook");
@@ -35,6 +35,27 @@ fn list_emails_returns_inbox_items() {
     for email in &emails {
         assert!(!email.id.is_empty());
     }
+}
+
+#[test]
+#[ignore]
+fn list_emails_offset_pages_tile_without_overlap() {
+    let c = client();
+    let page = |count: i32, offset: i32| -> Vec<String> {
+        c.list_emails(EmailQuery {
+            query: None, folder: "inbox".into(), count, offset, unread_only: false,
+            from: None, to: None, category: None, received_after: None, received_before: None,
+            since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        }).expect("list_emails should succeed against a live Outlook")
+            .into_iter().map(|e| e.id).collect()
+    };
+    let p1 = page(5, 0);
+    let p2 = page(5, 5);
+    let both = page(10, 0);
+    // Pages are disjoint, and together they are exactly one count=10 call
+    // (assumes no mail arrives in the inbox mid-test).
+    assert!(p1.iter().all(|id| !p2.contains(id)), "page 1 and page 2 overlap");
+    assert_eq!([p1, p2].concat(), both);
 }
 
 #[test]
@@ -48,7 +69,38 @@ fn create_draft_then_delete_round_trips() {
         None, None, false, None,
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().expect("create_draft returns an id").to_string();
-    c.delete_email(id).expect("cleanup: delete_email should succeed");
+    c.delete_email(id, false).expect("cleanup: delete_email should succeed");
+}
+
+#[test]
+#[ignore]
+fn permanent_delete_of_draft_skips_deleted_items() {
+    let c = client();
+    let subject = "outlook-mcp-rs permanent delete probe zzqx-7731";
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        subject.to_string(),
+        "This draft is created and permanently deleted by an automated test.".to_string(),
+        None, None, false, None,
+    ).expect("create_draft should succeed");
+    let id = created["id"].as_str().expect("create_draft returns an id").to_string();
+
+    let result = c.delete_email(id.clone(), true).expect("permanent delete_email should succeed");
+    assert_eq!(result["permanent"], true);
+
+    // The old id must no longer resolve...
+    assert!(c.get_email(id, false).is_err(), "deleted draft's id should no longer resolve");
+    // ...and nothing with that subject may be sitting in Deleted Items.
+    let leftovers = c.list_emails(EmailQuery {
+        query: Some(subject.to_string()), folder: "deleted".into(), count: 50, offset: 0,
+        unread_only: false, from: None, to: None, category: None, received_after: None,
+        received_before: None, since_days: None, has_attachments: None,
+        flagged: false, high_importance: false,
+    }).expect("list_emails on Deleted Items should succeed");
+    assert!(
+        !leftovers.iter().any(|e| e.subject == subject),
+        "a permanently deleted draft must not remain in Deleted Items"
+    );
 }
 
 #[test]
@@ -244,7 +296,7 @@ fn list_events_filters_by_query_and_category() {
     assert!(!misses.iter().any(|e| e.id == id), "non-matching query must exclude the probe");
 
     // Cleanup: delete the probe.
-    c.delete_email(id).expect("cleanup delete");
+    c.delete_email(id, false).expect("cleanup delete");
 }
 
 #[test]
@@ -274,14 +326,14 @@ fn list_emails_query_filter_narrows_results() {
     use outlook_mcp_rs::outlook::EmailQuery;
     let c = WindowsOutlookClient::new();
     let all = c.list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 25, unread_only: false,
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
         from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("plain list should work");
     // A query that almost certainly matches nothing should return <= all.
     let filtered = c.list_emails(EmailQuery {
         query: Some("zzqx-improbable-token-9137".into()),
-        folder: "inbox".into(), count: 25, unread_only: false,
+        folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
         from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("query list should work");
@@ -302,13 +354,13 @@ fn list_emails_query_matches_real_body_text() {
     let id = created["id"].as_str().unwrap().to_string();
 
     let found = c.list_emails(EmailQuery {
-        query: Some(token.to_string()), folder: "drafts".into(), count: 25,
+        query: Some(token.to_string()), folder: "drafts".into(), count: 25, offset: 0,
         unread_only: false, from: None, to: None, category: None, received_after: None,
         received_before: None, since_days: None, has_attachments: None,
         flagged: false, high_importance: false,
     }).expect("list_emails query should succeed");
 
-    c.delete_email(id.clone()).expect("cleanup: delete the draft");
+    c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
 
     assert!(
         found.iter().any(|e| e.id == id),
@@ -316,6 +368,47 @@ fn list_emails_query_matches_real_body_text() {
          of that token is in the body, proving the existing @SQL textdescription \
          clause matches body content and not just subject/sender"
     );
+}
+
+#[test]
+#[ignore]
+fn list_emails_hebrew_query_finds_matching_subject() {
+    // Issue #2: take a Hebrew word from a recent inbox subject (or pin one via
+    // OUTLOOK_MCP_LIVE_HEBREW_QUERY) and check list_emails(query=...) finds
+    // that email. Skips (passes) if there's no Hebrew subject to use.
+    let c = client();
+    let inbox = |query: Option<String>| EmailQuery {
+        query, folder: "inbox".into(), count: 50, offset: 0, unread_only: false,
+        from: None, to: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    };
+    let is_hebrew = |ch: char| ('\u{0590}'..='\u{05FF}').contains(&ch);
+    let mut term = std::env::var("OUTLOOK_MCP_LIVE_HEBREW_QUERY").ok().filter(|s| !s.is_empty());
+    let mut expected_id = None;
+    if term.is_none() {
+        let recent = c.list_emails(inbox(None)).expect("plain list should work");
+        'outer: for email in &recent {
+            for word in email.subject.split(|ch: char| !is_hebrew(ch)) {
+                if word.chars().count() >= 3 {
+                    term = Some(word.to_string());
+                    expected_id = Some(email.id.clone());
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let Some(term) = term else {
+        eprintln!("skipping: no Hebrew subject in the 50 newest inbox emails");
+        return;
+    };
+    let found = c.list_emails(inbox(Some(term.clone()))).expect("Hebrew query list should work");
+    assert!(!found.is_empty(), "no results for Hebrew query {term:?}");
+    if let Some(id) = expected_id {
+        assert!(
+            found.iter().any(|e| e.id == id),
+            "Hebrew query {term:?} should find the inbox email whose subject it came from"
+        );
+    }
 }
 
 #[test]
@@ -335,8 +428,109 @@ fn create_draft_with_attachment_round_trips() {
         Some(vec![path_str]),
     ).expect("create_draft with attachment should succeed");
     let id = created["id"].as_str().expect("draft id").to_string();
-    c.delete_email(id).expect("cleanup: delete the draft");
+    c.delete_email(id, false).expect("cleanup: delete the draft");
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+#[ignore]
+fn list_attachments_reports_metadata_for_a_draft_attachment() {
+    let dir = std::env::temp_dir();
+    let path = dir.join("outlook-mcp-rs-live-attach-meta.txt");
+    std::fs::write(&path, b"live attachment metadata test").expect("write temp file");
+    let path_str = path.to_string_lossy().to_string();
+
+    let c = WindowsOutlookClient::new();
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        "outlook-mcp-rs attachment metadata test".to_string(),
+        "see attached".to_string(),
+        None, None, false,
+        Some(vec![path_str]),
+    ).expect("create_draft with attachment should succeed");
+    let id = created["id"].as_str().expect("draft id").to_string();
+
+    // Capture the result before cleanup so a failed assertion doesn't leak the draft.
+    let listed = c.list_attachments(id.clone());
+    c.delete_email(id, false).expect("cleanup: delete the draft");
+    let _ = std::fs::remove_file(&path);
+
+    let atts = listed.expect("list_attachments should succeed");
+    assert_eq!(atts.len(), 1);
+    let v = serde_json::to_value(&atts[0]).unwrap();
+    assert_eq!(v["index"], 1);
+    assert_eq!(v["filename"], "outlook-mcp-rs-live-attach-meta.txt");
+    assert!(v["size"].as_i64().unwrap() > 0);
+    assert_eq!(v["type"], "file");
+    // A plain file attachment has no Content-ID; its MIME type comes from the
+    // tag or the .txt extension.
+    assert!(v["content_id"].is_null());
+    assert_eq!(v["mime_type"], "text/plain");
+    assert_eq!(v["hidden"], false);
+}
+
+#[test]
+#[ignore]
+fn inline_flag_consistent_on_a_real_inbox_email() {
+    let c = WindowsOutlookClient::new();
+    let list = c.list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
+        from: None, to: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list");
+    let Some(email) = list.iter().find(|e| e.has_attachments) else {
+        eprintln!("skipping: none of the newest 25 inbox emails has attachments");
+        return;
+    };
+    let atts = c.list_attachments(email.id.clone()).expect("list_attachments");
+    for att in &atts {
+        let v = serde_json::to_value(att).unwrap();
+        assert!(v["is_inline"].is_boolean(), "is_inline missing: {v}");
+        // Inline content is always cid:-addressable.
+        if att.is_inline {
+            assert!(att.content_id.is_some(), "inline attachment without a content_id: {v}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn get_inline_image_round_trips_a_real_content_id() {
+    // Read-only: looks for an existing inline attachment; never sends mail.
+    use base64::Engine as _;
+    let c = WindowsOutlookClient::new();
+    let emails = c.list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
+        from: None, to: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list_emails");
+    let found = emails.iter().find_map(|e| {
+        // Some item types don't support attachments; just skip those.
+        let atts = c.list_attachments(e.id.clone()).ok()?;
+        atts.into_iter()
+            .find(|a| a.content_id.is_some() && a.size <= 10 * 1024 * 1024)
+            .map(|a| (e.id.clone(), a))
+    });
+    let Some((email_id, att)) = found else {
+        eprintln!("skipping: no attachment with a Content-ID in the newest 25 inbox items");
+        return;
+    };
+    let cid = att.content_id.clone().unwrap();
+    let image = c.get_inline_image(email_id.clone(), format!("cid:{cid}"), None).expect("get_inline_image");
+    assert_eq!(image.content_id, cid);
+    let (header, payload) = image.data_uri.split_once(',').expect("data URI has a comma");
+    assert_eq!(header, format!("data:{};base64", image.mime_type));
+    let data = base64::engine::general_purpose::STANDARD.decode(payload).expect("valid base64");
+    assert_eq!(data.len(), image.size);
+    assert!(image.size > 0);
+    assert!(image.context.is_none(), "context only when context_lines is given");
+
+    // Same image with surrounding text requested: `context` is always present
+    // (possibly "" if the HTML body never references this Content-ID).
+    let with_ctx = c.get_inline_image(email_id, cid.clone(), Some(3)).expect("get_inline_image with context");
+    assert_eq!(with_ctx.content_id, cid);
+    let context = with_ctx.context.expect("context requested");
+    assert!(context.lines().count() <= 3, "{context:?}");
 }
 
 #[test]
@@ -344,7 +538,7 @@ fn create_draft_with_attachment_round_trips() {
 fn get_email_reports_item_type_for_real_inbox_item() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
-        query: None, folder: "inbox".into(), count: 1, unread_only: false,
+        query: None, folder: "inbox".into(), count: 1, offset: 0, unread_only: false,
         from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list");
@@ -423,7 +617,7 @@ fn update_email_applies_state_then_moves() {
     }).expect("update_email move");
     assert_eq!(moved["changed"], serde_json::json!(["move_to"]));
     let new_id = moved["id"].as_str().expect("moved id").to_string();
-    c.delete_email(new_id).expect("cleanup delete");
+    c.delete_email(new_id, false).expect("cleanup delete");
 }
 
 #[test]
@@ -867,7 +1061,7 @@ fn list_emails_to_filter_matches_draft_recipient() {
     let id = created["id"].as_str().unwrap().to_string();
 
     let query = |to: &str| EmailQuery {
-        query: None, folder: "drafts".into(), count: 50, unread_only: false,
+        query: None, folder: "drafts".into(), count: 50, offset: 0, unread_only: false,
         from: None, to: Some(to.to_string()), category: None, received_after: None,
         received_before: None, since_days: None, has_attachments: None,
         flagged: false, high_importance: false,
@@ -875,7 +1069,7 @@ fn list_emails_to_filter_matches_draft_recipient() {
     let hit = c.list_emails(query("nobody@example.invalid"));
     let miss = c.list_emails(query("someone-else@example.invalid"));
 
-    c.delete_email(id.clone()).expect("cleanup: delete the draft");
+    c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
 
     let hit = hit.expect("list_emails to=nobody should succeed");
     let miss = miss.expect("list_emails to=someone-else should succeed");

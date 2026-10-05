@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use super::types::*;
 use super::{
-    validate_recurrence_update, CheckAvailabilityInput, CreateEventInput, EmailQuery, EmailUpdate,
-    EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, TaskQuery, TaskUpdate,
+    require_empty_confirm, validate_recurrence_update, CheckAvailabilityInput, CreateEventInput,
+    EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, TaskQuery, TaskUpdate,
 };
 
 pub const EMAIL_ID: &str = "entry-1|store-1";
@@ -57,7 +57,7 @@ impl OutlookClient for FakeOutlookClient {
 
     fn list_emails(&self, q: EmailQuery) -> Result<Vec<EmailSummary>, ToolError> {
         self.record("list_emails", json!({
-            "query": q.query, "folder": q.folder, "count": q.count,
+            "query": q.query, "folder": q.folder, "count": q.count, "offset": q.offset,
             "unread_only": q.unread_only, "from": q.from, "to": q.to, "category": q.category,
             "received_after": q.received_after, "received_before": q.received_before,
             "since_days": q.since_days, "has_attachments": q.has_attachments,
@@ -134,9 +134,16 @@ impl OutlookClient for FakeOutlookClient {
         Ok(json!({"status": "updated", "id": id, "changed": changed}))
     }
 
-    fn delete_email(&self, email_id: String) -> Result<Value, ToolError> {
-        self.record("delete_email", json!({"email_id": email_id}))?;
-        Ok(json!({"status": "deleted"}))
+    fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError> {
+        self.record("delete_email", json!({"email_id": email_id, "permanent": permanent}))?;
+        Ok(json!({"status": "deleted", "permanent": permanent}))
+    }
+
+    fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError> {
+        // Record first so tests can see the call even when it's refused.
+        self.record("empty_deleted_items", json!({"confirm": confirm}))?;
+        require_empty_confirm(confirm)?;
+        Ok(json!({"status": "emptied", "items_deleted": 2, "folders_deleted": 1, "failed": 0}))
     }
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError> {
@@ -267,14 +274,42 @@ impl OutlookClient for FakeOutlookClient {
     fn list_attachments(&self, email_id: String)
         -> Result<Vec<AttachmentInfo>, ToolError> {
         self.record("list_attachments", json!({"email_id": email_id}))?;
-        Ok(vec![AttachmentInfo { index: 1, filename: "report.pdf".into(), size: 1234 }])
+        Ok(vec![
+            AttachmentInfo {
+                index: 1, filename: "report.pdf".into(), size: 1234, att_type: "file".into(),
+                content_id: None, mime_type: Some("application/pdf".into()), hidden: false,
+                is_inline: false,
+            },
+            AttachmentInfo {
+                index: 2, filename: "logo.png".into(), size: 512, att_type: "file".into(),
+                content_id: Some("logo@example".into()), mime_type: Some("image/png".into()), hidden: true,
+                is_inline: true,
+            },
+        ])
     }
 
     fn save_attachments(&self, email_id: String, save_dir: String,
         attachment_names: Option<Vec<String>>) -> Result<Vec<Value>, ToolError> {
         self.record("save_attachments",
             json!({"email_id": email_id, "save_dir": save_dir, "attachment_names": attachment_names}))?;
-        Ok(vec![json!({"filename": "report.pdf", "saved_to": save_dir, "status": "saved"})])
+        Ok(vec![json!({
+            "index": 1, "filename": "report.pdf", "size": 1234, "type": "file",
+            "content_id": null, "mime_type": "application/pdf", "hidden": false, "is_inline": false,
+            "saved_to": save_dir, "status": "saved",
+        })])
+    }
+
+    fn get_inline_image(&self, email_id: String, content_id: String,
+        context_lines: Option<u32>) -> Result<InlineImage, ToolError> {
+        self.record("get_inline_image", json!({
+            "email_id": email_id, "content_id": content_id, "context_lines": context_lines,
+        }))?;
+        Ok(InlineImage {
+            content_id: "logo@example".into(), filename: "logo.png".into(),
+            mime_type: "image/png".into(), size: 4,
+            data_uri: "data:image/png;base64,iVBORw==".into(),
+            context: context_lines.map(|_| "Here is our new logo:".to_string()),
+        })
     }
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError> {
@@ -369,7 +404,7 @@ mod tests {
 
     fn basic_query() -> EmailQuery {
         EmailQuery {
-            query: None, folder: "inbox".into(), count: 10, unread_only: false,
+            query: None, folder: "inbox".into(), count: 10, offset: 0, unread_only: false,
             from: None, to: None, category: None, received_after: None, received_before: None,
             since_days: None, has_attachments: None, flagged: false, high_importance: false,
         }
@@ -383,7 +418,7 @@ mod tests {
         assert_eq!(fake.calls(), vec![
             ("list_folders".to_string(), json!({})),
             ("list_emails".to_string(), json!({
-                "query": null, "folder": "inbox", "count": 10, "unread_only": false,
+                "query": null, "folder": "inbox", "count": 10, "offset": 0, "unread_only": false,
                 "from": null, "to": null, "category": null, "received_after": null,
                 "received_before": null, "since_days": null, "has_attachments": null,
                 "flagged": false, "high_importance": false,

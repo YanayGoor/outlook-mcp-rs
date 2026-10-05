@@ -7,13 +7,16 @@ use crate::error::ToolError;
 use serde_json::Value;
 use types::*;
 
-/// All filters for `list_emails`. All optional except `folder`/`count`
+/// All filters for `list_emails`. All optional except `folder`/`count`/`offset`
 /// (which the server fills with defaults). Supplying several ANDs them.
 #[derive(Debug, Clone)]
 pub struct EmailQuery {
     pub query: Option<String>,
     pub folder: String,
     pub count: i32,
+    /// Matches to skip before the page starts (after every filter). Negative
+    /// values are treated as 0.
+    pub offset: i32,
     pub unread_only: bool,
     pub from: Option<String>,
     /// Recipient filter: caseless substring of any To/CC recipient's
@@ -209,7 +212,12 @@ pub trait OutlookClient: Send + Sync {
         html: bool, send: bool, attachments: Option<Vec<String>>)
         -> Result<Value, ToolError>;
     fn update_email(&self, u: EmailUpdate) -> Result<Value, ToolError>;
-    fn delete_email(&self, email_id: String) -> Result<Value, ToolError>;
+    /// `permanent = false` moves the email to Deleted Items; `true`
+    /// hard-deletes it like Outlook's shift+delete.
+    fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError>;
+    /// Permanently delete everything in the default store's Deleted Items.
+    /// Refuses (via [`require_empty_confirm`]) unless `confirm` is true.
+    fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError>;
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError>;
     fn get_event(&self, event_id: String) -> Result<EventDetail, ToolError>;
@@ -224,6 +232,8 @@ pub trait OutlookClient: Send + Sync {
         -> Result<Vec<AttachmentInfo>, ToolError>;
     fn save_attachments(&self, email_id: String, save_dir: String,
         attachment_names: Option<Vec<String>>) -> Result<Vec<Value>, ToolError>;
+    fn get_inline_image(&self, email_id: String, content_id: String,
+        context_lines: Option<u32>) -> Result<InlineImage, ToolError>;
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError>;
     fn create_task(&self, subject: String, body: Option<String>,
@@ -237,6 +247,28 @@ pub trait OutlookClient: Send + Sync {
     fn create_note(&self, body: String, categories: Option<Vec<String>>, color: Option<String>) -> Result<Value, ToolError>;
     fn update_note(&self, u: NoteUpdate) -> Result<Value, ToolError>;
     fn delete_note(&self, note_id: String) -> Result<Value, ToolError>;
+}
+
+/// Guard for `empty_deleted_items`: it is irreversible, so it refuses unless
+/// the caller explicitly passed `confirm = true`. Shared by the real and fake
+/// clients so the refusal is the same everywhere.
+pub fn require_empty_confirm(confirm: bool) -> Result<(), ToolError> {
+    if confirm {
+        return Ok(());
+    }
+    Err(ToolError::new(
+        "empty_deleted_items permanently deletes EVERYTHING in Deleted Items \
+         (items and subfolders) and cannot be undone. Call again with \
+         confirm=true to proceed.",
+    ))
+}
+
+/// Whether a permanent `delete_email` must first move the item into Deleted
+/// Items. The object model has no hard-delete call, but `Delete()` on an item
+/// already in Deleted Items is permanent; so move there unless the item's
+/// parent folder already is that folder (EntryIDs compared exactly).
+pub fn permanent_delete_needs_move(parent_entry_id: &str, deleted_items_entry_id: &str) -> bool {
+    parent_entry_id.is_empty() || parent_entry_id != deleted_items_entry_id
 }
 
 /// The status string `create_event` returns: `"meeting_sent"` (attendees +
@@ -408,13 +440,271 @@ pub fn common_free(people: &[PersonAvailability], treat_as_free: &[String]) -> V
     windows
 }
 
+/// Upper bound on `get_inline_image`'s `context_lines`; larger requests are
+/// clamped to it.
+pub const MAX_CONTEXT_LINES: u32 = 50;
+
+/// Characters that can continue a Content-ID (RFC 5322 `atext` plus `.`/`@`,
+/// minus the HTML-significant `'` and `&`). A `cid:` reference only matches
+/// when the next character is NOT one of these, so `cid:logo` does not match
+/// `cid:logo.png` or `cid:logo2`.
+fn is_cid_char(c: char) -> bool {
+    c.is_alphanumeric() || "._@-+$%!#*/=?^`{|}~".contains(c)
+}
+
+/// Byte offset of the first `cid:<cid>` reference in `html` (case-insensitive,
+/// whole-id), if any. `cid` is already normalized (no `cid:` prefix or `<>`).
+/// Case folding is ASCII-only so byte offsets stay valid in `html`.
+fn find_cid_reference(html: &str, cid: &str) -> Option<usize> {
+    if cid.is_empty() {
+        return None;
+    }
+    let haystack = html.to_ascii_lowercase();
+    let needle = format!("cid:{}", cid.to_ascii_lowercase());
+    haystack.match_indices(&needle).map(|(pos, _)| pos).find(|&pos| {
+        // Left boundary: not part of a longer word like `xcid:`.
+        let left_ok = haystack[..pos].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let right_ok = haystack[pos + needle.len()..].chars().next().is_none_or(|c| !is_cid_char(c));
+        left_ok && right_ok
+    })
+}
+
+/// Decode the common HTML entities (`&nbsp;`, `&amp;`, `&lt;`, `&gt;`,
+/// `&quot;`, `&apos;`/`&#39;`, and numeric `&#NNN;`/`&#xHH;`). Anything else
+/// (unknown names, invalid code points, a missing `;`) is left as is.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        // Entities are short; only look a few bytes ahead for the `;` (ASCII,
+        // so its byte position is always a char boundary).
+        let decoded = rest.bytes().skip(1).take(11).position(|b| b == b';').and_then(|semi| {
+            let name = &rest[1..semi + 1];
+            let ch = match name {
+                "nbsp" => '\u{a0}',
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                _ => {
+                    let num = name.strip_prefix('#')?;
+                    let code = match num.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => num.parse::<u32>().ok()?,
+                    };
+                    char::from_u32(code)?
+                }
+            };
+            Some((ch, semi + 2))
+        });
+        match decoded {
+            Some((ch, len)) => {
+                out.push(ch);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A rough HTML-to-text conversion for `text_before_cid`: drops comments and
+/// `<script>`/`<style>` blocks, turns `<br>` and the closing tags of block
+/// elements (`p`, `div`, `li`, `tr`, `h1`-`h6`) into newlines, separates
+/// table cells with a space, strips every other tag and decodes entities.
+/// Source whitespace (including newlines) is just whitespace, as in a
+/// browser; only tags produce line breaks.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut text = String::new();
+    // Flush the pending text run: decode it and turn its whitespace into
+    // spaces (line breaks come only from tags).
+    let flush = |text: &mut String, out: &mut String| {
+        let decoded = decode_entities(text);
+        out.extend(decoded.chars().map(|c| if c.is_whitespace() { ' ' } else { c }));
+        text.clear();
+    };
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        text.push_str(&rest[..lt]);
+        let tag = &rest[lt..];
+        if let Some(comment) = tag.strip_prefix("<!--") {
+            rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
+            continue;
+        }
+        let after = tag[1..].chars().next();
+        if !after.is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!' || c == '?') {
+            // A bare `<` (e.g. "a < b") is text.
+            text.push('<');
+            rest = &tag[1..];
+            continue;
+        }
+        let Some(gt) = tag.find('>') else {
+            // An unterminated tag runs to the end.
+            rest = "";
+            break;
+        };
+        let inner = &tag[1..gt];
+        let closing = inner.starts_with('/');
+        let name: String = inner
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == ':')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        rest = &tag[gt + 1..];
+        match name.as_str() {
+            "script" | "style" if !closing => {
+                // Skip to the matching close tag (or the end if there is none).
+                let lower = rest.to_ascii_lowercase();
+                rest = match lower.find(&format!("</{name}")) {
+                    Some(end) => rest[end..].find('>').map_or("", |g| &rest[end + g + 1..]),
+                    None => "",
+                };
+            }
+            "br" => {
+                flush(&mut text, &mut out);
+                out.push('\n');
+            }
+            "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if closing => {
+                flush(&mut text, &mut out);
+                out.push('\n');
+            }
+            // Keep table cells apart on their row's line.
+            "td" | "th" if closing => text.push(' '),
+            _ => {}
+        }
+    }
+    text.push_str(rest);
+    flush(&mut text, &mut out);
+    out
+}
+
+/// Up to `lines` lines (clamped to [`MAX_CONTEXT_LINES`]) of plain text
+/// immediately preceding the first `cid:<cid>` reference in `html`, joined
+/// with `\n`; the tag holding the reference (normally its `<img>`) is
+/// excluded. Whitespace runs inside a line collapse to one space and empty
+/// lines are dropped. `None` when `html` never references `cid` (matched
+/// case-insensitively and as a whole id; `cid` is already normalized).
+pub fn text_before_cid(html: &str, cid: &str, lines: u32) -> Option<String> {
+    let pos = find_cid_reference(html, cid)?;
+    let mut before = &html[..pos];
+    // Inside a tag (the reference is an attribute value)? Cut at its `<`.
+    if let Some(lt) = before.rfind('<').filter(|&lt| !before[lt..].contains('>')) {
+        before = &before[..lt];
+    }
+    let text = html_to_text(before);
+    let all: Vec<String> = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect();
+    let n = lines.min(MAX_CONTEXT_LINES) as usize;
+    Some(all[all.len().saturating_sub(n)..].join("\n"))
+}
+
+/// One page of a lazy stream of filter matches: drops the first `offset`
+/// (negative treated as 0), then keeps up to `count`, and stops pulling from
+/// `matches` once the page is full. An error from any pulled item, including
+/// a skipped one, is returned as-is.
+pub fn take_page<T, E>(
+    matches: impl Iterator<Item = Result<T, E>>,
+    offset: i32,
+    count: i32,
+) -> Result<Vec<T>, E> {
+    let mut matches = matches;
+    for m in matches.by_ref().take(offset.max(0) as usize) {
+        m?;
+    }
+    matches.take(count.max(0) as usize).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
-        parse_freebusy_slots, validate_recurrence, validate_recurrence_update, EventUpdate, RecurrenceInput,
+        parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
+        EventUpdate, RecurrenceInput, permanent_delete_needs_move, require_empty_confirm,
     };
+    use std::cell::Cell;
+
+    fn ok_items(n: i32) -> impl Iterator<Item = Result<i32, String>> {
+        (1..=n).map(Ok)
+    }
+
+    #[test]
+    fn take_page_first_page_is_the_first_count_items() {
+        assert_eq!(take_page(ok_items(10), 0, 3), Ok(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn take_page_skips_offset_then_takes_count() {
+        assert_eq!(take_page(ok_items(10), 3, 3), Ok(vec![4, 5, 6]));
+    }
+
+    #[test]
+    fn take_page_consecutive_pages_tile_the_stream() {
+        let p1 = take_page(ok_items(10), 0, 5).unwrap();
+        let p2 = take_page(ok_items(10), 5, 5).unwrap();
+        let both = take_page(ok_items(10), 0, 10).unwrap();
+        assert_eq!([p1, p2].concat(), both);
+    }
+
+    #[test]
+    fn take_page_last_page_is_short_and_past_the_end_is_empty() {
+        assert_eq!(take_page(ok_items(7), 5, 5), Ok(vec![6, 7]));
+        assert_eq!(take_page(ok_items(7), 7, 5), Ok(vec![]));
+        assert_eq!(take_page(ok_items(7), 100, 5), Ok(vec![]));
+    }
+
+    #[test]
+    fn take_page_negative_offset_is_treated_as_zero() {
+        assert_eq!(take_page(ok_items(10), -4, 2), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn take_page_stops_pulling_once_the_page_is_full() {
+        let pulled = Cell::new(0);
+        let it = (1..=100).map(|i| {
+            pulled.set(pulled.get() + 1);
+            Ok::<i32, String>(i)
+        });
+        assert_eq!(take_page(it, 2, 3), Ok(vec![3, 4, 5]));
+        assert_eq!(pulled.get(), 5);
+    }
+
+    #[test]
+    fn take_page_propagates_errors_from_skipped_and_kept_items() {
+        let with_err = |bad: i32| (1..=10).map(move |i| if i == bad { Err(format!("bad {i}")) } else { Ok(i) });
+        assert_eq!(take_page(with_err(2), 3, 3), Err("bad 2".to_string()));
+        assert_eq!(take_page(with_err(5), 3, 3), Err("bad 5".to_string()));
+        // An error beyond the page is never pulled.
+        assert_eq!(take_page(with_err(9), 3, 3), Ok(vec![4, 5, 6]));
+    }
     use crate::outlook::types::{AvailabilitySlot, FreeWindow, PersonAvailability};
+
+    #[test]
+    fn require_empty_confirm_refuses_without_confirm() {
+        let err = require_empty_confirm(false).unwrap_err();
+        assert!(err.to_string().contains("confirm=true"));
+        assert!(err.to_string().contains("cannot be undone"));
+        assert!(require_empty_confirm(true).is_ok());
+    }
+
+    #[test]
+    fn permanent_delete_skips_move_only_when_already_in_deleted_items() {
+        assert!(!permanent_delete_needs_move("DELETED-ID", "DELETED-ID"));
+        assert!(permanent_delete_needs_move("DRAFTS-ID", "DELETED-ID"));
+        // An unreadable (empty) parent id never counts as "already there".
+        assert!(permanent_delete_needs_move("", ""));
+    }
 
     #[test]
     fn create_event_status_covers_all_three_outcomes() {
@@ -632,5 +922,115 @@ mod tests {
     fn common_free_empty_when_no_one_resolved() {
         let people = vec![avail("alice", false, &[])];
         assert_eq!(common_free(&people, &["free".to_string()]), vec![]);
+    }
+}
+
+#[cfg(test)]
+mod inline_context_tests {
+    use super::{text_before_cid, MAX_CONTEXT_LINES};
+
+    fn ctx(html: &str, cid: &str, lines: u32) -> Option<String> {
+        text_before_cid(html, cid, lines)
+    }
+
+    #[test]
+    fn paragraph_before_an_image() {
+        let html = "<html><body><p>Hello team,</p><p>Here is the new logo:</p>\
+                    <p><img width=10 src=\"cid:image001.png@01D9ABCD\" alt=\"logo\"></p>\
+                    <p>Thanks</p></body></html>";
+        assert_eq!(ctx(html, "image001.png@01D9ABCD", 1).as_deref(), Some("Here is the new logo:"));
+        assert_eq!(
+            ctx(html, "image001.png@01D9ABCD", 5).as_deref(),
+            Some("Hello team,\nHere is the new logo:")
+        );
+    }
+
+    #[test]
+    fn br_separated_lines_and_source_newlines_are_whitespace() {
+        let html = "<div>line one<br>line\n   two<BR/>line three<br />\n<img src='cid:a@b'></div>";
+        assert_eq!(ctx(html, "a@b", 2).as_deref(), Some("line two\nline three"));
+        assert_eq!(ctx(html, "a@b", 3).as_deref(), Some("line one\nline two\nline three"));
+    }
+
+    #[test]
+    fn decodes_entities() {
+        let html = "<p>Fish&nbsp;&amp;&nbsp;chips &lt;b&gt; &quot;q&quot; it&#39;s &#65;&#x42; &bogus; &amp</p>\
+                    <img src=\"cid:x@y\">";
+        assert_eq!(
+            ctx(html, "x@y", 1).as_deref(),
+            Some("Fish & chips <b> \"q\" it's AB &bogus; &amp")
+        );
+    }
+
+    #[test]
+    fn ignores_style_script_and_comments() {
+        let html = "<head><style>p { color: red; }\n.x { }</style>\
+                    <script type=\"text/javascript\">var a = 1 < 2;</script></head>\
+                    <!--[if gte mso 9]><xml><o:shapedefaults /></xml><![endif]-->\
+                    <body><p>Caption<o:p></o:p></p><img src=\"cid:x@y\"></body>";
+        assert_eq!(ctx(html, "x@y", 10).as_deref(), Some("Caption"));
+    }
+
+    #[test]
+    fn block_closers_split_lines() {
+        let html = "<h1>Title</h1><ul><li>one</li><li>two</li></ul>\
+                    <table><tr><td>a</td><td>b</td></tr></table><div>last</div><img src=\"cid:x@y\">";
+        assert_eq!(ctx(html, "x@y", 10).as_deref(), Some("Title\none\ntwo\na b\nlast"));
+    }
+
+    #[test]
+    fn n_larger_than_available_returns_everything() {
+        let html = "<p>only</p><img src=\"cid:x@y\">";
+        assert_eq!(ctx(html, "x@y", 40).as_deref(), Some("only"));
+        assert_eq!(ctx("<img src=\"cid:x@y\">", "x@y", 3).as_deref(), Some(""));
+        assert_eq!(ctx(html, "x@y", 0).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn lines_are_clamped_to_the_maximum() {
+        let body: String = (0..80).map(|i| format!("<p>l{i}</p>")).collect();
+        let html = format!("{body}<img src=\"cid:x@y\">");
+        let got = ctx(&html, "x@y", 1000).unwrap();
+        assert_eq!(got.lines().count(), MAX_CONTEXT_LINES as usize);
+        assert!(got.ends_with("l79"));
+    }
+
+    #[test]
+    fn unreferenced_cid_is_none() {
+        assert_eq!(ctx("<p>text</p><img src=\"cid:other@y\">", "x@y", 3), None);
+        assert_eq!(ctx("", "x@y", 3), None);
+        assert_eq!(ctx("<p>x@y</p>", "x@y", 3), None);
+    }
+
+    #[test]
+    fn reference_matches_case_insensitively() {
+        let html = "<p>Look:</p><IMG SRC=\"CID:Image001.PNG@01D9\">";
+        assert_eq!(ctx(html, "image001.png@01d9", 1).as_deref(), Some("Look:"));
+    }
+
+    #[test]
+    fn prefix_collisions_do_not_match() {
+        let html = "<p>first</p><img src=\"cid:logo.png@01D9AB\"><p>second</p><img src=\"cid:logo.png@01D9\">\
+                    <p>third</p><img src=\"cid:logo\">";
+        assert_eq!(ctx(html, "logo.png@01D9", 1).as_deref(), Some("second"));
+        assert_eq!(ctx(html, "logo", 1).as_deref(), Some("third"));
+        assert_eq!(ctx(html, "logo.png@01D9A", 1), None);
+        // Not part of a longer scheme-like word.
+        assert_eq!(ctx("<p>a</p>xcid:z@y", "z@y", 1), None);
+    }
+
+    #[test]
+    fn first_reference_wins() {
+        let html = "<p>one</p><img src=\"cid:x@y\"><p>two</p><img src=\"cid:x@y\">";
+        assert_eq!(ctx(html, "x@y", 5).as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn hebrew_text_survives() {
+        let html = "<div dir=\"rtl\"><p>שלום לכולם,</p><p>הנה&nbsp;התמונה:</p></div><img src=\"cid:img@x\">";
+        assert_eq!(ctx(html, "img@x", 2).as_deref(), Some("שלום לכולם,\nהנה התמונה:"));
+        // An entity right before multi-byte text still decodes.
+        let html = "<p>&amp;שלום&#x5D0;&nbsp;עולם</p><img src=\"cid:img@x\">";
+        assert_eq!(ctx(html, "img@x", 1).as_deref(), Some("&שלוםא עולם"));
     }
 }

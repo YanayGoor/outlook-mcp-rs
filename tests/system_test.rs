@@ -52,7 +52,7 @@ impl Results {
 
 fn eq_default(folder: &str) -> EmailQuery {
     EmailQuery {
-        query: None, folder: folder.to_string(), count: 25, unread_only: false,
+        query: None, folder: folder.to_string(), count: 25, offset: 0, unread_only: false,
         from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }
@@ -401,7 +401,7 @@ fn system_test_plans_1_to_9() {
                     .map(|l| l.iter().any(|e| e.id == id))
                     .unwrap_or(false);
                 r.record("A7", found_in_drafts, format!("draft {id} present in Drafts: {found_in_drafts}"));
-                match c.delete_email(id.to_string()) {
+                match c.delete_email(id.to_string(), false) {
                     Ok(_) => r.record("A7-cleanup", true, "draft deleted"),
                     Err(e) => r.record("A7-cleanup", false, format!("delete_email failed: {e}")),
                 }
@@ -497,7 +497,7 @@ fn system_test_plans_1_to_9() {
         for label in ["A6", "A8"] {
             if let Some(pos) = cleanup_emails.iter().position(|(l, _)| l == label) {
                 let (_, id) = cleanup_emails.remove(pos);
-                match c.delete_email(id) {
+                match c.delete_email(id, false) {
                     Ok(v) => notes.push(format!("{label}: {}", v["status"])),
                     Err(e) => { ok = false; notes.push(format!("{label} FAILED: {e}")); }
                 }
@@ -822,7 +822,7 @@ fn system_test_plans_1_to_9() {
     println!("\n--- Cleanup ---");
     let mut leftovers: Vec<String> = Vec::new();
     for (label, id) in cleanup_emails {
-        match c.delete_email(id.clone()) {
+        match c.delete_email(id.clone(), false) {
             Ok(_) => println!("cleaned up email {label} ({id})"),
             Err(e) => {
                 println!("FAILED to clean up email {label} ({id}): {e}");
