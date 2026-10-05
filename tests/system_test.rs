@@ -52,8 +52,8 @@ impl Results {
 
 fn eq_default(folder: &str) -> EmailQuery {
     EmailQuery {
-        query: None, folder: folder.to_string(), count: 25, unread_only: false,
-        from: None, category: None, received_after: None, received_before: None,
+        query: None, folder: folder.to_string(), count: 25, offset: 0, unread_only: false,
+        from: None, to: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }
 }
@@ -351,8 +351,8 @@ fn system_test_plans_1_to_9() {
     println!("\n--- A4: get_email ---");
     if let Ok(list) = c.list_emails(EmailQuery { count: 1, ..eq_default("inbox") }) {
         if let Some(first) = list.first() {
-            let plain_ok = c.get_email(first.id.clone(), false).is_ok();
-            let html_ok = c.get_email(first.id.clone(), true).is_ok();
+            let plain_ok = c.get_email(first.id.clone(), false, None).is_ok();
+            let html_ok = c.get_email(first.id.clone(), true, None).is_ok();
             r.record("A4", plain_ok && html_ok, format!("prefer_html false/true both ok: {plain_ok}/{html_ok}"));
         } else {
             r.record("A4", false, "no inbox email available to test get_email against");
@@ -378,7 +378,7 @@ fn system_test_plans_1_to_9() {
         Ok(_) => {
             match find_by_subject(&c, "inbox", &a6_subject) {
                 Some(found) => {
-                    let detail_ok = c.get_email(found.id.clone(), false)
+                    let detail_ok = c.get_email(found.id.clone(), false, None)
                         .map(|d| d.body.contains("Self-loop test."))
                         .unwrap_or(false);
                     r.record("A6", detail_ok, format!("landed as {} and body round-trips: {detail_ok}", found.id));
@@ -401,7 +401,7 @@ fn system_test_plans_1_to_9() {
                     .map(|l| l.iter().any(|e| e.id == id))
                     .unwrap_or(false);
                 r.record("A7", found_in_drafts, format!("draft {id} present in Drafts: {found_in_drafts}"));
-                match c.delete_email(id.to_string()) {
+                match c.delete_email(id.to_string(), false) {
                     Ok(_) => r.record("A7-cleanup", true, "draft deleted"),
                     Err(e) => r.record("A7-cleanup", false, format!("delete_email failed: {e}")),
                 }
@@ -448,7 +448,7 @@ fn system_test_plans_1_to_9() {
                 Err(e) => { ok = false; notes.push(format!("{label} FAILED: {e}")); }
             }
         }
-        let has_orange = c.get_email(id.clone(), false)
+        let has_orange = c.get_email(id.clone(), false, None)
             .map(|d| d.summary.categories.iter().any(|cat| cat == "Orange Category"))
             .unwrap_or(false);
         ok &= has_orange;
@@ -497,7 +497,7 @@ fn system_test_plans_1_to_9() {
         for label in ["A6", "A8"] {
             if let Some(pos) = cleanup_emails.iter().position(|(l, _)| l == label) {
                 let (_, id) = cleanup_emails.remove(pos);
-                match c.delete_email(id) {
+                match c.delete_email(id, false) {
                     Ok(v) => notes.push(format!("{label}: {}", v["status"])),
                     Err(e) => { ok = false; notes.push(format!("{label} FAILED: {e}")); }
                 }
@@ -822,7 +822,7 @@ fn system_test_plans_1_to_9() {
     println!("\n--- Cleanup ---");
     let mut leftovers: Vec<String> = Vec::new();
     for (label, id) in cleanup_emails {
-        match c.delete_email(id.clone()) {
+        match c.delete_email(id.clone(), false) {
             Ok(_) => println!("cleaned up email {label} ({id})"),
             Err(e) => {
                 println!("FAILED to clean up email {label} ({id}): {e}");

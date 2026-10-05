@@ -95,10 +95,14 @@ pub const OL_NOTE_COLOR_PINK: i32 = 2;
 pub const OL_NOTE_COLOR_YELLOW: i32 = 3;
 pub const OL_NOTE_COLOR_WHITE: i32 = 4;
 
-// OlAttachmentType (Attachments.Add)
+// OlAttachmentType (Attachment.Type)
 pub const OL_BY_VALUE: i32 = 1;
+pub const OL_BY_REFERENCE: i32 = 4;
+pub const OL_EMBEDDED_ITEM: i32 = 5;
+pub const OL_OLE: i32 = 6;
 
-// MAPI attachment properties (PropertyAccessor schema names)
+// MAPI attachment properties, read via `Attachment.PropertyAccessor.GetProperty`
+// (DASL proptag schema names; 001F = PT_UNICODE, 000B = PT_BOOLEAN).
 pub const PR_ATTACH_CONTENT_ID: &str = "http://schemas.microsoft.com/mapi/proptag/0x3712001F";
 pub const PR_ATTACH_MIME_TAG: &str = "http://schemas.microsoft.com/mapi/proptag/0x370E001F";
 pub const PR_ATTACHMENT_HIDDEN: &str = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B";
@@ -143,6 +147,17 @@ pub fn meeting_response_to_id(name: &str) -> Option<i32> {
     }
 }
 
+/// Friendly word for an `OlAttachmentType`, as returned by the attachment tools.
+pub fn attachment_type_name(att_type: i32) -> &'static str {
+    match att_type {
+        OL_BY_VALUE => "file",
+        OL_BY_REFERENCE => "link",
+        OL_EMBEDDED_ITEM => "item",
+        OL_OLE => "ole",
+        _ => "unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +180,14 @@ mod tests {
         assert_eq!(note_color_to_id("BLUE"), Some(OL_NOTE_COLOR_BLUE));
         assert_eq!(note_color_to_id("Yellow"), Some(OL_NOTE_COLOR_YELLOW));
         assert_eq!(note_color_to_id("purple"), None);
+    }
+
+    #[test]
+    fn attachment_type_names() {
+        assert_eq!(attachment_type_name(OL_BY_VALUE), "file");
+        assert_eq!(attachment_type_name(OL_BY_REFERENCE), "link");
+        assert_eq!(attachment_type_name(OL_EMBEDDED_ITEM), "item");
+        assert_eq!(attachment_type_name(OL_OLE), "ole");
+        assert_eq!(attachment_type_name(7), "unknown");
     }
 }
