@@ -136,8 +136,8 @@ The Outlook tools then appear in that client.
 - `list_folders` — list mail folders (name, path, item counts)
 - `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body; non-ASCII queries such as Hebrew fall back to a client-side scan when Outlook's search finds nothing) and filters (sender via `from`, recipient via `to` — any To/CC name or address, category, date range, attachments, flagged, importance); newest first, `count` up to 200, page with `offset`
 - `get_email` — get the full body and attachment list of one email by id; reports `body_truncated`/`body_length` (and `html_truncated`/`html_length` with `prefer_html`), and `max_body_chars` (default 100,000, up to 5,000,000) fetches a larger body
-- `send_email` — send a new email immediately
-- `create_draft` — create a draft email without sending it
+- `send_email` — send a new email immediately (to/cc/bcc, plain or HTML body, file attachments, inline images)
+- `create_draft` — create a draft email without sending it (same options as `send_email`)
 - `reply_email` — reply to an email, optionally to all recipients, optionally as a draft
 - `update_email` — change an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, set importance
 - `update_draft` — edit an unsent draft's subject, body/HTML body, To/CC/BCC (each replaces that line; `[]` clears it), or append attachments; saves but never sends
@@ -170,6 +170,29 @@ The Outlook tools then appear in that client.
 - `create_note` — create a new Outlook note (optional categories, color)
 - `update_note` — change an existing note: body, add/remove categories, color
 - `delete_note` — delete a note (moves it to Deleted Items)
+
+### Inline images
+
+`send_email` and `create_draft` accept `inline_images` to embed images as
+real Content-ID attachments instead of base64 inside the HTML string. This
+requires `html: true`. Each entry has a `content_id` and exactly one of a
+local `path` or `data_base64` (a `data:image/png;base64,` prefix and
+whitespace are accepted). `filename` and `mime_type` are optional; the MIME
+type is otherwise guessed from the file name or the image bytes. Reference
+each image in the body as `<img src="cid:CONTENT_ID">`:
+
+```json
+{
+  "to": ["ada@example.com"], "subject": "Q3", "html": true,
+  "body": "<p>Results:</p><img src=\"cid:chart\">",
+  "inline_images": [{"content_id": "chart", "path": "C:/reports/q3.png"}]
+}
+```
+
+All entries are validated before anything is created, sent or saved. Base64
+data is written to a temp file for `Attachments.Add` and deleted afterwards.
+Images are marked hidden, but some Outlook versions may still list them as
+regular attachments.
 
 ## How it works
 

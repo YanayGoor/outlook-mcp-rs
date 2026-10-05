@@ -9,7 +9,7 @@
 //! can't be undone — see TESTING.md for how to test those by hand.
 
 use outlook_mcp_rs::outlook::client::WindowsOutlookClient;
-use outlook_mcp_rs::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate};
+use outlook_mcp_rs::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 
 fn client() -> WindowsOutlookClient {
     WindowsOutlookClient::new()
@@ -66,7 +66,7 @@ fn create_draft_then_delete_round_trips() {
         vec!["nobody@example.invalid".to_string()],
         "outlook-mcp-rs live test draft".to_string(),
         "This draft is created and deleted by an automated test.".to_string(),
-        None, None, false, None,
+        None, None, false, None, None,
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().expect("create_draft returns an id").to_string();
     c.delete_email(id, false).expect("cleanup: delete_email should succeed");
@@ -81,7 +81,7 @@ fn permanent_delete_of_draft_skips_deleted_items() {
         vec!["nobody@example.invalid".to_string()],
         subject.to_string(),
         "This draft is created and permanently deleted by an automated test.".to_string(),
-        None, None, false, None,
+        None, None, false, None, None,
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().expect("create_draft returns an id").to_string();
 
@@ -349,7 +349,7 @@ fn list_emails_query_matches_real_body_text() {
         vec!["nobody@example.invalid".to_string()],
         "[outlook-mcp-rs body-search live] draft probe".to_string(),
         format!("this draft's body contains {token} and the subject does not"),
-        None, None, false, None,
+        None, None, false, None, None,
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
@@ -425,11 +425,65 @@ fn create_draft_with_attachment_round_trips() {
         "outlook-mcp-rs attachment test".to_string(),
         "see attached".to_string(),
         None, None, false,
-        Some(vec![path_str]),
+        Some(vec![path_str]), None,
     ).expect("create_draft with attachment should succeed");
     let id = created["id"].as_str().expect("draft id").to_string();
     c.delete_email(id, false).expect("cleanup: delete the draft");
     let _ = std::fs::remove_file(&path);
+}
+
+/// Read a draft's first attachment's MAPI Content-ID / hidden flag straight
+/// from COM (the client API doesn't expose PropertyAccessor reads).
+fn first_attachment_cid_and_hidden(item_id: &str) -> (String, bool) {
+    use outlook_mcp_rs::constants as k;
+    use outlook_mcp_rs::outlook::com::{
+        call_method, create_com_object, get_property, parse_item_id, variant_from_i32,
+        variant_from_str, variant_to_bool, variant_to_string, ComGuard,
+    };
+    use windows::Win32::System::Com::IDispatch;
+    let disp = |v: windows::Win32::System::Variant::VARIANT| IDispatch::try_from(&v).expect("IDispatch");
+    let _guard = ComGuard::new().expect("CoInitialize");
+    let app = create_com_object("Outlook.Application").expect("Outlook.Application");
+    let ns = disp(call_method(&app, "GetNamespace", &mut [variant_from_str("MAPI")]).unwrap());
+    let (entry, store) = parse_item_id(item_id).unwrap();
+    let item = disp(call_method(&ns, "GetItemFromID", &mut [variant_from_str(&entry), variant_from_str(&store)]).unwrap());
+    let atts = disp(get_property(&item, "Attachments").unwrap());
+    let att = disp(call_method(&atts, "Item", &mut [variant_from_i32(1)]).unwrap());
+    let pa = disp(get_property(&att, "PropertyAccessor").unwrap());
+    let cid = variant_to_string(&call_method(&pa, "GetProperty", &mut [variant_from_str(k::PR_ATTACH_CONTENT_ID)]).unwrap());
+    let hidden = call_method(&pa, "GetProperty", &mut [variant_from_str(k::PR_ATTACHMENT_HIDDEN)])
+        .ok()
+        .and_then(|v| variant_to_bool(&v))
+        .unwrap_or(false);
+    (cid, hidden)
+}
+
+#[test]
+#[ignore]
+fn create_draft_with_inline_base64_image_sets_content_id() {
+    // A 1x1 transparent PNG.
+    const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let c = WindowsOutlookClient::new();
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        "outlook-mcp-rs inline image test".to_string(),
+        "<p>Pixel:</p><img src=\"cid:pixel\">".to_string(),
+        None, None, true, None,
+        Some(vec![InlineImage {
+            content_id: "pixel".into(),
+            data_base64: Some(format!("data:image/png;base64,{PNG_1X1_B64}")),
+            ..Default::default()
+        }]),
+    ).expect("create_draft with an inline image should succeed");
+    let id = created["id"].as_str().expect("draft id").to_string();
+    // Read back before asserting so cleanup still runs on a mismatch.
+    let read_back = std::panic::catch_unwind(|| first_attachment_cid_and_hidden(&id));
+    c.delete_email(id, false).expect("cleanup: delete the draft");
+    let (cid, hidden) = read_back.expect("reading the attachment's MAPI properties should succeed");
+    assert_eq!(cid, "pixel");
+    // Not asserted: whether PR_ATTACHMENT_HIDDEN survives Save varies by
+    // Outlook version. Printed for manual verification.
+    eprintln!("inline image attachment hidden flag after Save: {hidden}");
 }
 
 #[test]
@@ -446,7 +500,7 @@ fn list_attachments_reports_metadata_for_a_draft_attachment() {
         "outlook-mcp-rs attachment metadata test".to_string(),
         "see attached".to_string(),
         None, None, false,
-        Some(vec![path_str]),
+        Some(vec![path_str]), None,
     ).expect("create_draft with attachment should succeed");
     let id = created["id"].as_str().expect("draft id").to_string();
 
@@ -567,7 +621,7 @@ fn get_email_reports_truncation_and_honours_max_body_chars() {
         vec!["nobody@example.invalid".to_string()],
         "outlook-mcp-rs truncation live test".to_string(),
         html,
-        None, None, true, None,
+        None, None, true, None, None,
     ).expect("create_draft");
     let id = created["id"].as_str().expect("draft id").to_string();
 
@@ -610,7 +664,7 @@ fn update_email_applies_state_then_moves() {
         vec!["nobody@example.invalid".to_string()],
         "outlook-mcp-rs update_email live test".to_string(),
         "body".to_string(),
-        None, None, false, None,
+        None, None, false, None, None,
     ).expect("create_draft");
     let id = created["id"].as_str().expect("draft id").to_string();
 
@@ -676,7 +730,7 @@ fn update_draft_edits_subject_body_and_recipients() {
         vec!["nobody@example.invalid".to_string()],
         "outlook-mcp-rs update_draft live test".to_string(),
         "original body".to_string(),
-        None, None, false, None,
+        None, None, false, None, None,
     ).expect("create_draft");
     let id = created["id"].as_str().expect("draft id").to_string();
 
@@ -710,7 +764,7 @@ fn send_with_missing_attachment_errors_before_sending() {
         vec!["nobody@example.invalid".to_string()],
         "should not send".to_string(), "body".to_string(),
         None, None, false,
-        Some(vec!["C:/definitely/does/not/exist/nope.pdf".to_string()]),
+        Some(vec!["C:/definitely/does/not/exist/nope.pdf".to_string()]), None,
     ).unwrap_err();
     assert!(err.to_string().contains("attachment not found"));
 }
@@ -1138,7 +1192,7 @@ fn list_emails_to_filter_matches_draft_recipient() {
         vec!["nobody@example.invalid".to_string()],
         "[outlook-mcp-rs to-filter live] draft probe".to_string(),
         "recipient filter probe; never sent".to_string(),
-        None, None, false, None,
+        None, None, false, None, None,
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
@@ -1169,7 +1223,7 @@ fn hebrew_subject_and_body_round_trip_through_com() {
     let body = "סיכום עשייה — שורה ראשונה".to_string();
     let created = c.create_draft(
         vec!["nobody@example.invalid".to_string()],
-        subject.clone(), body.clone(), None, None, false, None,
+        subject.clone(), body.clone(), None, None, false, None, None,
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 

@@ -227,6 +227,7 @@ async fn hebrew_arguments_reach_the_client_unchanged() {
             bcc: None,
             html: false,
             attachments: None,
+            inline_images: None,
         }))
         .await
         .unwrap();
@@ -374,6 +375,7 @@ async fn send_email_passes_recipients_and_html_flag() {
             bcc: None,
             html: false,
             attachments: None,
+            inline_images: None,
         }))
         .await
         .unwrap();
@@ -396,6 +398,7 @@ async fn create_draft_returns_draft_saved_status() {
             bcc: None,
             html: false,
             attachments: None,
+            inline_images: None,
         }))
         .await
         .unwrap();
@@ -482,6 +485,70 @@ async fn update_draft_rejects_an_empty_update() {
     let params: UpdateDraftParams = serde_json::from_value(json!({"draft_id": EMAIL_ID})).unwrap();
     assert!(server.update_draft(Parameters(params)).await.is_err());
     assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn send_email_forwards_inline_images() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: SendEmailParams = serde_json::from_value(json!({
+        "to": ["a@x.com"], "subject": "Hi", "html": true,
+        "body": "<img src=\"cid:logo\">",
+        "inline_images": [
+            {"content_id": "logo", "path": "C:/img/logo.png"},
+            {"content_id": "chart", "data_base64": "aGk=", "filename": "chart.png", "mime_type": "image/png"}
+        ]
+    })).unwrap();
+    server.send_email(Parameters(params)).await.unwrap();
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "send_email");
+    assert_eq!(args["html"], true);
+    let imgs = &args["inline_images"];
+    assert_eq!(imgs[0]["content_id"], "logo");
+    assert_eq!(imgs[0]["path"], "C:/img/logo.png");
+    assert_eq!(imgs[0]["data_base64"], Value::Null);
+    assert_eq!(imgs[1]["content_id"], "chart");
+    assert_eq!(imgs[1]["data_base64"], "aGk=");
+    assert_eq!(imgs[1]["filename"], "chart.png");
+    assert_eq!(imgs[1]["mime_type"], "image/png");
+}
+
+#[tokio::test]
+async fn create_draft_forwards_inline_images_and_defaults_to_none() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: CreateDraftParams = serde_json::from_value(json!({
+        "to": ["a@x.com"], "subject": "Hi", "body": "<img src=\"cid:logo\">", "html": true,
+        "inline_images": [{"content_id": "logo", "data_base64": "aGk="}]
+    })).unwrap();
+    let result = server.create_draft(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["status"], "draft_saved");
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "create_draft");
+    assert_eq!(args["inline_images"][0]["content_id"], "logo");
+    assert_eq!(args["inline_images"][0]["data_base64"], "aGk=");
+
+    // Omitted -> None (recorded as null).
+    let params: CreateDraftParams = serde_json::from_value(json!({
+        "to": ["a@x.com"], "subject": "Hi", "body": "plain"
+    })).unwrap();
+    server.create_draft(Parameters(params)).await.unwrap();
+    assert_eq!(fake.calls()[1].1["inline_images"], Value::Null);
+}
+
+#[test]
+fn inline_images_appear_in_send_and_draft_schemas() {
+    for schema in [schemars::schema_for!(SendEmailParams), schemars::schema_for!(CreateDraftParams)] {
+        let v = serde_json::to_value(&schema).unwrap();
+        let prop = &v["properties"]["inline_images"];
+        assert!(prop.is_object(), "inline_images missing from schema: {v}");
+        assert!(prop["description"].as_str().unwrap_or("").contains("cid:CONTENT_ID"), "{prop}");
+        let def = &v["$defs"]["InlineImage"];
+        for field in ["content_id", "path", "data_base64", "filename", "mime_type"] {
+            assert!(def["properties"][field]["description"].is_string(), "InlineImage.{field} lacks a description: {def}");
+        }
+        assert_eq!(def["required"], json!(["content_id"]));
+    }
 }
 
 #[tokio::test]

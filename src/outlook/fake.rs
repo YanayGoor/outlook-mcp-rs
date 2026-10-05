@@ -7,7 +7,7 @@ use super::types::*;
 use super::{
     require_empty_confirm, validate_recurrence_update, CheckAvailabilityInput, CreateEventInput,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
-    TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate,
+    TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate, InlineImage,
 };
 
 pub const EMAIL_ID: &str = "entry-1|store-1";
@@ -130,17 +130,19 @@ impl OutlookClient for FakeOutlookClient {
 
     fn send_email(&self, to: Vec<String>, subject: String, body: String,
         cc: Option<Vec<String>>, bcc: Option<Vec<String>>, html: bool,
-        attachments: Option<Vec<String>>) -> Result<Value, ToolError> {
+        attachments: Option<Vec<String>>, inline_images: Option<Vec<InlineImage>>)
+        -> Result<Value, ToolError> {
         self.record("send_email",
-            json!({"to": to, "subject": subject, "body": body, "cc": cc, "bcc": bcc, "html": html, "attachments": attachments}))?;
+            json!({"to": to, "subject": subject, "body": body, "cc": cc, "bcc": bcc, "html": html, "attachments": attachments, "inline_images": inline_images}))?;
         Ok(json!({"status": "sent", "to": to.join("; "), "subject": subject}))
     }
 
     fn create_draft(&self, to: Vec<String>, subject: String, body: String,
         cc: Option<Vec<String>>, bcc: Option<Vec<String>>, html: bool,
-        attachments: Option<Vec<String>>) -> Result<Value, ToolError> {
+        attachments: Option<Vec<String>>, inline_images: Option<Vec<InlineImage>>)
+        -> Result<Value, ToolError> {
         self.record("create_draft",
-            json!({"to": to, "subject": subject, "body": body, "cc": cc, "bcc": bcc, "html": html, "attachments": attachments}))?;
+            json!({"to": to, "subject": subject, "body": body, "cc": cc, "bcc": bcc, "html": html, "attachments": attachments, "inline_images": inline_images}))?;
         Ok(json!({"status": "draft_saved", "id": EMAIL_ID, "subject": subject}))
     }
 
@@ -352,11 +354,11 @@ impl OutlookClient for FakeOutlookClient {
     }
 
     fn get_inline_image(&self, email_id: String, content_id: String,
-        context_lines: Option<u32>) -> Result<InlineImage, ToolError> {
+        context_lines: Option<u32>) -> Result<InlineImageData, ToolError> {
         self.record("get_inline_image", json!({
             "email_id": email_id, "content_id": content_id, "context_lines": context_lines,
         }))?;
-        Ok(InlineImage {
+        Ok(InlineImageData {
             content_id: "logo@example".into(), filename: "logo.png".into(),
             mime_type: "image/png".into(), size: 4,
             data_uri: "data:image/png;base64,iVBORw==".into(),

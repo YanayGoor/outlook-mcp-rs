@@ -9,7 +9,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::error::ToolError;
-use crate::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate};
+use crate::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 
 /// Runs a blocking `OutlookClient` call on a dedicated blocking thread so the
 /// tokio scheduler never migrates it mid-call (COM apartment-threading
@@ -99,6 +99,10 @@ pub struct SendEmailParams {
     pub html: bool,
     #[serde(default)]
     pub attachments: Option<Vec<String>>,
+    /// Images to embed as hidden Content-ID attachments (requires html=true).
+    /// Reference each in the HTML body as <img src="cid:CONTENT_ID">.
+    #[serde(default)]
+    pub inline_images: Option<Vec<InlineImage>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -114,6 +118,10 @@ pub struct CreateDraftParams {
     pub html: bool,
     #[serde(default)]
     pub attachments: Option<Vec<String>>,
+    /// Images to embed as hidden Content-ID attachments (requires html=true).
+    /// Reference each in the HTML body as <img src="cid:CONTENT_ID">.
+    #[serde(default)]
+    pub inline_images: Option<Vec<InlineImage>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -555,23 +563,23 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Send a new email immediately.")]
+    #[tool(description = "Send a new email immediately. `attachments` is a list of local file paths. `inline_images` embeds images (a local path or base64 data) as hidden Content-ID attachments and requires html=true: reference each in the HTML body as <img src=\"cid:CONTENT_ID\"> instead of inlining base64 in the HTML. All inline images are validated before anything is sent.")]
     pub async fn send_email(
         &self,
-        Parameters(SendEmailParams { to, subject, body, cc, bcc, html, attachments }): Parameters<SendEmailParams>,
+        Parameters(SendEmailParams { to, subject, body, cc, bcc, html, attachments, inline_images }): Parameters<SendEmailParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.send_email(to, subject, body, cc, bcc, html, attachments)).await?;
+        let result = run_blocking(move || client.send_email(to, subject, body, cc, bcc, html, attachments, inline_images)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Create (but don't send) a draft email.")]
+    #[tool(description = "Create (but don't send) a draft email. `attachments` is a list of local file paths. `inline_images` embeds images (a local path or base64 data) as hidden Content-ID attachments and requires html=true: reference each in the HTML body as <img src=\"cid:CONTENT_ID\"> instead of inlining base64 in the HTML. All inline images are validated before the draft is created.")]
     pub async fn create_draft(
         &self,
-        Parameters(CreateDraftParams { to, subject, body, cc, bcc, html, attachments }): Parameters<CreateDraftParams>,
+        Parameters(CreateDraftParams { to, subject, body, cc, bcc, html, attachments, inline_images }): Parameters<CreateDraftParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.create_draft(to, subject, body, cc, bcc, html, attachments)).await?;
+        let result = run_blocking(move || client.create_draft(to, subject, body, cc, bcc, html, attachments, inline_images)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
