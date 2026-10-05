@@ -15,8 +15,8 @@ use windows::Win32::System::Variant::VARIANT;
 use crate::constants as c;
 use crate::error::ToolError;
 use crate::outlook::com::{
-    call_method, create_com_object, format_com_error, get_item_categories, get_property,
-    has_member, jet_datetime, make_item_id, parse_item_id, put_property, safe_filename,
+    call_method, clean_content_id, create_com_object, format_com_error, get_item_categories,
+    get_mapi_prop, get_property, guess_mime, has_member, is_inline, jet_datetime, make_item_id, normalize_cid_request, parse_item_id, put_property, safe_filename,
     set_item_categories, variant_from_bool, variant_from_datetime, variant_from_i32, variant_from_str,
     variant_to_bool, variant_to_i32, variant_to_iso_string, variant_to_string, ComGuard,
 };
@@ -26,7 +26,7 @@ use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
     CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate,
-    OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate,
+    OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid,
 };
 
 /// Matches `MAX_EMAIL_COUNT` in `client.py`. Larger result sets are paged
@@ -38,6 +38,9 @@ const MAX_EMAIL_COUNT: i32 = 200;
 const MAX_CALENDAR_ITEMS: usize = 250;
 /// Matches `MAX_BODY_CHARS` in `client.py`.
 const MAX_BODY_CHARS: usize = 100_000;
+/// Largest attachment `get_inline_image` returns inline (base64 in the tool
+/// result); anything bigger belongs on disk via `save_attachments`.
+const MAX_INLINE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Lets `?` turn a `windows::core::Error` into a [`ToolError`] anywhere in
 /// this module, so COM-plumbing calls (`call_method`, `get_property`, …) and
@@ -673,6 +676,151 @@ fn compose(
         put_property(&mail, "Body", variant_from_str(body))?;
     }
     Ok(mail)
+}
+
+/// Metadata for one attachment (`index` is COM's 1-based position). Shared by
+/// `list_attachments` and `save_attachments`. `FileName`/`Size` are required;
+/// the MAPI properties are optional (absent -> `None`/`false`). `html_body` is
+/// the owning item's `HTMLBody`, used for `is_inline`.
+fn attachment_info(att: &IDispatch, index: i32, html_body: &str) -> Result<AttachmentInfo, ToolError> {
+    let filename = variant_to_string(&get_property(att, "FileName")?);
+    let size = variant_to_i32(&get_property(att, "Size")?).unwrap_or(0);
+    let att_type = get_property(att, "Type")
+        .ok()
+        .and_then(|v| variant_to_i32(&v))
+        .unwrap_or(c::OL_BY_VALUE);
+    let content_id = get_mapi_prop(att, c::PR_ATTACH_CONTENT_ID).map(|v| variant_to_string(&v));
+    let mime_tag = get_mapi_prop(att, c::PR_ATTACH_MIME_TAG).map(|v| variant_to_string(&v));
+    let hidden = get_mapi_prop(att, c::PR_ATTACHMENT_HIDDEN)
+        .and_then(|v| variant_to_bool(&v))
+        .unwrap_or(false);
+    let content_id = clean_content_id(content_id.as_deref());
+    Ok(AttachmentInfo {
+        index,
+        mime_type: guess_mime(mime_tag.as_deref(), &filename),
+        filename,
+        size,
+        att_type: c::attachment_type_name(att_type).to_string(),
+        is_inline: is_inline(content_id.as_deref(), hidden, html_body),
+        content_id,
+        hidden,
+    })
+}
+
+/// An item's `HTMLBody`, or "" when it has none or it can't be read.
+fn item_html_body(item: &IDispatch) -> String {
+    get_property(item, "HTMLBody")
+        .map(|v| variant_to_string(&v))
+        .unwrap_or_default()
+}
+
+/// Pick the attachment whose Content-ID matches `wanted` (already normalized
+/// by `normalize_cid_request`), case-insensitively. `content_ids[i]` is the
+/// cleaned Content-ID of the i-th attachment (`None` if it has none); returns
+/// that position. Errors list the available Content-IDs, or point to
+/// `list_attachments` when the email has none.
+fn select_by_content_id(wanted: &str, content_ids: &[Option<String>]) -> Result<usize, ToolError> {
+    let wanted_lower = wanted.to_lowercase();
+    if let Some(pos) = content_ids
+        .iter()
+        .position(|cid| cid.as_deref().is_some_and(|c| c.to_lowercase() == wanted_lower))
+    {
+        return Ok(pos);
+    }
+    let available: Vec<&str> = content_ids.iter().flatten().map(String::as_str).collect();
+    if available.is_empty() {
+        Err(ToolError::new(format!(
+            "Content-ID '{wanted}' not found: this email has no attachments with a \
+             Content-ID (use list_attachments to see its attachments)."
+        )))
+    } else {
+        Err(ToolError::new(format!(
+            "Content-ID '{wanted}' not found. Available Content-IDs: {}",
+            available.join(", ")
+        )))
+    }
+}
+
+/// `get_inline_image`'s error for an attachment over `MAX_INLINE_IMAGE_BYTES`.
+fn inline_image_too_big(info: &AttachmentInfo) -> ToolError {
+    let name = if info.filename.is_empty() {
+        info.content_id.as_deref().unwrap_or_default()
+    } else {
+        &info.filename
+    };
+    ToolError::new(format!(
+        "Attachment '{name}' exceeds the {} MB limit for get_inline_image; use \
+         save_attachments to save it to disk instead.",
+        MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+    ))
+}
+
+/// `data:<mime>;base64,<payload>` for `bytes`.
+fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{mime_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+/// A freshly created, uniquely named directory under `std::env::temp_dir()`,
+/// removed (with its contents) when dropped, so every exit path cleans up.
+struct TempDirGuard(std::path::PathBuf);
+
+impl TempDirGuard {
+    fn create() -> Result<Self, ToolError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("outlook-mcp-rs-{}-{nanos}-{n}", std::process::id()));
+        // `create_dir` (not `_all`) fails if the name is somehow taken, so we
+        // never adopt (and later delete) someone else's directory.
+        std::fs::create_dir(&dir).map_err(|e| {
+            ToolError::new(format!("Could not create temp directory {:?}: {e}", dir.display()))
+        })?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read an attachment's bytes: `SaveAsFile` into a private temp dir (always
+/// removed afterwards), then read the file back.
+fn read_attachment_bytes(att: &IDispatch, info: &AttachmentInfo) -> Result<Vec<u8>, ToolError> {
+    let dir = TempDirGuard::create()?;
+    let name = if info.filename.is_empty() {
+        format!("attachment-{}", info.index)
+    } else {
+        info.filename.clone()
+    };
+    let target = dir.path().join(safe_filename(&name));
+    call_method(att, "SaveAsFile", &mut [variant_from_str(&target.to_string_lossy())])?;
+    std::fs::read(&target).map_err(|e| {
+        ToolError::new(format!("Could not read the saved attachment {:?}: {e}", target.display()))
+    })
+}
+
+/// Shallow-merge `extra`'s keys into `base` (both JSON objects; a non-object
+/// `extra` is ignored). Used to append per-call fields to a serialized struct.
+fn merge_json_objects(mut base: Value, extra: Value) -> Value {
+    if let (Value::Object(fields), Value::Object(more)) = (&mut base, extra) {
+        fields.extend(more);
+    }
+    base
 }
 
 /// Attach local files to a mail/reply item. Validates every path exists
@@ -1541,15 +1689,17 @@ impl OutlookClient for WindowsOutlookClient {
                 _ => return Ok(Vec::new()),
             };
             let count = variant_to_i32(&get_property(&attachments, "Count")?).unwrap_or(0);
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            // Read the HTML body once (only when there are attachments) for
+            // `is_inline`; a plain-text item or an unreadable body counts as "".
+            let html_body = item_html_body(&item);
             let mut results = Vec::new();
             for i in 1..=count {
                 // COM collections are 1-based.
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                results.push(AttachmentInfo {
-                    index: i,
-                    filename: variant_to_string(&get_property(&att, "FileName")?),
-                    size: variant_to_i32(&get_property(&att, "Size")?).unwrap_or(0),
-                });
+                results.push(attachment_info(&att, i, &html_body)?);
             }
             Ok(results)
         })
@@ -1585,36 +1735,32 @@ impl OutlookClient for WindowsOutlookClient {
             // `{n.lower() for n in attachment_names}`: case-insensitive set membership.
             let wanted: Option<std::collections::HashSet<String>> = attachment_names
                 .map(|names| names.iter().map(|n| n.to_lowercase()).collect());
+            // Read the HTML body once (only when there are attachments) for
+            // `is_inline`; a plain-text item or an unreadable body counts as "".
+            let html_body = item_html_body(&item);
             let mut results = Vec::new();
             for i in 1..=count {
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                let raw = variant_to_string(&get_property(&att, "FileName")?);
-                let filename = if raw.is_empty() {
-                    format!("attachment-{i}")
-                } else {
-                    raw
-                };
+                let mut info = attachment_info(&att, i, &html_body)?;
+                if info.filename.is_empty() {
+                    info.filename = format!("attachment-{i}");
+                }
                 if let Some(wanted) = &wanted {
-                    if !wanted.contains(&filename.to_lowercase()) {
+                    if !wanted.contains(&info.filename.to_lowercase()) {
                         continue;
                     }
                 }
-                let target = dir.join(safe_filename(&filename));
+                let target = dir.join(safe_filename(&info.filename));
                 let target_str = target.to_string_lossy().into_owned();
+                // Each entry is the attachment's metadata (`index` stays its
+                // original COM position even when filtering) plus the outcome.
                 // A COM failure saving one file is collected per-file and does
                 // NOT abort the batch (mirrors the per-file try/except in Python).
-                match call_method(&att, "SaveAsFile", &mut [variant_from_str(&target_str)]) {
-                    Ok(_) => results.push(json!({
-                        "filename": filename,
-                        "saved_to": target_str,
-                        "status": "saved",
-                    })),
-                    Err(e) => results.push(json!({
-                        "filename": filename,
-                        "status": "failed",
-                        "error": format_com_error(&e),
-                    })),
-                }
+                let outcome = match call_method(&att, "SaveAsFile", &mut [variant_from_str(&target_str)]) {
+                    Ok(_) => json!({"saved_to": target_str, "status": "saved"}),
+                    Err(e) => json!({"status": "failed", "error": format_com_error(&e)}),
+                };
+                results.push(merge_json_objects(json!(info), outcome));
             }
             if results.is_empty() {
                 return Err(ToolError::new(
@@ -1623,6 +1769,61 @@ impl OutlookClient for WindowsOutlookClient {
                 ));
             }
             Ok(results)
+        })
+    }
+
+    fn get_inline_image(&self, email_id: String, content_id: String, context_lines: Option<u32>)
+        -> Result<InlineImage, ToolError> {
+        let wanted = normalize_cid_request(&content_id).ok_or_else(|| {
+            ToolError::new("content_id must be a non-empty Content-ID (e.g. \"image001.png@01D9...\", optionally prefixed with cid:).")
+        })?;
+        self.with_com(|| {
+            let (_app, ns) = mapi()?;
+            let item = get_item(&ns, &email_id)?;
+            // As in list_attachments, an item without an `Attachments`
+            // collection is treated as having none.
+            let mut candidates: Vec<(IDispatch, AttachmentInfo)> = Vec::new();
+            if let Some(Ok(attachments)) = get_property(&item, "Attachments").ok().map(to_disp) {
+                let count = variant_to_i32(&get_property(&attachments, "Count")?).unwrap_or(0);
+                for i in 1..=count {
+                    let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
+                    // `is_inline` isn't part of the result, so skip reading
+                    // HTMLBody just to compute it.
+                    let info = attachment_info(&att, i, "")?;
+                    candidates.push((att, info));
+                }
+            }
+            let content_ids: Vec<Option<String>> =
+                candidates.iter().map(|(_, info)| info.content_id.clone()).collect();
+            let (att, info) = &candidates[select_by_content_id(&wanted, &content_ids)?];
+
+            // `Size` is the MAPI attachment size (a bit above the payload), so
+            // it only pre-screens; the real byte count is checked after reading.
+            if usize::try_from(info.size).unwrap_or(0) > MAX_INLINE_IMAGE_BYTES {
+                return Err(inline_image_too_big(info));
+            }
+            let bytes = read_attachment_bytes(att, info)?;
+            if bytes.len() > MAX_INLINE_IMAGE_BYTES {
+                return Err(inline_image_too_big(info));
+            }
+            let mime_type = info
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            // As in get_email, an item without `HTMLBody` reads as empty, so
+            // the image just counts as unreferenced.
+            let context = context_lines.map(|n| {
+                let html = variant_to_string(&get_property(&item, "HTMLBody").unwrap_or_default());
+                text_before_cid(&html, &wanted, n).unwrap_or_default()
+            });
+            Ok(InlineImage {
+                content_id: info.content_id.clone().unwrap_or_default(),
+                filename: info.filename.clone(),
+                data_uri: data_uri(&mime_type, &bytes),
+                mime_type,
+                size: bytes.len(),
+                context,
+            })
         })
     }
 
@@ -2431,5 +2632,105 @@ mod task_filter_tests {
             ..Default::default()
         };
         assert!(!task_matches("budget numbers", &summary, &query));
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn info() -> AttachmentInfo {
+        AttachmentInfo {
+            index: 3,
+            filename: "logo.png".to_string(),
+            size: 42,
+            att_type: "file".to_string(),
+            content_id: Some("logo@x".to_string()),
+            mime_type: Some("image/png".to_string()),
+            hidden: true,
+            is_inline: true,
+        }
+    }
+
+    #[test]
+    fn attachment_info_serializes_type_key() {
+        let v = json!(info());
+        assert_eq!(v["type"], "file");
+        assert!(v.get("att_type").is_none());
+        assert_eq!(v["content_id"], "logo@x");
+        assert_eq!(v["mime_type"], "image/png");
+        assert_eq!(v["hidden"], true);
+        assert_eq!(v["is_inline"], true);
+    }
+
+    #[test]
+    fn save_entry_is_info_plus_outcome() {
+        let v = merge_json_objects(json!(info()), json!({"saved_to": "C:/x/logo.png", "status": "saved"}));
+        assert_eq!(v["index"], 3);
+        assert_eq!(v["filename"], "logo.png");
+        assert_eq!(v["type"], "file");
+        assert_eq!(v["saved_to"], "C:/x/logo.png");
+        assert_eq!(v["status"], "saved");
+    }
+
+    #[test]
+    fn merge_ignores_non_object_extra() {
+        let v = merge_json_objects(json!({"a": 1}), json!("nope"));
+        assert_eq!(v, json!({"a": 1}));
+    }
+
+    fn cids(ids: &[Option<&str>]) -> Vec<Option<String>> {
+        ids.iter().map(|c| c.map(str::to_string)).collect()
+    }
+
+    #[test]
+    fn select_by_content_id_matches_case_insensitively() {
+        let ids = cids(&[None, Some("logo@01D9"), Some("Image001.PNG@01D9ABCD")]);
+        assert_eq!(select_by_content_id("image001.png@01d9abcd", &ids).unwrap(), 2);
+        assert_eq!(select_by_content_id("LOGO@01d9", &ids).unwrap(), 1);
+    }
+
+    #[test]
+    fn select_by_content_id_lists_available_ids_when_missing() {
+        let ids = cids(&[Some("a@x"), None, Some("b@y")]);
+        let msg = select_by_content_id("missing@z", &ids).unwrap_err().0;
+        assert!(msg.contains("missing@z"), "{msg}");
+        assert!(msg.contains("Available Content-IDs: a@x, b@y"), "{msg}");
+    }
+
+    #[test]
+    fn select_by_content_id_points_to_list_attachments_when_none() {
+        for ids in [cids(&[]), cids(&[None, None])] {
+            let msg = select_by_content_id("x@y", &ids).unwrap_err().0;
+            assert!(msg.contains("no attachments with a Content-ID"), "{msg}");
+            assert!(msg.contains("list_attachments"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn inline_image_too_big_points_to_save_attachments() {
+        let msg = inline_image_too_big(&info()).0;
+        assert!(msg.contains("logo.png"), "{msg}");
+        assert!(msg.contains("10 MB"), "{msg}");
+        assert!(msg.contains("save_attachments"), "{msg}");
+        let unnamed = AttachmentInfo { filename: String::new(), ..info() };
+        assert!(inline_image_too_big(&unnamed).0.contains("logo@x"));
+    }
+
+    #[test]
+    fn data_uri_base64_encodes_with_the_mime_header() {
+        assert_eq!(data_uri("image/png", b"\x89PNG"), "data:image/png;base64,iVBORw==");
+        assert_eq!(data_uri("application/octet-stream", b""), "data:application/octet-stream;base64,");
+    }
+
+    #[test]
+    fn temp_dir_guard_removes_its_directory_on_drop() {
+        let guard = TempDirGuard::create().unwrap();
+        let dir = guard.path().to_path_buf();
+        std::fs::write(dir.join("f.bin"), b"abc").unwrap();
+        let other = TempDirGuard::create().unwrap();
+        assert_ne!(other.path(), dir.as_path());
+        drop(guard);
+        assert!(!dir.exists());
     }
 }

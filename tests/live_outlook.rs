@@ -362,6 +362,107 @@ fn create_draft_with_attachment_round_trips() {
 
 #[test]
 #[ignore]
+fn list_attachments_reports_metadata_for_a_draft_attachment() {
+    let dir = std::env::temp_dir();
+    let path = dir.join("outlook-mcp-rs-live-attach-meta.txt");
+    std::fs::write(&path, b"live attachment metadata test").expect("write temp file");
+    let path_str = path.to_string_lossy().to_string();
+
+    let c = WindowsOutlookClient::new();
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        "outlook-mcp-rs attachment metadata test".to_string(),
+        "see attached".to_string(),
+        None, None, false,
+        Some(vec![path_str]),
+    ).expect("create_draft with attachment should succeed");
+    let id = created["id"].as_str().expect("draft id").to_string();
+
+    // Capture the result before cleanup so a failed assertion doesn't leak the draft.
+    let listed = c.list_attachments(id.clone());
+    c.delete_email(id).expect("cleanup: delete the draft");
+    let _ = std::fs::remove_file(&path);
+
+    let atts = listed.expect("list_attachments should succeed");
+    assert_eq!(atts.len(), 1);
+    let v = serde_json::to_value(&atts[0]).unwrap();
+    assert_eq!(v["index"], 1);
+    assert_eq!(v["filename"], "outlook-mcp-rs-live-attach-meta.txt");
+    assert!(v["size"].as_i64().unwrap() > 0);
+    assert_eq!(v["type"], "file");
+    // A plain file attachment has no Content-ID; its MIME type comes from the
+    // tag or the .txt extension.
+    assert!(v["content_id"].is_null());
+    assert_eq!(v["mime_type"], "text/plain");
+    assert_eq!(v["hidden"], false);
+}
+
+#[test]
+#[ignore]
+fn inline_flag_consistent_on_a_real_inbox_email() {
+    let c = WindowsOutlookClient::new();
+    let list = c.list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
+        from: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list");
+    let Some(email) = list.iter().find(|e| e.has_attachments) else {
+        eprintln!("skipping: none of the newest 25 inbox emails has attachments");
+        return;
+    };
+    let atts = c.list_attachments(email.id.clone()).expect("list_attachments");
+    for att in &atts {
+        let v = serde_json::to_value(att).unwrap();
+        assert!(v["is_inline"].is_boolean(), "is_inline missing: {v}");
+        // Inline content is always cid:-addressable.
+        if att.is_inline {
+            assert!(att.content_id.is_some(), "inline attachment without a content_id: {v}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn get_inline_image_round_trips_a_real_content_id() {
+    // Read-only: looks for an existing inline attachment; never sends mail.
+    use base64::Engine as _;
+    let c = WindowsOutlookClient::new();
+    let emails = c.list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
+        from: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list_emails");
+    let found = emails.iter().find_map(|e| {
+        // Some item types don't support attachments; just skip those.
+        let atts = c.list_attachments(e.id.clone()).ok()?;
+        atts.into_iter()
+            .find(|a| a.content_id.is_some() && a.size <= 10 * 1024 * 1024)
+            .map(|a| (e.id.clone(), a))
+    });
+    let Some((email_id, att)) = found else {
+        eprintln!("skipping: no attachment with a Content-ID in the newest 25 inbox items");
+        return;
+    };
+    let cid = att.content_id.clone().unwrap();
+    let image = c.get_inline_image(email_id.clone(), format!("cid:{cid}"), None).expect("get_inline_image");
+    assert_eq!(image.content_id, cid);
+    let (header, payload) = image.data_uri.split_once(',').expect("data URI has a comma");
+    assert_eq!(header, format!("data:{};base64", image.mime_type));
+    let data = base64::engine::general_purpose::STANDARD.decode(payload).expect("valid base64");
+    assert_eq!(data.len(), image.size);
+    assert!(image.size > 0);
+    assert!(image.context.is_none(), "context only when context_lines is given");
+
+    // Same image with surrounding text requested: `context` is always present
+    // (possibly "" if the HTML body never references this Content-ID).
+    let with_ctx = c.get_inline_image(email_id, cid.clone(), Some(3)).expect("get_inline_image with context");
+    assert_eq!(with_ctx.content_id, cid);
+    let context = with_ctx.context.expect("context requested");
+    assert!(context.lines().count() <= 3, "{context:?}");
+}
+
+#[test]
+#[ignore]
 fn get_email_reports_item_type_for_real_inbox_item() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
