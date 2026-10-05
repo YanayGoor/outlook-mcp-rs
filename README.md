@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **27 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **28 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 27 tools below become available.
+already running, and the 28 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 27 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 28 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
