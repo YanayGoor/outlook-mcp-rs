@@ -14,6 +14,7 @@ Live-test outlook-mcp-rs tools against the real, running Outlook mailbox with re
 - After a plan ships and you want end-to-end confidence beyond unit/fake-client tests.
 - When the user asks to "test everything" / "system test" against their real mailbox.
 - Periodically, as a health check on the live COM surface (Outlook API behavior drifts under real accounts in ways `FakeOutlookClient` can never catch).
+- Before landing a batch of open PRs — see "Testing a batch of PRs" below.
 
 Not for: a single function's regression coverage (add a normal `#[ignore]`d test to `tests/live_outlook.rs` instead).
 
@@ -23,7 +24,7 @@ Not for: a single function's regression coverage (add a normal `#[ignore]`d test
 
 Read `src/server.rs`'s `#[tool_router]` block to enumerate every tool in scope. Decide what's covered (e.g. "email + calendar, Plans 1-9") and what's explicitly out of scope (e.g. tools for a not-yet-shipped plan, or a tool that needs a second mailbox to test safely).
 
-Write a plan doc (`SYSTEM_TEST_PLAN_<date>.md` at the repo root) **before writing any test code**, and get the user's sign-off before executing — they may want different seed data, different categories, a different scope. See `SYSTEM_TEST_PLAN_2026-07-16.md` (git history) as a worked example. The doc must have:
+Write a plan doc (`SYSTEM_TEST_PLAN_<date>.md` at the repo root) **before writing any test code**, and get the user's sign-off before executing (unless they told you to run autonomously — then write the plan anyway, keep to previously-authorized addresses only, and call out every judgement call in the results doc) — they may want different seed data, different categories, a different scope. See `SYSTEM_TEST_PLAN_2026-07-16.md` (git history) as a worked example. The doc must have:
 
 - **Purpose / Mechanism** — state plainly whether this runs through the actual MCP tool layer or calls `WindowsOutlookClient` directly. In practice it's almost always direct: an already-running Claude Code session can't pick up a newly-registered MCP binary without restarting, so route through `src/outlook/client.rs` directly (same code the tool layer calls one layer down — `server.rs`'s tool methods are thin wrappers with no logic of their own).
 - **Accounts used** — the real mailbox address, and any external test-recipient address the user has explicitly authorized for real sends/invites. Never send real mail/invites to an address you weren't explicitly told is safe to use.
@@ -78,6 +79,32 @@ This skill covers testing and root-causing, not hasty inline fixes. Once a real 
 
 Write a results doc (`SYSTEM_TEST_RESULTS_<date>.md`) with: a pass/fail table per test id, a root-caused writeup for every failure (not just "flaky"), confirmed final cleanup state, and any non-code findings worth flagging separately (e.g. a real mail-delivery bounce discovered along the way, unrelated to the tools themselves).
 
+## Testing a batch of PRs
+
+When the ask is "system-test all the open PRs", test the **merged** result once rather than each branch separately — the interesting bugs are the cross-PR ones.
+
+1. **Isolate.** Create a worktree on a throwaway integration branch from the PRs' base (`git worktree add -b systest/all-prs-<date> .worktrees/systest-all-prs origin/main`). Never merge in the user's main checkout — it may hold uncommitted WIP. Fetch PRs by number (`git fetch origin pull/N/head:pr-N`), since fork branches aren't on `origin`.
+2. **Merge stacked PRs in dependency order** (a base PR before the PRs built on it; check with `git merge-base --is-ancestor pr-A pr-B`), then the independent ones. After **each** merge run `cargo build --tests` so a break is attributed to the PR that caused it.
+3. **Expect cross-PR fallout that git won't flag as a conflict**, and record each one as a finding (it must be fixed on one of the PRs before they land in any order):
+   - a new field on a shared struct (`EmailQuery.offset`, `EmailQuery.to`) or a new trait-method argument (`delete_email(.., permanent)`, `get_email(.., max_body_chars)`, `create_draft(.., inline_images)`) breaks every struct literal / call site *another* PR added in `tests/`;
+   - two PRs introducing the **same type name** for different things (2026-10-03: #22's `InlineImage` input vs #24's `InlineImage` result), which surfaces only as confusing type errors once both are in;
+   - the same dependency added twice in `Cargo.toml` (duplicate key);
+   - both PRs editing the same README tool-list line or the "N tools" count, which must become the merged total;
+   - two PRs both rewriting the same hot function (`list_emails`'s filter loop): merge by hand and re-read the result, since a mechanical union can silently drop one PR's behaviour.
+4. Scope the plan doc to the **new and changed behaviour per PR** (one test id prefix per PR, so the results table maps straight back to PRs), plus a short regression smoke of the core tools the PRs touched.
+5. Report per PR: merged cleanly / conflict resolved / needs a change before it can land, with the fix commit on the integration branch. Don't push to anyone's PR branch or comment on GitHub without the user asking.
+6. **Landing** (only when the user asks): land the PRs one at a time, in the same order you merged them. Before each one, merge the *real* current `main` into that PR's branch, resolving to the tree you already verified on the integration branch. Put PR-specific fixes (a bug the test found, a rename that avoids a clash) in their own commits on that PR, not hidden inside a merge commit. Order-independent fixes (e.g. a bug in one PR, a rename) can be pushed before anything is merged; conflict resolutions can't, because they depend on what is already in `main`. Merging to `main` and pushing to a contributor's branch are both outward-facing, so they need explicit authorization each time — if a permission check blocks them, stop and hand the prepared branches to the user rather than routing around it.
+7. Keep the system test in its own PR, opened after (or explicitly dependent on) the feature PRs, since it won't compile on `main` until they land.
+
+## Destructive and content-sensitive tools
+
+- **Permanent delete** (`delete_email(permanent=true)`): only ever on items your test created and tagged. Verify afterwards that the item is in neither its folder nor Deleted Items. Use it in cleanup sweeps for systest items only, so cleanup stops adding to Deleted Items.
+- **`empty_deleted_items(confirm=true)` is never run live** unless the user explicitly says the Deleted Items folder may be emptied — it destroys every item there, including the user's own. Live-test only the `confirm=false` refusal path (and that it leaves the folder count unchanged); leave the rest to the fake-client tests.
+- **Non-ASCII (Hebrew etc.):** round-trip through COM and assert exact string equality, not `contains` on a lossy rendering. For search, seed an item whose Hebrew word appears **only** in the body (not the subject) as well as one with it in the subject, so both the DASL path and the client-side fallback are exercised, plus a Hebrew negative case.
+- **Inline images / attachments:** build test images yourself (a 1×1 PNG in base64 is enough) and attach to **drafts** addressed to `nobody@example.invalid`; you never need to send mail to test attachment metadata, `is_inline`, `get_inline_image`, or `context_lines`. Assert the decoded bytes equal the bytes you put in, not just that a data URI came back.
+
 ## Worked example
+
+The PR-batch run (2026-10-03, PRs #14–#25) is the reference for "Testing a batch of PRs": `docs/superpowers/plans/2026-10-03-systest-all-open-prs.md`, `SYSTEM_TEST_PLAN_2026-10-03-PRS.md`, `tests/system_test_prs.rs`, `SYSTEM_TEST_RESULTS_2026-10-03-PRS.md`.
 
 Plans 1-9's live system test (2026-07-16) is the reference implementation of this whole process: `SYSTEM_TEST_PLAN_2026-07-16.md`, `tests/system_test.rs`, `SYSTEM_TEST_RESULTS_2026-07-16.md`, and the fix commit `05904c5` (with its report at `.superpowers/sdd/systest-findings-fixes-report.md`) — including a real example of the "original hypothesis was wrong, re-investigate" pattern (Finding 3 was first assumed to be transient sync lag; live instrumentation proved it was a structural `Parent.StoreID` gap instead) and the "cleanup fell behind after many runs" gremlin (42 stray inbox items, 304 stray drafts, traced to a capped cleanup query — not a code regression).
