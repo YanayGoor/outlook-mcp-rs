@@ -28,8 +28,18 @@ pub struct EmailDetail {
     pub cc: String,
     pub bcc: String,
     pub body: String,
+    /// True when `body` was cut at the caller's `max_body_chars`.
+    pub body_truncated: bool,
+    /// Full original length of the body, in characters.
+    pub body_length: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_body: Option<String>,
+    /// Set only with `prefer_html`: whether `html_body` was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_truncated: Option<bool>,
+    /// Set only with `prefer_html`: full original HTML length, in characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_length: Option<usize>,
     pub attachments: Vec<String>,
     pub item_type: String,
     pub is_meeting: bool,
@@ -74,6 +84,7 @@ pub struct EventDetail {
     #[serde(flatten)]
     pub summary: EventSummary,
     pub body: String,
+    pub body_truncated: bool,
     pub recurrence: Option<RecurrenceInfo>,
 }
 
@@ -170,6 +181,7 @@ pub struct NoteDetail {
     #[serde(flatten)]
     pub summary: NoteSummary,
     pub body: String,
+    pub body_truncated: bool,
     pub modified: Option<String>,
 }
 
@@ -230,7 +242,8 @@ mod tests {
                 has_attachments: false, categories: vec![],
             },
             cc: "".into(), bcc: "".into(), body: "Hello".into(),
-            html_body: None, attachments: vec![],
+            body_truncated: false, body_length: 5,
+            html_body: None, html_truncated: None, html_length: None, attachments: vec![],
             item_type: "email".into(), is_meeting: false, meeting: None,
         };
         let value = serde_json::to_value(&detail).unwrap();
@@ -241,5 +254,11 @@ mod tests {
         assert_eq!(value["body"], "Hello");
         assert!(value.get("html_body").is_none());
         assert!(value.get("summary").is_none());
+        // Truncation info is always present for the plain body, and the
+        // HTML counterparts are omitted without prefer_html.
+        assert_eq!(value["body_truncated"], false);
+        assert_eq!(value["body_length"], 5);
+        assert!(value.get("html_truncated").is_none());
+        assert!(value.get("html_length").is_none());
     }
 }

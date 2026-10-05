@@ -132,6 +132,7 @@ async fn get_email_returns_body() {
         .get_email(Parameters(GetEmailParams {
             email_id: EMAIL_ID.to_string(),
             prefer_html: false,
+            max_body_chars: None,
         }))
         .await
         .unwrap();
@@ -146,11 +147,69 @@ async fn get_email_includes_item_type() {
         .get_email(Parameters(GetEmailParams {
             email_id: EMAIL_ID.to_string(),
             prefer_html: false,
+            max_body_chars: None,
         }))
         .await
         .unwrap();
     assert_eq!(result_json(&result)["item_type"], "email");
     assert_eq!(result_json(&result)["is_meeting"], false);
+}
+
+#[tokio::test]
+async fn get_email_max_body_chars_defaults_to_none() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: GetEmailParams = serde_json::from_value(json!({"email_id": EMAIL_ID})).unwrap();
+    assert_eq!(params.max_body_chars, None);
+    server.get_email(Parameters(params)).await.unwrap();
+    let (name, args) = &fake.calls()[0];
+    assert_eq!(name, "get_email");
+    assert_eq!(args["max_body_chars"], Value::Null);
+}
+
+#[tokio::test]
+async fn get_email_forwards_max_body_chars() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: GetEmailParams = serde_json::from_value(json!({
+        "email_id": EMAIL_ID, "prefer_html": true, "max_body_chars": 2_000_000
+    }))
+    .unwrap();
+    server.get_email(Parameters(params)).await.unwrap();
+    let (_, args) = &fake.calls()[0];
+    assert_eq!(args["prefer_html"], true);
+    assert_eq!(args["max_body_chars"], 2_000_000);
+}
+
+#[tokio::test]
+async fn get_email_reports_truncation_fields() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // Plain: body flags present, html ones omitted.
+    let params: GetEmailParams = serde_json::from_value(json!({"email_id": EMAIL_ID})).unwrap();
+    let json = result_json(&server.get_email(Parameters(params)).await.unwrap());
+    assert_eq!(json["body_truncated"], false);
+    assert_eq!(json["body_length"], 8);
+    assert!(json.get("html_truncated").is_none());
+    assert!(json.get("html_length").is_none());
+    // prefer_html: html flags present too.
+    let params: GetEmailParams =
+        serde_json::from_value(json!({"email_id": EMAIL_ID, "prefer_html": true})).unwrap();
+    let json = result_json(&server.get_email(Parameters(params)).await.unwrap());
+    assert_eq!(json["html_truncated"], false);
+    assert_eq!(json["html_length"], 15);
+}
+
+#[tokio::test]
+async fn get_event_and_get_note_report_body_truncated() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: GetEventParams = serde_json::from_value(json!({"event_id": "x"})).unwrap();
+    let json = result_json(&server.get_event(Parameters(params)).await.unwrap());
+    assert_eq!(json["body_truncated"], false);
+    let params: GetNoteParams = serde_json::from_value(json!({"note_id": "x"})).unwrap();
+    let json = result_json(&server.get_note(Parameters(params)).await.unwrap());
+    assert_eq!(json["body_truncated"], false);
 }
 
 #[tokio::test]

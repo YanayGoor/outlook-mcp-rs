@@ -135,7 +135,7 @@ The Outlook tools then appear in that client.
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
 - `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body; non-ASCII queries such as Hebrew fall back to a client-side scan when Outlook's search finds nothing) and filters (sender via `from`, recipient via `to` — any To/CC name or address, category, date range, attachments, flagged, importance); newest first, `count` up to 200, page with `offset`
-- `get_email` — get the full body and attachment list of one email by id
+- `get_email` — get the full body and attachment list of one email by id; reports `body_truncated`/`body_length` (and `html_truncated`/`html_length` with `prefer_html`), and `max_body_chars` (default 100,000, up to 5,000,000) fetches a larger body
 - `send_email` — send a new email immediately
 - `create_draft` — create a draft email without sending it
 - `reply_email` — reply to an email, optionally to all recipients, optionally as a draft

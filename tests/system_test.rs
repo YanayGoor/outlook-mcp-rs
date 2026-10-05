@@ -351,8 +351,8 @@ fn system_test_plans_1_to_9() {
     println!("\n--- A4: get_email ---");
     if let Ok(list) = c.list_emails(EmailQuery { count: 1, ..eq_default("inbox") }) {
         if let Some(first) = list.first() {
-            let plain_ok = c.get_email(first.id.clone(), false).is_ok();
-            let html_ok = c.get_email(first.id.clone(), true).is_ok();
+            let plain_ok = c.get_email(first.id.clone(), false, None).is_ok();
+            let html_ok = c.get_email(first.id.clone(), true, None).is_ok();
             r.record("A4", plain_ok && html_ok, format!("prefer_html false/true both ok: {plain_ok}/{html_ok}"));
         } else {
             r.record("A4", false, "no inbox email available to test get_email against");
@@ -378,7 +378,7 @@ fn system_test_plans_1_to_9() {
         Ok(_) => {
             match find_by_subject(&c, "inbox", &a6_subject) {
                 Some(found) => {
-                    let detail_ok = c.get_email(found.id.clone(), false)
+                    let detail_ok = c.get_email(found.id.clone(), false, None)
                         .map(|d| d.body.contains("Self-loop test."))
                         .unwrap_or(false);
                     r.record("A6", detail_ok, format!("landed as {} and body round-trips: {detail_ok}", found.id));
@@ -448,7 +448,7 @@ fn system_test_plans_1_to_9() {
                 Err(e) => { ok = false; notes.push(format!("{label} FAILED: {e}")); }
             }
         }
-        let has_orange = c.get_email(id.clone(), false)
+        let has_orange = c.get_email(id.clone(), false, None)
             .map(|d| d.summary.categories.iter().any(|cat| cat == "Orange Category"))
             .unwrap_or(false);
         ok &= has_orange;

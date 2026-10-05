@@ -89,7 +89,7 @@ fn permanent_delete_of_draft_skips_deleted_items() {
     assert_eq!(result["permanent"], true);
 
     // The old id must no longer resolve...
-    assert!(c.get_email(id, false).is_err(), "deleted draft's id should no longer resolve");
+    assert!(c.get_email(id, false, None).is_err(), "deleted draft's id should no longer resolve");
     // ...and nothing with that subject may be sitting in Deleted Items.
     let leftovers = c.list_emails(EmailQuery {
         query: Some(subject.to_string()), folder: "deleted".into(), count: 50, offset: 0,
@@ -543,7 +543,7 @@ fn get_email_reports_item_type_for_real_inbox_item() {
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list");
     if let Some(first) = list.first() {
-        let detail = c.get_email(first.id.clone(), false).expect("get_email");
+        let detail = c.get_email(first.id.clone(), false, None).expect("get_email");
         let v = serde_json::to_value(&detail).unwrap();
         let t = v["item_type"].as_str().unwrap();
         assert!(["email", "meeting", "bounce", "read_receipt", "other"].contains(&t));
@@ -551,6 +551,53 @@ fn get_email_reports_item_type_for_real_inbox_item() {
         if v["is_meeting"].as_bool().unwrap() {
             assert!(v.get("meeting").is_some());
         }
+    }
+}
+
+#[test]
+#[ignore]
+fn get_email_reports_truncation_and_honours_max_body_chars() {
+    let c = client();
+    // A >100k-char HTML body (well past the 100,000 default cut). A draft is
+    // a safe, disposable target (never sent).
+    let filler = "<p>outlook-mcp-rs truncation live test line.</p>\n".repeat(3_000);
+    let html = format!("<html><body>{filler}</body></html>");
+    assert!(html.chars().count() > 100_000);
+    let created = c.create_draft(
+        vec!["nobody@example.invalid".to_string()],
+        "outlook-mcp-rs truncation live test".to_string(),
+        html,
+        None, None, true, None,
+    ).expect("create_draft");
+    let id = created["id"].as_str().expect("draft id").to_string();
+
+    let result = || {
+        // Default limit: HTML is cut and the flags/lengths say so. Outlook
+        // may normalise the stored HTML, so compare against what it reports.
+        let detail = c.get_email(id.clone(), true, None).expect("get_email default");
+        let html_length = detail.html_length.expect("html_length with prefer_html");
+        assert!(html_length > 100_000, "html_length {html_length}");
+        assert_eq!(detail.html_truncated, Some(true));
+        assert!(detail.html_body.as_deref().unwrap().contains("[... truncated at 100000 characters]"));
+        assert_eq!(detail.body_truncated, detail.body_length > 100_000);
+
+        // Re-fetch with a limit of the reported length: the complete HTML.
+        let limit = html_length.max(detail.body_length) as u32;
+        let full = c.get_email(id.clone(), true, Some(limit)).expect("get_email larger limit");
+        assert_eq!(full.html_truncated, Some(false));
+        assert!(!full.body_truncated);
+        let full_html = full.html_body.expect("html_body");
+        assert_eq!(full_html.chars().count(), html_length);
+        assert!(full_html.contains("</body>"));
+
+        // Without prefer_html the HTML fields are absent.
+        let plain = c.get_email(id.clone(), false, None).expect("get_email plain");
+        assert!(plain.html_truncated.is_none() && plain.html_length.is_none());
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(result));
+    c.delete_email(id, false).expect("cleanup delete");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -590,7 +637,7 @@ fn update_email_applies_state_then_moves() {
     assert!(changed.iter().any(|v| v == "add_categories"));
 
     // Verify importance + category landed.
-    let detail = c.get_email(id.clone(), false).expect("get_email");
+    let detail = c.get_email(id.clone(), false, None).expect("get_email");
     let dv = serde_json::to_value(&detail).unwrap();
     assert_eq!(dv["summary"]["importance"], "high");
     assert!(dv["summary"]["categories"].as_array().unwrap().iter().any(|v| v == "Work"));
@@ -605,7 +652,7 @@ fn update_email_applies_state_then_moves() {
         ..Default::default()
     }).expect("update_email mark unread");
     assert_eq!(unread["changed"], serde_json::json!(["mark_read"]));
-    let redetail = c.get_email(id.clone(), false).expect("get_email after unread");
+    let redetail = c.get_email(id.clone(), false, None).expect("get_email after unread");
     let rv = serde_json::to_value(&redetail).unwrap();
     assert_eq!(rv["summary"]["unread"], true);
 
@@ -641,7 +688,7 @@ fn update_draft_edits_subject_body_and_recipients() {
         ..Default::default()
     });
     // Read back before asserting so a failure still cleans up.
-    let detail = c.get_email(id.clone(), false);
+    let detail = c.get_email(id.clone(), false, None);
     c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
 
     let res = res.expect("update_draft");
