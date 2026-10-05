@@ -3,7 +3,7 @@ use std::sync::Arc;
 use outlook_mcp_rs::outlook::fake::{FakeOutlookClient, EMAIL_ID};
 use outlook_mcp_rs::server::{
     CheckAvailabilityParams, CreateDraftParams, CreateEventParams, CreateNoteParams, CreateTaskParams,
-    DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams, GetEventParams, GetNoteParams, ListAttachmentsParams,
+    DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams, GetEventParams, GetInlineImageParams, GetNoteParams, ListAttachmentsParams,
     ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
     SendEmailParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
@@ -679,6 +679,55 @@ async fn save_attachments_passes_dir_and_names() {
     for key in ["index", "size", "type", "content_id", "mime_type", "hidden", "is_inline"] {
         assert!(v[0].get(key).is_some(), "missing {key}");
     }
+}
+
+#[tokio::test]
+async fn get_inline_image_forwards_args_and_returns_data_uri() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let result = server
+        .get_inline_image(Parameters(GetInlineImageParams {
+            email_id: EMAIL_ID.to_string(),
+            content_id: "cid:logo@example".to_string(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls(),
+        vec![(
+            "get_inline_image".to_string(),
+            json!({"email_id": EMAIL_ID, "content_id": "cid:logo@example"})
+        )]
+    );
+    let v = result_json(&result);
+    assert_eq!(v["content_id"], "logo@example");
+    assert_eq!(v["filename"], "logo.png");
+    assert_eq!(v["mime_type"], "image/png");
+    assert_eq!(v["size"], 4);
+    assert_eq!(v["data_uri"], "data:image/png;base64,iVBORw==");
+}
+
+#[test]
+fn get_inline_image_params_require_content_id() {
+    let missing = serde_json::from_value::<GetInlineImageParams>(json!({"email_id": EMAIL_ID}));
+    assert!(missing.is_err());
+    let missing = serde_json::from_value::<GetInlineImageParams>(json!({"content_id": "a@b"}));
+    assert!(missing.is_err());
+}
+
+#[tokio::test]
+async fn get_inline_image_surfaces_client_errors() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_fail_with("Content-ID 'x@y' not found.");
+    let server = OutlookMcpServer::new(fake.clone());
+    let err = server
+        .get_inline_image(Parameters(GetInlineImageParams {
+            email_id: EMAIL_ID.to_string(),
+            content_id: "x@y".to_string(),
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("Content-ID 'x@y' not found."));
 }
 
 // ---- Tasks ----

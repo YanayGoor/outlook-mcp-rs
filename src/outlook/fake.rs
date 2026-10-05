@@ -292,6 +292,16 @@ impl OutlookClient for FakeOutlookClient {
         })])
     }
 
+    fn get_inline_image(&self, email_id: String, content_id: String)
+        -> Result<InlineImage, ToolError> {
+        self.record("get_inline_image", json!({"email_id": email_id, "content_id": content_id}))?;
+        Ok(InlineImage {
+            content_id: "logo@example".into(), filename: "logo.png".into(),
+            mime_type: "image/png".into(), size: 4,
+            data_uri: "data:image/png;base64,iVBORw==".into(),
+        })
+    }
+
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError> {
         self.record("list_tasks", json!({
             "include_completed": q.include_completed, "category": q.category,

@@ -402,6 +402,38 @@ fn inline_flag_consistent_on_a_real_inbox_email() {
 
 #[test]
 #[ignore]
+fn get_inline_image_round_trips_a_real_content_id() {
+    // Read-only: looks for an existing inline attachment; never sends mail.
+    use base64::Engine as _;
+    let c = WindowsOutlookClient::new();
+    let emails = c.list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count: 25, unread_only: false,
+        from: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list_emails");
+    let found = emails.iter().find_map(|e| {
+        // Some item types don't support attachments; just skip those.
+        let atts = c.list_attachments(e.id.clone()).ok()?;
+        atts.into_iter()
+            .find(|a| a.content_id.is_some() && a.size <= 10 * 1024 * 1024)
+            .map(|a| (e.id.clone(), a))
+    });
+    let Some((email_id, att)) = found else {
+        eprintln!("skipping: no attachment with a Content-ID in the newest 25 inbox items");
+        return;
+    };
+    let cid = att.content_id.clone().unwrap();
+    let image = c.get_inline_image(email_id, format!("cid:{cid}")).expect("get_inline_image");
+    assert_eq!(image.content_id, cid);
+    let (header, payload) = image.data_uri.split_once(',').expect("data URI has a comma");
+    assert_eq!(header, format!("data:{};base64", image.mime_type));
+    let data = base64::engine::general_purpose::STANDARD.decode(payload).expect("valid base64");
+    assert_eq!(data.len(), image.size);
+    assert!(image.size > 0);
+}
+
+#[test]
+#[ignore]
 fn get_email_reports_item_type_for_real_inbox_item() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {

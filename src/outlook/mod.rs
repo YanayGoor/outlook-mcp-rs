@@ -221,6 +221,8 @@ pub trait OutlookClient: Send + Sync {
         -> Result<Vec<AttachmentInfo>, ToolError>;
     fn save_attachments(&self, email_id: String, save_dir: String,
         attachment_names: Option<Vec<String>>) -> Result<Vec<Value>, ToolError>;
+    fn get_inline_image(&self, email_id: String, content_id: String)
+        -> Result<InlineImage, ToolError>;
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError>;
     fn create_task(&self, subject: String, body: Option<String>,

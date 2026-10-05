@@ -196,6 +196,21 @@ pub struct AttachmentInfo {
     pub is_inline: bool,
 }
 
+/// An attachment fetched by Content-ID (`get_inline_image`), inlined as a
+/// base64 `data:` URI.
+#[derive(Debug, Clone, Serialize)]
+pub struct InlineImage {
+    /// The attachment's Content-ID without `<>` (as `list_attachments` shows it).
+    pub content_id: String,
+    pub filename: String,
+    /// From the attachment's metadata, else `application/octet-stream`.
+    pub mime_type: String,
+    /// Actual byte length of the decoded payload.
+    pub size: usize,
+    /// `data:<mime_type>;base64,<payload>`.
+    pub data_uri: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
