@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **27 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **28 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 27 tools below become available.
+already running, and the 28 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 27 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 28 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
@@ -134,14 +134,15 @@ The Outlook tools then appear in that client.
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
-- `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body) and filters (sender, category, date range, attachments, flagged, importance)
+- `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body; non-ASCII queries such as Hebrew fall back to a client-side scan when Outlook's search finds nothing) and filters (sender via `from`, recipient via `to` — any To/CC name or address, category, date range, attachments, flagged, importance); newest first, `count` up to 200, page with `offset`
 - `get_email` — get the full body and attachment list of one email by id
 - `send_email` — send a new email immediately
 - `create_draft` — create a draft email without sending it
 - `reply_email` — reply to an email, optionally to all recipients, optionally as a draft
 - `update_email` — change an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, set importance
 - `update_draft` — edit an unsent draft's subject, body/HTML body, To/CC/BCC (each replaces that line; `[]` clears it), or append attachments; saves but never sends
-- `delete_email` — delete an email (moves it to Deleted Items)
+- `delete_email` — delete an email (moves it to Deleted Items), or hard-delete it with `permanent=true` (like shift+delete; **irreversible**, not recoverable from Deleted Items)
+- `empty_deleted_items` — **permanently** delete everything in Deleted Items (items and subfolders); **irreversible**, refuses unless `confirm=true`. On Exchange/Microsoft 365, retention policy may still keep items in Recoverable Items
 
 **Calendar**
 - `list_events` — list/search calendar events by date range, text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`
@@ -153,8 +154,9 @@ The Outlook tools then appear in that client.
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**
-- `list_attachments` — list an email's attachments (filename and size)
-- `save_attachments` — save an email's attachments to a local directory
+- `list_attachments` — list an email's attachments with metadata: index, filename, size, type (file/link/item/ole), Content-ID (for `cid:` references in HTML bodies), MIME type, hidden flag, and `is_inline` (inline `cid:` content vs. a standalone attachment)
+- `save_attachments` — save an email's attachments to a local directory (each result carries the same metadata plus `saved_to`/`status`)
+- `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB); optional `context_lines` (max 50) also returns `context`, the plain-text lines just before the image's first `cid:` reference in the HTML body (`""` if it isn't referenced)
 
 **Tasks**
 - `list_tasks` — list Outlook tasks (filter by category, importance, or a text query matching subject or body)
