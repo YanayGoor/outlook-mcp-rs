@@ -87,12 +87,14 @@ These conflicts are invisible to git, so each PR passes CI on its own but they b
 
 ## Landing status
 
-Nothing has been merged to `main` and nothing has been pushed to the PR branches yet: the permission check blocked both. These changes are needed when the PRs land:
+All 12 PRs were merged on 2026-10-06, in the order above. Each PR was merged as soon as it had been brought up to date with `main`:
 
-- **#16:** add the permanent-delete fix commit. It is prepared locally as branch `upd-16` in `.worktrees/landing`. Offline tests and #16's live test pass on it.
-- **#24:** rename the result type to `InlineImageData`. Prepared locally as an uncommitted change on `upd-24`. #25 then needs #24's update merged in, plus the same rename.
-- Everything else is the conflict resolution listed above, done as a "merge main into the PR" commit just before each PR lands.
-- Tool count in the README: 27 after #24, 28 after #16, 29 after #19.
+- **"Merge main into …" commit.** #24, #14, #15, #16, #17, #19, #20, #21 and #22 each got one on their branch, resolved to the tree verified here. #18, #23 and #25 merged cleanly as they were.
+- **#16:** two separate commits: the permanent-delete fix, and the README tool count (28).
+- **#19:** a separate commit for the README tool count (29).
+- **#22:** the `InlineImageData` rename and the `base64` dedupe are in its merge-main commit, because that is where the clash appears.
+- **Checks on every step.** Before each merge, CI's test command (`cargo test --all -- --skip live_outlook`) passed locally. After each merge, `main` was compared with the tested integration tree: it was identical except for the #16 fix and the comment rewrap, which were carried forward on purpose.
+- **Final result.** `main` after #22 equals the integration branch that passed 43/43, minus the files this PR adds.
 
 ## Other observations (not failures)
 
