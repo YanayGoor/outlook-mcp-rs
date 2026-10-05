@@ -15,28 +15,50 @@ use windows::Win32::System::Variant::VARIANT;
 use crate::constants as c;
 use crate::error::ToolError;
 use crate::outlook::com::{
-    call_method, create_com_object, format_com_error, get_item_categories, get_property,
-    has_member, jet_datetime, make_item_id, parse_item_id, put_property, safe_filename,
+    call_method, clean_content_id, create_com_object, format_com_error, get_item_categories,
+    get_mapi_prop, get_property, guess_mime, has_member, is_inline, jet_datetime, make_item_id, normalize_cid_request, parse_item_id, put_property, safe_filename,
     set_item_categories, variant_from_bool, variant_from_datetime, variant_from_i32, variant_from_str,
     variant_to_bool, variant_to_i32, variant_to_iso_string, variant_to_string, ComGuard,
 };
 use crate::outlook::types::*;
 use chrono::Datelike;
+use unicode_normalization::UnicodeNormalization;
 use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
-    parse_freebusy_slots, validate_recurrence, validate_recurrence_update, CheckAvailabilityInput,
-    CreateEventInput, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate,
-    OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate,
+    parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
+    CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
+    EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
+    RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
+    validate_draft_update, DraftUpdate,
 };
 
-/// Matches `MAX_EMAIL_COUNT` in `client.py`.
-const MAX_EMAIL_COUNT: i32 = 50;
+/// Matches `MAX_EMAIL_COUNT` in `client.py`. Larger result sets are paged
+/// with `EmailQuery::offset`.
+const MAX_EMAIL_COUNT: i32 = 200;
+/// How many items (newest first, after every other filter) `list_emails`
+/// will open one by one when the `to` filter falls back to scanning each
+/// item's `Recipients` collection. Bounds the cost of a per-item COM walk.
+const RECIPIENT_SCAN_LIMIT: i32 = 2000;
+/// MAPI `PR_SMTP_ADDRESS` (Unicode), read through `Recipient.PropertyAccessor`.
+const PR_SMTP_ADDRESS: &str = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F";
 /// Matches `MAX_CALENDAR_ITEMS` in `client.py`. Caps `list_events` because a
 /// recurring appointment without an end date expands forever under
 /// `IncludeRecurrences`.
 const MAX_CALENDAR_ITEMS: usize = 250;
-/// Matches `MAX_BODY_CHARS` in `client.py`.
+/// Matches `MAX_BODY_CHARS` in `client.py`. The default body cut, and the
+/// fixed cut for `get_event`/`get_note`.
 const MAX_BODY_CHARS: usize = 100_000;
+/// Largest attachment `get_inline_image` returns inline (base64 in the tool
+/// result); anything bigger belongs on disk via `save_attachments`.
+const MAX_INLINE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Upper bound on items scanned client-side when the DASL text search for a
+/// non-ASCII query comes back empty (see `list_emails`).
+const MAX_SCAN_ITEMS: i32 = 2000;
+/// Bounds for `get_email`'s caller-chosen `max_body_chars` (large HTML mail
+/// with inline images can run to megabytes). Match `MIN_BODY_CHARS_LIMIT` /
+/// `MAX_BODY_CHARS_LIMIT` in `client.py`.
+const MIN_BODY_CHARS_LIMIT: usize = 1_000;
+const MAX_BODY_CHARS_LIMIT: usize = 5_000_000;
 
 /// Lets `?` turn a `windows::core::Error` into a [`ToolError`] anywhere in
 /// this module, so COM-plumbing calls (`call_method`, `get_property`, …) and
@@ -116,6 +138,25 @@ fn get_item(ns: &IDispatch, item_id: &str) -> Result<IDispatch, ToolError> {
     to_disp(item)
 }
 
+/// The Deleted Items folder of the item's own store, so a hard delete of an
+/// item in a secondary mailbox/PST stays in that store. Falls back to the
+/// default store's Deleted Items when the store can't be resolved.
+fn deleted_items_for(ns: &IDispatch, item: &IDispatch) -> Result<IDispatch, ToolError> {
+    let own = || -> Result<IDispatch, ToolError> {
+        let parent = to_disp(get_property(item, "Parent")?)?;
+        let store = to_disp(get_property(&parent, "Store")?)?;
+        to_disp(call_method(
+            &store, "GetDefaultFolder", &mut [variant_from_i32(c::OL_FOLDER_DELETED_ITEMS)],
+        )?)
+    };
+    match own() {
+        Ok(folder) => Ok(folder),
+        Err(_) => to_disp(call_method(
+            ns, "GetDefaultFolder", &mut [variant_from_i32(c::OL_FOLDER_DELETED_ITEMS)],
+        )?),
+    }
+}
+
 /// `client.py::_resolve_folder`: a well-known folder name maps to a default
 /// folder id; otherwise walk a `Inbox/Sub/Sub` path from the store root.
 fn resolve_folder(ns: &IDispatch, folder: Option<&str>) -> Result<IDispatch, ToolError> {
@@ -177,15 +218,53 @@ fn resolve_save_dir(save_dir: &str) -> std::path::PathBuf {
     std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
-/// `client.py::_truncate`: cap long bodies at `MAX_BODY_CHARS` *characters*
-/// (not bytes) so multi-byte UTF-8 content is never split mid-codepoint.
-fn truncate(text: &str) -> String {
-    if text.chars().count() > MAX_BODY_CHARS {
-        let head: String = text.chars().take(MAX_BODY_CHARS).collect();
-        format!("{head}\n\n[... truncated at {MAX_BODY_CHARS} characters]")
+/// `client.py::_truncate`: cap long bodies at `limit` *characters* (not
+/// bytes) so multi-byte UTF-8 content is never split mid-codepoint. The cut
+/// is a hard one and may land mid-tag or mid-base64 in HTML; the returned
+/// flag says whether it happened so callers can re-request with a larger
+/// limit. Returns `(text, truncated)`.
+fn truncate(text: &str, limit: usize) -> (String, bool) {
+    if text.chars().count() > limit {
+        let head: String = text.chars().take(limit).collect();
+        (format!("{head}\n\n[... truncated at {limit} characters]"), true)
     } else {
-        text.to_string()
+        (text.to_string(), false)
     }
+}
+
+/// `client.py::_clamp_body_limit`: `None` means `MAX_BODY_CHARS`; any other
+/// value is clamped into `[MIN_BODY_CHARS_LIMIT, MAX_BODY_CHARS_LIMIT]`.
+fn clamp_body_limit(max_body_chars: Option<u32>) -> usize {
+    match max_body_chars {
+        None => MAX_BODY_CHARS,
+        Some(n) => (n as usize).clamp(MIN_BODY_CHARS_LIMIT, MAX_BODY_CHARS_LIMIT),
+    }
+}
+
+/// Normalize text for caseless matching: NFC (so composed and decomposed
+/// forms of the same character compare equal), then lowercase.
+fn fold_text(text: &str) -> String {
+    text.nfc().collect::<String>().to_lowercase()
+}
+
+/// True if `query` occurs (caseless, NFC-normalized) in any of `fields`.
+/// Empty fields are skipped.
+fn text_matches(query: &str, fields: &[&str]) -> bool {
+    let needle = fold_text(query);
+    fields.iter().filter(|f| !f.is_empty()).any(|f| fold_text(f).contains(&needle))
+}
+
+/// Client-side text match for the `list_emails` non-ASCII fallback: subject
+/// and sender name first, then the body only if those miss (Body is the
+/// expensive property to fetch).
+fn email_text_matches(item: &IDispatch, query: &str) -> bool {
+    let subject = variant_to_string(&get_property(item, "Subject").unwrap_or_default());
+    let sender = variant_to_string(&get_property(item, "SenderName").unwrap_or_default());
+    if text_matches(query, &[&subject, &sender]) {
+        return true;
+    }
+    let body = variant_to_string(&get_property(item, "Body").unwrap_or_default());
+    text_matches(query, &[&body])
 }
 
 /// `client.py::_parse_dt`: parse a user-supplied ISO date/datetime. Mirrors
@@ -398,6 +477,54 @@ fn recurrence_info(item: &IDispatch) -> Result<Option<RecurrenceInfo>, ToolError
         occurrences,
         no_end,
     }))
+}
+
+/// True if `needle` is a case-insensitive substring of any of `candidates`
+/// (a recipient's display name, address, SMTP address, …). Callers skip
+/// the filter entirely for an empty needle.
+fn recipient_matches(needle: &str, candidates: &[String]) -> bool {
+    let needle = needle.to_lowercase();
+    candidates.iter().any(|c| c.to_lowercase().contains(&needle))
+}
+
+/// Every name/address string for the To (Type 1) and CC (Type 2) recipients
+/// of `item`: `Recipient.Name`, `Recipient.Address`, and the SMTP address
+/// from `PropertyAccessor` (for an Exchange recipient `Address` is the X.500
+/// legacy DN, so the SMTP form is only available through PR_SMTP_ADDRESS).
+/// Best-effort: an item without `Recipients` (e.g. some report items) or a
+/// recipient whose properties can't be read just contributes fewer strings.
+fn recipient_strings(item: &IDispatch) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(recipients) = get_property(item, "Recipients").ok().and_then(|v| to_disp(v).ok()) else {
+        return out;
+    };
+    let n = variant_to_i32(&get_property(&recipients, "Count").unwrap_or_default()).unwrap_or(0);
+    for i in 1..=n {
+        let Some(r) = call_method(&recipients, "Item", &mut [variant_from_i32(i)])
+            .ok()
+            .and_then(|v| to_disp(v).ok())
+        else {
+            continue;
+        };
+        let kind = variant_to_i32(&get_property(&r, "Type").unwrap_or_default()).unwrap_or(0);
+        if kind != 1 && kind != 2 {
+            continue; // BCC (3) and originator (0) aren't in displayto/displaycc either.
+        }
+        for prop in ["Name", "Address"] {
+            out.push(variant_to_string(&get_property(&r, prop).unwrap_or_default()));
+        }
+        let smtp = get_property(&r, "PropertyAccessor")
+            .ok()
+            .and_then(|v| to_disp(v).ok())
+            .and_then(|pa| {
+                call_method(&pa, "GetProperty", &mut [variant_from_str(PR_SMTP_ADDRESS)]).ok()
+            });
+        if let Some(v) = smtp {
+            out.push(variant_to_string(&v));
+        }
+    }
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 /// True if `summary` passes every filter set on `q`. All comparisons are
@@ -674,6 +801,151 @@ fn compose(
     Ok(mail)
 }
 
+/// Metadata for one attachment (`index` is COM's 1-based position). Shared by
+/// `list_attachments` and `save_attachments`. `FileName`/`Size` are required;
+/// the MAPI properties are optional (absent -> `None`/`false`). `html_body` is
+/// the owning item's `HTMLBody`, used for `is_inline`.
+fn attachment_info(att: &IDispatch, index: i32, html_body: &str) -> Result<AttachmentInfo, ToolError> {
+    let filename = variant_to_string(&get_property(att, "FileName")?);
+    let size = variant_to_i32(&get_property(att, "Size")?).unwrap_or(0);
+    let att_type = get_property(att, "Type")
+        .ok()
+        .and_then(|v| variant_to_i32(&v))
+        .unwrap_or(c::OL_BY_VALUE);
+    let content_id = get_mapi_prop(att, c::PR_ATTACH_CONTENT_ID).map(|v| variant_to_string(&v));
+    let mime_tag = get_mapi_prop(att, c::PR_ATTACH_MIME_TAG).map(|v| variant_to_string(&v));
+    let hidden = get_mapi_prop(att, c::PR_ATTACHMENT_HIDDEN)
+        .and_then(|v| variant_to_bool(&v))
+        .unwrap_or(false);
+    let content_id = clean_content_id(content_id.as_deref());
+    Ok(AttachmentInfo {
+        index,
+        mime_type: guess_mime(mime_tag.as_deref(), &filename),
+        filename,
+        size,
+        att_type: c::attachment_type_name(att_type).to_string(),
+        is_inline: is_inline(content_id.as_deref(), hidden, html_body),
+        content_id,
+        hidden,
+    })
+}
+
+/// An item's `HTMLBody`, or "" when it has none or it can't be read.
+fn item_html_body(item: &IDispatch) -> String {
+    get_property(item, "HTMLBody")
+        .map(|v| variant_to_string(&v))
+        .unwrap_or_default()
+}
+
+/// Pick the attachment whose Content-ID matches `wanted` (already normalized
+/// by `normalize_cid_request`), case-insensitively. `content_ids[i]` is the
+/// cleaned Content-ID of the i-th attachment (`None` if it has none); returns
+/// that position. Errors list the available Content-IDs, or point to
+/// `list_attachments` when the email has none.
+fn select_by_content_id(wanted: &str, content_ids: &[Option<String>]) -> Result<usize, ToolError> {
+    let wanted_lower = wanted.to_lowercase();
+    if let Some(pos) = content_ids
+        .iter()
+        .position(|cid| cid.as_deref().is_some_and(|c| c.to_lowercase() == wanted_lower))
+    {
+        return Ok(pos);
+    }
+    let available: Vec<&str> = content_ids.iter().flatten().map(String::as_str).collect();
+    if available.is_empty() {
+        Err(ToolError::new(format!(
+            "Content-ID '{wanted}' not found: this email has no attachments with a \
+             Content-ID (use list_attachments to see its attachments)."
+        )))
+    } else {
+        Err(ToolError::new(format!(
+            "Content-ID '{wanted}' not found. Available Content-IDs: {}",
+            available.join(", ")
+        )))
+    }
+}
+
+/// `get_inline_image`'s error for an attachment over `MAX_INLINE_IMAGE_BYTES`.
+fn inline_image_too_big(info: &AttachmentInfo) -> ToolError {
+    let name = if info.filename.is_empty() {
+        info.content_id.as_deref().unwrap_or_default()
+    } else {
+        &info.filename
+    };
+    ToolError::new(format!(
+        "Attachment '{name}' exceeds the {} MB limit for get_inline_image; use \
+         save_attachments to save it to disk instead.",
+        MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+    ))
+}
+
+/// `data:<mime>;base64,<payload>` for `bytes`.
+fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{mime_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+/// A freshly created, uniquely named directory under `std::env::temp_dir()`,
+/// removed (with its contents) when dropped, so every exit path cleans up.
+struct TempDirGuard(std::path::PathBuf);
+
+impl TempDirGuard {
+    fn create() -> Result<Self, ToolError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("outlook-mcp-rs-{}-{nanos}-{n}", std::process::id()));
+        // `create_dir` (not `_all`) fails if the name is somehow taken, so we
+        // never adopt (and later delete) someone else's directory.
+        std::fs::create_dir(&dir).map_err(|e| {
+            ToolError::new(format!("Could not create temp directory {:?}: {e}", dir.display()))
+        })?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read an attachment's bytes: `SaveAsFile` into a private temp dir (always
+/// removed afterwards), then read the file back.
+fn read_attachment_bytes(att: &IDispatch, info: &AttachmentInfo) -> Result<Vec<u8>, ToolError> {
+    let dir = TempDirGuard::create()?;
+    let name = if info.filename.is_empty() {
+        format!("attachment-{}", info.index)
+    } else {
+        info.filename.clone()
+    };
+    let target = dir.path().join(safe_filename(&name));
+    call_method(att, "SaveAsFile", &mut [variant_from_str(&target.to_string_lossy())])?;
+    std::fs::read(&target).map_err(|e| {
+        ToolError::new(format!("Could not read the saved attachment {:?}: {e}", target.display()))
+    })
+}
+
+/// Shallow-merge `extra`'s keys into `base` (both JSON objects; a non-object
+/// `extra` is ignored). Used to append per-call fields to a serialized struct.
+fn merge_json_objects(mut base: Value, extra: Value) -> Value {
+    if let (Value::Object(fields), Value::Object(more)) = (&mut base, extra) {
+        fields.extend(more);
+    }
+    base
+}
+
 /// Attach local files to a mail/reply item. Validates every path exists
 /// FIRST (so a bad path fails before anything is sent), then adds each via
 /// `MailItem.Attachments.Add(path)`.
@@ -760,16 +1032,6 @@ impl OutlookClient for WindowsOutlookClient {
             let folder_obj = resolve_folder(&ns, Some(&q.folder))?;
             let mut items = to_disp(get_property(&folder_obj, "Items")?)?;
 
-            // Text query: DASL @SQL across subject/sender/body (escaped).
-            if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
-                let e = query.replace('\'', "''");
-                let dasl = format!(
-                    "@SQL=(\"urn:schemas:httpmail:subject\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:fromname\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:textdescription\" LIKE '%{e}%')"
-                );
-                items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
-            }
             // Sender: DASL @SQL against fromname + fromemail.
             if let Some(from) = q.from.as_deref().filter(|s| !s.is_empty()) {
                 let e = from.replace('\'', "''");
@@ -820,51 +1082,125 @@ impl OutlookClient for WindowsOutlookClient {
                 items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&f)])?)?;
             }
 
+            // Text query near-last, so the fallback scan below only walks
+            // items that already passed every other filter. DASL @SQL across
+            // subject/sender/body (escaped).
+            let mut text_fallback: Option<String> = None;
+            if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
+                let query: String = query.nfc().collect();
+                let e = query.replace('\'', "''");
+                let dasl = format!(
+                    "@SQL=(\"urn:schemas:httpmail:subject\" LIKE '%{e}%' \
+                     OR \"urn:schemas:httpmail:fromname\" LIKE '%{e}%' \
+                     OR \"urn:schemas:httpmail:textdescription\" LIKE '%{e}%')"
+                );
+                let matched =
+                    to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
+                let matched_count = variant_to_i32(&get_property(&matched, "Count")?).unwrap_or(0);
+                // DASL LIKE has been observed to return nothing for Hebrew
+                // (and other non-Latin) terms even when matching mail exists
+                // (issue #2). For a non-ASCII query, treat an empty DASL
+                // result as unreliable and scan the pre-filtered items
+                // client-side instead. ASCII queries stay DASL-only.
+                if matched_count == 0 && !query.is_ascii() {
+                    text_fallback = Some(query);
+                } else {
+                    items = matched;
+                }
+            }
+
+            // Recipient: applied last so the fallback below scans an
+            // already-narrowed set. First try DASL on the To/CC display
+            // strings (fast, evaluated by the store, no per-item COM calls).
+            // Those strings are what Outlook shows in the To/CC lines: for
+            // resolved Exchange/contact recipients that's the display NAME
+            // ("Ada Lovelace"), not the address, so an address needle can
+            // match nothing even though the mail was sent to that address.
+            // So when the DASL restrict comes back empty, fall back to
+            // scanning each item's Recipients (Name, Address, SMTP address)
+            // client-side, over at most RECIPIENT_SCAN_LIMIT newest items.
+            // A non-empty DASL result is kept as-is: every hit genuinely has
+            // the needle in its To/CC line, and it avoids the per-item walk.
+            let mut to_scan: Option<&str> = None;
+            if let Some(to) = q.to.as_deref().filter(|s| !s.is_empty()) {
+                let e = to.replace('\'', "''");
+                let dasl = format!(
+                    "@SQL=(\"urn:schemas:httpmail:displayto\" LIKE '%{e}%' \
+                     OR \"urn:schemas:httpmail:displaycc\" LIKE '%{e}%')"
+                );
+                let restricted =
+                    to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
+                if variant_to_i32(&get_property(&restricted, "Count")?).unwrap_or(0) > 0 {
+                    items = restricted;
+                } else {
+                    to_scan = Some(to);
+                }
+            }
+
             call_method(
                 &items,
                 "Sort",
                 &mut [variant_from_str("[ReceivedTime]"), variant_from_bool(true)],
             )?;
 
-            // Client-side fuzzy filters: category + has_attachments + flagged.
-            // Iterate, build each summary, keep it only if it passes, stop at count.
+            // Client-side fuzzy filters: non-ASCII text fallback and `to`
+            // recipient fallback (if active) + category + has_attachments +
+            // flagged. Lazily build each summary and keep it only if it
+            // passes; then `take_page` skips the first `offset` matches (after
+            // these filters, so pages line up) and stops at count.
             let cat_want = q.category.as_deref().map(|c| c.to_lowercase());
-            let total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
-            let mut results = Vec::new();
-            for i in 1..=total {
-                let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
-                let summary = email_summary(&item)?;
-                if let Some(want) = &cat_want {
-                    if !summary.categories.iter().any(|c| c.to_lowercase() == *want) {
-                        continue;
-                    }
-                }
-                if let Some(want_att) = q.has_attachments {
-                    if summary.has_attachments != want_att {
-                        continue;
-                    }
-                }
-                if q.flagged {
-                    // "Flagged" means any non-zero FlagStatus: both a
-                    // follow-up flag (OL_FLAG_MARKED = 2) and a completed
-                    // flag (OL_FLAG_COMPLETE = 1) count; 0 = no flag/cleared.
-                    let flag_status =
-                        variant_to_i32(&get_property(&item, "FlagStatus").unwrap_or_default())
-                            .unwrap_or(0);
-                    if flag_status == 0 {
-                        continue;
-                    }
-                }
-                results.push(summary);
-                if results.len() as i32 >= count {
-                    break;
-                }
+            let mut total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
+            if text_fallback.is_some() {
+                // The fallback reads Subject/SenderName (and maybe Body) per
+                // item, so cap how far back it scans (newest first).
+                total = total.min(MAX_SCAN_ITEMS);
             }
-            Ok(results)
+            if to_scan.is_some() {
+                // Same for the per-item Recipients walk of the `to` fallback.
+                total = total.min(RECIPIENT_SCAN_LIMIT);
+            }
+            let matches = (1..=total).filter_map(|i| {
+                (|| -> Result<Option<EmailSummary>, ToolError> {
+                    let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                    if text_fallback.as_deref().is_some_and(|query| !email_text_matches(&item, query)) {
+                        return Ok(None);
+                    }
+                    if to_scan.is_some_and(|to| !recipient_matches(to, &recipient_strings(&item))) {
+                        return Ok(None);
+                    }
+                    let summary = email_summary(&item)?;
+                    if let Some(want) = &cat_want {
+                        if !summary.categories.iter().any(|c| c.to_lowercase() == *want) {
+                            return Ok(None);
+                        }
+                    }
+                    if let Some(want_att) = q.has_attachments {
+                        if summary.has_attachments != want_att {
+                            return Ok(None);
+                        }
+                    }
+                    if q.flagged {
+                        // "Flagged" means any non-zero FlagStatus: both a
+                        // follow-up flag (OL_FLAG_MARKED = 2) and a completed
+                        // flag (OL_FLAG_COMPLETE = 1) count; 0 = no flag/cleared.
+                        let flag_status =
+                            variant_to_i32(&get_property(&item, "FlagStatus").unwrap_or_default())
+                                .unwrap_or(0);
+                        if flag_status == 0 {
+                            return Ok(None);
+                        }
+                    }
+                    Ok(Some(summary))
+                })()
+                .transpose()
+            });
+            take_page(matches, q.offset, count)
         })
     }
 
-    fn get_email(&self, email_id: String, prefer_html: bool) -> Result<EmailDetail, ToolError> {
+    fn get_email(&self, email_id: String, prefer_html: bool, max_body_chars: Option<u32>)
+        -> Result<EmailDetail, ToolError> {
+        let limit = clamp_body_limit(max_body_chars);
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &email_id)?;
@@ -874,13 +1210,17 @@ impl OutlookClient for WindowsOutlookClient {
             // Body/HTMLBody yields graceful partial detail rather than a COM error.
             let cc = variant_to_string(&get_property(&item, "CC").unwrap_or_default());
             let bcc = variant_to_string(&get_property(&item, "BCC").unwrap_or_default());
-            let body = truncate(&variant_to_string(&get_property(&item, "Body").unwrap_or_default()));
-            let html_body = if prefer_html {
-                Some(truncate(&variant_to_string(
-                    &get_property(&item, "HTMLBody").unwrap_or_default(),
-                )))
+            // `*_length` is the full original length in chars, so a caller
+            // that sees a `*_truncated` flag knows what limit to ask for.
+            let full_body = variant_to_string(&get_property(&item, "Body").unwrap_or_default());
+            let body_length = full_body.chars().count();
+            let (body, body_truncated) = truncate(&full_body, limit);
+            let (html_body, html_truncated, html_length) = if prefer_html {
+                let full_html = variant_to_string(&get_property(&item, "HTMLBody").unwrap_or_default());
+                let (html, truncated) = truncate(&full_html, limit);
+                (Some(html), Some(truncated), Some(full_html.chars().count()))
             } else {
-                None
+                (None, None, None)
             };
             // `getattr(item, "Attachments", None)` then `attachments and attachments.Count`:
             // tolerate an item that has no `Attachments` collection at all (falls back
@@ -927,7 +1267,11 @@ impl OutlookClient for WindowsOutlookClient {
                 cc,
                 bcc,
                 body,
+                body_truncated,
+                body_length,
                 html_body,
+                html_truncated,
+                html_length,
                 attachments,
                 item_type,
                 is_meeting,
@@ -1117,13 +1461,151 @@ impl OutlookClient for WindowsOutlookClient {
         })
     }
 
-    fn delete_email(&self, email_id: String) -> Result<Value, ToolError> {
+    fn update_draft(&self, u: DraftUpdate) -> Result<Value, ToolError> {
+        // Validate everything before the item is touched.
+        validate_draft_update(&u)?;
+        self.with_com(|| {
+            let (_app, ns) = mapi()?;
+            let item = get_item(&ns, &u.draft_id)?;
+            // `Sent` is true for anything sent or received; only an unsent
+            // draft may be edited.
+            if variant_to_bool(&get_property(&item, "Sent")?).unwrap_or(false) {
+                return Err(ToolError::new(
+                    "only unsent drafts can be edited; this item has already been sent or \
+                     received. Use reply_email or create_draft instead.",
+                ));
+            }
+
+            if let Some(subject) = &u.subject {
+                put_property(&item, "Subject", variant_from_str(subject))?;
+            }
+            // Set BodyFormat before the body so Outlook doesn't re-convert it.
+            if let Some(body) = &u.body {
+                put_property(&item, "BodyFormat", variant_from_i32(c::OL_FORMAT_PLAIN))?;
+                put_property(&item, "Body", variant_from_str(body))?;
+            }
+            if let Some(html) = &u.html_body {
+                put_property(&item, "BodyFormat", variant_from_i32(c::OL_FORMAT_HTML))?;
+                put_property(&item, "HTMLBody", variant_from_str(html))?;
+            }
+            // Recipients replace that whole line; an empty list clears it.
+            if let Some(to) = &u.to {
+                put_property(&item, "To", variant_from_str(&to.join("; ")))?;
+            }
+            if let Some(cc) = &u.cc {
+                put_property(&item, "CC", variant_from_str(&cc.join("; ")))?;
+            }
+            if let Some(bcc) = &u.bcc {
+                put_property(&item, "BCC", variant_from_str(&bcc.join("; ")))?;
+            }
+            // Appended; existing attachments are kept.
+            if let Some(atts) = u.attachments.as_deref().filter(|a| !a.is_empty()) {
+                attach_files(&item, atts)?;
+            }
+
+            call_method(&item, "Save", &mut [])?; // one Save for all changes; never Send
+            let id = make_id(&item)?;
+            Ok(json!({"status": "draft_updated", "id": id, "changed": draft_update_changes(&u)}))
+        })
+    }
+
+    fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &email_id)?;
             let subject = variant_to_string(&get_property(&item, "Subject")?);
-            call_method(&item, "Delete", &mut [])?;
-            Ok(json!({"status": "deleted", "subject": subject, "note": "Moved to Deleted Items."}))
+            if !permanent {
+                call_method(&item, "Delete", &mut [])?;
+                return Ok(json!({
+                    "status": "deleted", "subject": subject, "permanent": false,
+                    "note": "Moved to Deleted Items.",
+                }));
+            }
+
+            // OOM has no hard-delete call; Delete() on an item already in
+            // Deleted Items is permanent, so move it there first (Outlook's
+            // shift+delete).
+            let deleted = deleted_items_for(&ns, &item)?;
+            let deleted_id = variant_to_string(&get_property(&deleted, "EntryID")?);
+            // An unreadable parent id just means "move first" (always safe).
+            let parent_id = (|| -> Result<String, ToolError> {
+                let parent = to_disp(get_property(&item, "Parent")?)?;
+                Ok(variant_to_string(&get_property(&parent, "EntryID")?))
+            })()
+            .unwrap_or_default();
+            if permanent_delete_needs_move(&parent_id, &deleted_id) {
+                // Move returns the item in its new home, but Delete() on that
+                // returned object is a silent no-op (confirmed with a raw
+                // PowerShell COM probe on an Outlook.com store, with or
+                // without a delay): the item stays in Deleted Items. Re-open
+                // the moved item by EntryID and delete that fresh object.
+                let moved = to_disp(call_method(
+                    &item, "Move", &mut [VARIANT::from(deleted.clone())],
+                )?)?;
+                let moved_id = variant_to_string(&get_property(&moved, "EntryID")?);
+                let store_id = variant_to_string(&get_property(&deleted, "StoreID")?);
+                let fresh = to_disp(call_method(
+                    &ns,
+                    "GetItemFromID",
+                    &mut [variant_from_str(&moved_id), variant_from_str(&store_id)],
+                )?)?;
+                call_method(&fresh, "Delete", &mut [])?;
+            } else {
+                call_method(&item, "Delete", &mut [])?;
+            }
+            Ok(json!({
+                "status": "deleted", "subject": subject, "permanent": true,
+                "note": "Permanently deleted (not recoverable from Deleted Items).",
+            }))
+        })
+    }
+
+    fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError> {
+        require_empty_confirm(confirm)?;
+        self.with_com(|| {
+            let (_app, ns) = mapi()?;
+            let folder = to_disp(call_method(
+                &ns,
+                "GetDefaultFolder",
+                &mut [variant_from_i32(c::OL_FOLDER_DELETED_ITEMS)],
+            )?)?;
+            let (mut items_deleted, mut folders_deleted, mut failed) = (0, 0, 0);
+
+            // Walk backwards: deleting during forward iteration skips items
+            // as the collection re-indexes. One stuck item must not abort
+            // the rest, so per-item errors are only counted.
+            let items = to_disp(get_property(&folder, "Items")?)?;
+            let count = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
+            for i in (1..=count).rev() {
+                let deleted = (|| -> Result<(), ToolError> {
+                    let it = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                    call_method(&it, "Delete", &mut [])?;
+                    Ok(())
+                })();
+                match deleted {
+                    Ok(_) => items_deleted += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+
+            let subfolders = to_disp(get_property(&folder, "Folders")?)?;
+            let count = variant_to_i32(&get_property(&subfolders, "Count")?).unwrap_or(0);
+            for i in (1..=count).rev() {
+                let deleted = (|| -> Result<(), ToolError> {
+                    let f = to_disp(call_method(&subfolders, "Item", &mut [variant_from_i32(i)])?)?;
+                    call_method(&f, "Delete", &mut [])?;
+                    Ok(())
+                })();
+                match deleted {
+                    Ok(_) => folders_deleted += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+
+            Ok(json!({
+                "status": "emptied", "items_deleted": items_deleted,
+                "folders_deleted": folders_deleted, "failed": failed,
+            }))
         })
     }
 
@@ -1209,9 +1691,14 @@ impl OutlookClient for WindowsOutlookClient {
             let item = get_item(&ns, &event_id)?;
             let summary = event_summary(&item, None)?;
             let recurrence = recurrence_info(&item)?;
+            let (body, body_truncated) = truncate(
+                &variant_to_string(&get_property(&item, "Body").unwrap_or_default()),
+                MAX_BODY_CHARS,
+            );
             Ok(EventDetail {
                 summary,
-                body: truncate(&variant_to_string(&get_property(&item, "Body").unwrap_or_default())),
+                body,
+                body_truncated,
                 recurrence,
             })
         })
@@ -1539,15 +2026,17 @@ impl OutlookClient for WindowsOutlookClient {
                 _ => return Ok(Vec::new()),
             };
             let count = variant_to_i32(&get_property(&attachments, "Count")?).unwrap_or(0);
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            // Read the HTML body once (only when there are attachments) for
+            // `is_inline`; a plain-text item or an unreadable body counts as "".
+            let html_body = item_html_body(&item);
             let mut results = Vec::new();
             for i in 1..=count {
                 // COM collections are 1-based.
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                results.push(AttachmentInfo {
-                    index: i,
-                    filename: variant_to_string(&get_property(&att, "FileName")?),
-                    size: variant_to_i32(&get_property(&att, "Size")?).unwrap_or(0),
-                });
+                results.push(attachment_info(&att, i, &html_body)?);
             }
             Ok(results)
         })
@@ -1583,36 +2072,32 @@ impl OutlookClient for WindowsOutlookClient {
             // `{n.lower() for n in attachment_names}`: case-insensitive set membership.
             let wanted: Option<std::collections::HashSet<String>> = attachment_names
                 .map(|names| names.iter().map(|n| n.to_lowercase()).collect());
+            // Read the HTML body once (only when there are attachments) for
+            // `is_inline`; a plain-text item or an unreadable body counts as "".
+            let html_body = item_html_body(&item);
             let mut results = Vec::new();
             for i in 1..=count {
                 let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
-                let raw = variant_to_string(&get_property(&att, "FileName")?);
-                let filename = if raw.is_empty() {
-                    format!("attachment-{i}")
-                } else {
-                    raw
-                };
+                let mut info = attachment_info(&att, i, &html_body)?;
+                if info.filename.is_empty() {
+                    info.filename = format!("attachment-{i}");
+                }
                 if let Some(wanted) = &wanted {
-                    if !wanted.contains(&filename.to_lowercase()) {
+                    if !wanted.contains(&info.filename.to_lowercase()) {
                         continue;
                     }
                 }
-                let target = dir.join(safe_filename(&filename));
+                let target = dir.join(safe_filename(&info.filename));
                 let target_str = target.to_string_lossy().into_owned();
+                // Each entry is the attachment's metadata (`index` stays its
+                // original COM position even when filtering) plus the outcome.
                 // A COM failure saving one file is collected per-file and does
                 // NOT abort the batch (mirrors the per-file try/except in Python).
-                match call_method(&att, "SaveAsFile", &mut [variant_from_str(&target_str)]) {
-                    Ok(_) => results.push(json!({
-                        "filename": filename,
-                        "saved_to": target_str,
-                        "status": "saved",
-                    })),
-                    Err(e) => results.push(json!({
-                        "filename": filename,
-                        "status": "failed",
-                        "error": format_com_error(&e),
-                    })),
-                }
+                let outcome = match call_method(&att, "SaveAsFile", &mut [variant_from_str(&target_str)]) {
+                    Ok(_) => json!({"saved_to": target_str, "status": "saved"}),
+                    Err(e) => json!({"status": "failed", "error": format_com_error(&e)}),
+                };
+                results.push(merge_json_objects(json!(info), outcome));
             }
             if results.is_empty() {
                 return Err(ToolError::new(
@@ -1621,6 +2106,61 @@ impl OutlookClient for WindowsOutlookClient {
                 ));
             }
             Ok(results)
+        })
+    }
+
+    fn get_inline_image(&self, email_id: String, content_id: String, context_lines: Option<u32>)
+        -> Result<InlineImage, ToolError> {
+        let wanted = normalize_cid_request(&content_id).ok_or_else(|| {
+            ToolError::new("content_id must be a non-empty Content-ID (e.g. \"image001.png@01D9...\", optionally prefixed with cid:).")
+        })?;
+        self.with_com(|| {
+            let (_app, ns) = mapi()?;
+            let item = get_item(&ns, &email_id)?;
+            // As in list_attachments, an item without an `Attachments`
+            // collection is treated as having none.
+            let mut candidates: Vec<(IDispatch, AttachmentInfo)> = Vec::new();
+            if let Some(Ok(attachments)) = get_property(&item, "Attachments").ok().map(to_disp) {
+                let count = variant_to_i32(&get_property(&attachments, "Count")?).unwrap_or(0);
+                for i in 1..=count {
+                    let att = to_disp(call_method(&attachments, "Item", &mut [variant_from_i32(i)])?)?;
+                    // `is_inline` isn't part of the result, so skip reading
+                    // HTMLBody just to compute it.
+                    let info = attachment_info(&att, i, "")?;
+                    candidates.push((att, info));
+                }
+            }
+            let content_ids: Vec<Option<String>> =
+                candidates.iter().map(|(_, info)| info.content_id.clone()).collect();
+            let (att, info) = &candidates[select_by_content_id(&wanted, &content_ids)?];
+
+            // `Size` is the MAPI attachment size (a bit above the payload), so
+            // it only pre-screens; the real byte count is checked after reading.
+            if usize::try_from(info.size).unwrap_or(0) > MAX_INLINE_IMAGE_BYTES {
+                return Err(inline_image_too_big(info));
+            }
+            let bytes = read_attachment_bytes(att, info)?;
+            if bytes.len() > MAX_INLINE_IMAGE_BYTES {
+                return Err(inline_image_too_big(info));
+            }
+            let mime_type = info
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            // As in get_email, an item without `HTMLBody` reads as empty, so
+            // the image just counts as unreferenced.
+            let context = context_lines.map(|n| {
+                let html = variant_to_string(&get_property(&item, "HTMLBody").unwrap_or_default());
+                text_before_cid(&html, &wanted, n).unwrap_or_default()
+            });
+            Ok(InlineImage {
+                content_id: info.content_id.clone().unwrap_or_default(),
+                filename: info.filename.clone(),
+                data_uri: data_uri(&mime_type, &bytes),
+                mime_type,
+                size: bytes.len(),
+                context,
+            })
         })
     }
 
@@ -1838,9 +2378,12 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             let note = get_item(&ns, &note_id)?;
             let summary = note_summary(&note)?;
+            let (body, body_truncated) =
+                truncate(&variant_to_string(&get_property(&note, "Body")?), MAX_BODY_CHARS);
             Ok(NoteDetail {
                 summary,
-                body: truncate(&variant_to_string(&get_property(&note, "Body")?)),
+                body,
+                body_truncated,
                 modified: variant_to_iso_string(&get_property(&note, "LastModificationTime").unwrap_or_default()),
             })
         })
@@ -2429,5 +2972,229 @@ mod task_filter_tests {
             ..Default::default()
         };
         assert!(!task_matches("budget numbers", &summary, &query));
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn info() -> AttachmentInfo {
+        AttachmentInfo {
+            index: 3,
+            filename: "logo.png".to_string(),
+            size: 42,
+            att_type: "file".to_string(),
+            content_id: Some("logo@x".to_string()),
+            mime_type: Some("image/png".to_string()),
+            hidden: true,
+            is_inline: true,
+        }
+    }
+
+    #[test]
+    fn attachment_info_serializes_type_key() {
+        let v = json!(info());
+        assert_eq!(v["type"], "file");
+        assert!(v.get("att_type").is_none());
+        assert_eq!(v["content_id"], "logo@x");
+        assert_eq!(v["mime_type"], "image/png");
+        assert_eq!(v["hidden"], true);
+        assert_eq!(v["is_inline"], true);
+    }
+
+    #[test]
+    fn save_entry_is_info_plus_outcome() {
+        let v = merge_json_objects(json!(info()), json!({"saved_to": "C:/x/logo.png", "status": "saved"}));
+        assert_eq!(v["index"], 3);
+        assert_eq!(v["filename"], "logo.png");
+        assert_eq!(v["type"], "file");
+        assert_eq!(v["saved_to"], "C:/x/logo.png");
+        assert_eq!(v["status"], "saved");
+    }
+
+    #[test]
+    fn merge_ignores_non_object_extra() {
+        let v = merge_json_objects(json!({"a": 1}), json!("nope"));
+        assert_eq!(v, json!({"a": 1}));
+    }
+
+    fn cids(ids: &[Option<&str>]) -> Vec<Option<String>> {
+        ids.iter().map(|c| c.map(str::to_string)).collect()
+    }
+
+    #[test]
+    fn select_by_content_id_matches_case_insensitively() {
+        let ids = cids(&[None, Some("logo@01D9"), Some("Image001.PNG@01D9ABCD")]);
+        assert_eq!(select_by_content_id("image001.png@01d9abcd", &ids).unwrap(), 2);
+        assert_eq!(select_by_content_id("LOGO@01d9", &ids).unwrap(), 1);
+    }
+
+    #[test]
+    fn select_by_content_id_lists_available_ids_when_missing() {
+        let ids = cids(&[Some("a@x"), None, Some("b@y")]);
+        let msg = select_by_content_id("missing@z", &ids).unwrap_err().0;
+        assert!(msg.contains("missing@z"), "{msg}");
+        assert!(msg.contains("Available Content-IDs: a@x, b@y"), "{msg}");
+    }
+
+    #[test]
+    fn select_by_content_id_points_to_list_attachments_when_none() {
+        for ids in [cids(&[]), cids(&[None, None])] {
+            let msg = select_by_content_id("x@y", &ids).unwrap_err().0;
+            assert!(msg.contains("no attachments with a Content-ID"), "{msg}");
+            assert!(msg.contains("list_attachments"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn inline_image_too_big_points_to_save_attachments() {
+        let msg = inline_image_too_big(&info()).0;
+        assert!(msg.contains("logo.png"), "{msg}");
+        assert!(msg.contains("10 MB"), "{msg}");
+        assert!(msg.contains("save_attachments"), "{msg}");
+        let unnamed = AttachmentInfo { filename: String::new(), ..info() };
+        assert!(inline_image_too_big(&unnamed).0.contains("logo@x"));
+    }
+
+    #[test]
+    fn data_uri_base64_encodes_with_the_mime_header() {
+        assert_eq!(data_uri("image/png", b"\x89PNG"), "data:image/png;base64,iVBORw==");
+        assert_eq!(data_uri("application/octet-stream", b""), "data:application/octet-stream;base64,");
+    }
+
+    #[test]
+    fn temp_dir_guard_removes_its_directory_on_drop() {
+        let guard = TempDirGuard::create().unwrap();
+        let dir = guard.path().to_path_buf();
+        std::fs::write(dir.join("f.bin"), b"abc").unwrap();
+        let other = TempDirGuard::create().unwrap();
+        assert_ne!(other.path(), dir.as_path());
+        drop(guard);
+        assert!(!dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod text_match_tests {
+    use super::*;
+
+    #[test]
+    fn hebrew_matches_subject_or_later_field() {
+        assert!(text_matches("מייל שיקוף", &["Re: מייל שיקוף שבועי"]));
+        assert!(text_matches("סיכום עשייה", &["", "Dana", "גוף: סיכום עשייה Q3"]));
+        assert!(!text_matches("מייל שיקוף", &["Weekly report", "Dana"]));
+    }
+
+    #[test]
+    fn mixed_hebrew_and_english() {
+        assert!(text_matches("Q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
+        assert!(text_matches("q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
+        assert!(!text_matches("Q4 סיכום", &["Weekly Q3 סיכום עשייה"]));
+    }
+
+    #[test]
+    fn matching_is_caseless() {
+        assert!(text_matches("weekly", &["WEEKLY Report"]));
+        assert!(text_matches("ÉCOLE", &["notes from école today"]));
+        assert!(text_matches("ΣΟΦΊΑ", &["σοφία"]));
+    }
+
+    #[test]
+    fn matching_ignores_normalization_form() {
+        // Latin with an accent: composed (NFC) vs decomposed (NFD).
+        let nfc: String = "café".nfc().collect();
+        let nfd: String = "café".nfd().collect();
+        assert_ne!(nfc, nfd);
+        assert!(text_matches(&nfd, &[&format!("subject {nfc}")]));
+        assert!(text_matches(&nfc, &[&format!("subject {nfd}")]));
+        // Hebrew niqqud has no precomposed forms, but the same marks typed
+        // in a different order (shin dot + qamats vs qamats + shin dot) are
+        // canonically equivalent and must still match.
+        let a = "\u{05E9}\u{05C1}\u{05B8}לום";
+        let b = "\u{05E9}\u{05B8}\u{05C1}לום";
+        assert_ne!(a, b);
+        assert!(text_matches(a, &[&format!("subject {b}")]));
+        assert!(text_matches(b, &[&format!("subject {a}")]));
+    }
+
+    #[test]
+    fn empty_fields_never_match() {
+        assert!(!text_matches("שלום", &[]));
+        assert!(!text_matches("שלום", &["", ""]));
+    }
+}
+
+#[cfg(test)]
+mod recipient_filter_tests {
+    use super::recipient_matches;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn matches_name_substring_caselessly() {
+        assert!(recipient_matches("lovelace", &strs(&["Ada Lovelace", "/o=ExchangeLabs/cn=ada"])));
+        assert!(recipient_matches("ADA", &strs(&["Ada Lovelace"])));
+    }
+
+    #[test]
+    fn matches_smtp_address_when_name_differs() {
+        let c = strs(&["Ada Lovelace", "/o=ExchangeLabs/cn=ada", "Ada.Lovelace@Example.com"]);
+        assert!(recipient_matches("ada.lovelace@example.com", &c));
+        assert!(recipient_matches("@example.com", &c));
+    }
+
+    #[test]
+    fn rejects_when_no_candidate_contains_needle() {
+        let c = strs(&["nobody@example.invalid"]);
+        assert!(!recipient_matches("someone-else@example.invalid", &c));
+        assert!(!recipient_matches("ada", &[]));
+    }
+
+    #[test]
+    fn empty_needle_matches_anything_with_a_candidate() {
+        assert!(recipient_matches("", &strs(&["x"])));
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_leaves_short_text_untouched() {
+        assert_eq!(truncate("hello", 10), ("hello".to_string(), false));
+        // Exactly at the limit is not truncated.
+        assert_eq!(truncate("hello", 5), ("hello".to_string(), false));
+        assert_eq!(truncate("", 5), (String::new(), false));
+    }
+
+    #[test]
+    fn truncate_cuts_long_text_and_flags_it() {
+        let (text, truncated) = truncate("abcdefghij", 4);
+        assert!(truncated);
+        assert_eq!(text, "abcd\n\n[... truncated at 4 characters]");
+    }
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        // Each "é" is 2 bytes; a byte-based cut would split a codepoint.
+        let (text, truncated) = truncate("ééééé", 3);
+        assert!(truncated);
+        assert!(text.starts_with("ééé\n\n"));
+        assert_eq!(truncate("ééé", 3), ("ééé".to_string(), false));
+    }
+
+    #[test]
+    fn clamp_body_limit_defaults_and_clamps() {
+        assert_eq!(clamp_body_limit(None), MAX_BODY_CHARS);
+        assert_eq!(clamp_body_limit(Some(0)), MIN_BODY_CHARS_LIMIT);
+        assert_eq!(clamp_body_limit(Some(999)), MIN_BODY_CHARS_LIMIT);
+        assert_eq!(clamp_body_limit(Some(1_000)), 1_000);
+        assert_eq!(clamp_body_limit(Some(250_000)), 250_000);
+        assert_eq!(clamp_body_limit(Some(5_000_000)), MAX_BODY_CHARS_LIMIT);
+        assert_eq!(clamp_body_limit(Some(u32::MAX)), MAX_BODY_CHARS_LIMIT);
     }
 }

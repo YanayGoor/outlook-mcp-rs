@@ -28,8 +28,18 @@ pub struct EmailDetail {
     pub cc: String,
     pub bcc: String,
     pub body: String,
+    /// True when `body` was cut at the caller's `max_body_chars`.
+    pub body_truncated: bool,
+    /// Full original length of the body, in characters.
+    pub body_length: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_body: Option<String>,
+    /// Set only with `prefer_html`: whether `html_body` was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_truncated: Option<bool>,
+    /// Set only with `prefer_html`: full original HTML length, in characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_length: Option<usize>,
     pub attachments: Vec<String>,
     pub item_type: String,
     pub is_meeting: bool,
@@ -74,6 +84,7 @@ pub struct EventDetail {
     #[serde(flatten)]
     pub summary: EventSummary,
     pub body: String,
+    pub body_truncated: bool,
     pub recurrence: Option<RecurrenceInfo>,
 }
 
@@ -170,14 +181,51 @@ pub struct NoteDetail {
     #[serde(flatten)]
     pub summary: NoteSummary,
     pub body: String,
+    pub body_truncated: bool,
     pub modified: Option<String>,
 }
 
+/// Metadata for one attachment, shared by `list_attachments` and (flattened,
+/// plus `saved_to`/`status`/`error`) `save_attachments`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentInfo {
+    /// COM's 1-based position in the item's `Attachments` collection.
     pub index: i32,
     pub filename: String,
     pub size: i32,
+    /// `"file"`, `"link"`, `"item"`, `"ole"` or `"unknown"` (see
+    /// `constants::attachment_type_name`).
+    #[serde(rename = "type")]
+    pub att_type: String,
+    /// Content-ID without `<>`, as an HTML body references it (`cid:...`).
+    pub content_id: Option<String>,
+    pub mime_type: Option<String>,
+    /// MAPI `PR_ATTACHMENT_HIDDEN`; false when the property is absent.
+    pub hidden: bool,
+    /// Inline (`cid:`-referenced) content rather than a standalone attachment:
+    /// has a Content-ID and is either hidden or referenced by the HTML body
+    /// (see `com::is_inline`).
+    pub is_inline: bool,
+}
+
+/// An attachment fetched by Content-ID (`get_inline_image`), inlined as a
+/// base64 `data:` URI.
+#[derive(Debug, Clone, Serialize)]
+pub struct InlineImage {
+    /// The attachment's Content-ID without `<>` (as `list_attachments` shows it).
+    pub content_id: String,
+    pub filename: String,
+    /// From the attachment's metadata, else `application/octet-stream`.
+    pub mime_type: String,
+    /// Actual byte length of the decoded payload.
+    pub size: usize,
+    /// `data:<mime_type>;base64,<payload>`.
+    pub data_uri: String,
+    /// Only when `context_lines` was requested: the plain-text lines just
+    /// before the first `cid:` reference to this image in the HTML body
+    /// (`""` if the body never references it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 #[cfg(test)]
@@ -194,7 +242,8 @@ mod tests {
                 has_attachments: false, categories: vec![],
             },
             cc: "".into(), bcc: "".into(), body: "Hello".into(),
-            html_body: None, attachments: vec![],
+            body_truncated: false, body_length: 5,
+            html_body: None, html_truncated: None, html_length: None, attachments: vec![],
             item_type: "email".into(), is_meeting: false, meeting: None,
         };
         let value = serde_json::to_value(&detail).unwrap();
@@ -205,5 +254,11 @@ mod tests {
         assert_eq!(value["body"], "Hello");
         assert!(value.get("html_body").is_none());
         assert!(value.get("summary").is_none());
+        // Truncation info is always present for the plain body, and the
+        // HTML counterparts are omitted without prefer_html.
+        assert_eq!(value["body_truncated"], false);
+        assert_eq!(value["body_length"], 5);
+        assert!(value.get("html_truncated").is_none());
+        assert!(value.get("html_length").is_none());
     }
 }
