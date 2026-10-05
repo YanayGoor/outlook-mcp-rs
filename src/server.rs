@@ -47,6 +47,10 @@ pub struct ListEmailsParams {
     pub folder: String,
     #[serde(default = "default_count")]
     pub count: i32,
+    /// Matches to skip before this page starts (default 0). To page, call
+    /// again with offset += count until fewer than count results come back.
+    #[serde(default)]
+    pub offset: i32,
     #[serde(default)]
     pub unread_only: bool,
     #[serde(default)]
@@ -352,6 +356,18 @@ pub struct SaveAttachmentsParams {
     pub attachment_names: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetInlineImageParams {
+    pub email_id: String,
+    /// The attachment's Content-ID (`content_id` from list_attachments, or the
+    /// `cid:...` reference from the HTML body). A `cid:` prefix and `<>` are accepted.
+    pub content_id: String,
+    /// Also return `context`: up to this many lines (max 50) of plain text
+    /// immediately before the image's first `cid:` reference in the HTML body.
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+}
+
 // ---- Tasks ----
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -478,14 +494,15 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Find emails in a folder with optional text query and filters (sender, category, date range, attachments, flagged, importance).")]
+    #[tool(description = "Find emails in a folder (newest first) with optional text query and filters (sender, category, date range, attachments, flagged, importance). count is capped at 200. To page through more, call again with offset += count until fewer than count results come back.")]
     pub async fn list_emails(
         &self,
         Parameters(p): Parameters<ListEmailsParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
         let q = EmailQuery {
-            query: p.query, folder: p.folder, count: p.count, unread_only: p.unread_only,
+            query: p.query, folder: p.folder, count: p.count, offset: p.offset,
+            unread_only: p.unread_only,
             from: p.from, category: p.category, received_after: p.received_after,
             received_before: p.received_before, since_days: p.since_days,
             has_attachments: p.has_attachments, flagged: p.flagged,
@@ -683,7 +700,7 @@ impl OutlookMcpServer {
 
     // ---- Attachments ----
 
-    #[tool(description = "List an email's attachments (filename and size).")]
+    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden).")]
     pub async fn list_attachments(
         &self,
         Parameters(ListAttachmentsParams { email_id }): Parameters<ListAttachmentsParams>,
@@ -693,13 +710,23 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Save an email's attachments to a local directory.")]
+    #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.")]
     pub async fn save_attachments(
         &self,
         Parameters(SaveAttachmentsParams { email_id, save_dir, attachment_names }): Parameters<SaveAttachmentsParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
         let result = run_blocking(move || client.save_attachments(email_id, save_dir, attachment_names)).await?;
+        Ok(CallToolResult::success(vec![json_content(&result)?]))
+    }
+
+    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files. Optional `context_lines` (max 50) also returns `context`: the last that-many non-empty lines of plain text immediately before the image's first `cid:` reference in the HTML body (tags stripped, entities decoded), useful for knowing what the image shows. `context` is \"\" when the HTML body never references the image, and is omitted when `context_lines` is not given.")]
+    pub async fn get_inline_image(
+        &self,
+        Parameters(GetInlineImageParams { email_id, content_id, context_lines }): Parameters<GetInlineImageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = self.client.clone();
+        let result = run_blocking(move || client.get_inline_image(email_id, content_id, context_lines)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 

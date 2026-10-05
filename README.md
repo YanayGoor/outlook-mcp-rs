@@ -134,7 +134,7 @@ The Outlook tools then appear in that client.
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
-- `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body) and filters (sender, category, date range, attachments, flagged, importance)
+- `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body; non-ASCII queries such as Hebrew fall back to a client-side scan when Outlook's search finds nothing) and filters (sender, category, date range, attachments, flagged, importance); newest first, `count` up to 200, page with `offset`
 - `get_email` — get the full body and attachment list of one email by id
 - `send_email` — send a new email immediately
 - `create_draft` — create a draft email without sending it
@@ -153,8 +153,9 @@ The Outlook tools then appear in that client.
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**
-- `list_attachments` — list an email's attachments (filename and size)
-- `save_attachments` — save an email's attachments to a local directory
+- `list_attachments` — list an email's attachments with metadata: index, filename, size, type (file/link/item/ole), Content-ID (for `cid:` references in HTML bodies), MIME type, hidden flag, and `is_inline` (inline `cid:` content vs. a standalone attachment)
+- `save_attachments` — save an email's attachments to a local directory (each result carries the same metadata plus `saved_to`/`status`)
+- `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB); optional `context_lines` (max 50) also returns `context`, the plain-text lines just before the image's first `cid:` reference in the HTML body (`""` if it isn't referenced)
 
 **Tasks**
 - `list_tasks` — list Outlook tasks (filter by category, importance, or a text query matching subject or body)

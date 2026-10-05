@@ -52,7 +52,7 @@ impl Results {
 
 fn eq_default(folder: &str) -> EmailQuery {
     EmailQuery {
-        query: None, folder: folder.to_string(), count: 25, unread_only: false,
+        query: None, folder: folder.to_string(), count: 25, offset: 0, unread_only: false,
         from: None, category: None, received_after: None, received_before: None,
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }
