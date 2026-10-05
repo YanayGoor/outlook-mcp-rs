@@ -20,11 +20,42 @@ pub const NOTE_ID: &str = "entry-4|store-1";
 pub struct FakeOutlookClient {
     calls: Mutex<Vec<(String, Value)>>,
     fail_with: Mutex<Option<String>>,
+    email_text: Mutex<Option<EmailText>>,
+}
+
+/// Custom subject/sender/body returned by `list_emails` and `get_email`
+/// (see `FakeOutlookClient::set_email_text`). Lets tests feed non-ASCII
+/// text through the tool layer.
+#[derive(Clone)]
+struct EmailText {
+    subject: String,
+    sender: String,
+    body: String,
 }
 
 impl FakeOutlookClient {
     pub fn new() -> Self {
-        Self { calls: Mutex::new(Vec::new()), fail_with: Mutex::new(None) }
+        Self {
+            calls: Mutex::new(Vec::new()),
+            fail_with: Mutex::new(None),
+            email_text: Mutex::new(None),
+        }
+    }
+
+    /// Make `list_emails` and `get_email` return this subject/sender/body
+    /// instead of their canned values.
+    pub fn set_email_text(&self, subject: impl Into<String>, sender: impl Into<String>,
+        body: impl Into<String>) {
+        *self.email_text.lock().unwrap() = Some(EmailText {
+            subject: subject.into(), sender: sender.into(), body: body.into(),
+        });
+    }
+
+    /// The custom email text if one was set, else the given canned defaults.
+    fn email_text(&self, subject: &str, sender: &str, body: &str) -> EmailText {
+        self.email_text.lock().unwrap().clone().unwrap_or_else(|| EmailText {
+            subject: subject.into(), sender: sender.into(), body: body.into(),
+        })
     }
 
     pub fn calls(&self) -> Vec<(String, Value)> {
@@ -64,8 +95,9 @@ impl OutlookClient for FakeOutlookClient {
             "since_days": q.since_days, "has_attachments": q.has_attachments,
             "flagged": q.flagged, "high_importance": q.high_importance,
         }))?;
+        let text = self.email_text("Hello", "Ada", "");
         Ok(vec![EmailSummary {
-            id: EMAIL_ID.into(), subject: "Hello".into(), sender: "Ada".into(),
+            id: EMAIL_ID.into(), subject: text.subject, sender: text.sender,
             sender_email: "".into(), to: "".into(), received: None,
             unread: true, has_attachments: false,
             categories: vec!["Work".to_string()],
@@ -77,14 +109,15 @@ impl OutlookClient for FakeOutlookClient {
         self.record("get_email", json!({
             "email_id": email_id, "prefer_html": prefer_html, "max_body_chars": max_body_chars,
         }))?;
+        let text = self.email_text("Hello", "", "Hi there");
         Ok(EmailDetail {
             summary: EmailSummary {
-                id: email_id, subject: "Hello".into(), sender: "".into(),
+                id: email_id, subject: text.subject, sender: text.sender,
                 sender_email: "".into(), to: "".into(), received: None,
                 unread: false, has_attachments: false, categories: vec![],
             },
-            cc: "".into(), bcc: "".into(), body: "Hi there".into(),
-            body_truncated: false, body_length: 8,
+            cc: "".into(), bcc: "".into(),
+            body_length: text.body.chars().count(), body_truncated: false, body: text.body,
             html_body: if prefer_html { Some("<p>Hi there</p>".into()) } else { None },
             html_truncated: if prefer_html { Some(false) } else { None },
             html_length: if prefer_html { Some(15) } else { None },

@@ -199,6 +199,17 @@ destroying them. A few have real, outbound effects and are explicit in the tool 
 cancellation flag is set. [`TESTING.md`](TESTING.md) spells out exactly which behaviors are
 covered by automated tests versus verified by hand precisely because they send real mail.
 
+## Troubleshooting
+
+### Hebrew or other non-ASCII text shows up as `????`
+
+The server's output is UTF-8 end to end. Outlook text stays UTF-16 until it is
+decoded to a Rust `String`, serialized as raw UTF-8 JSON (no `\uXXXX` escapes), and
+written unchanged to stdout or the HTTP response. The `????` comes from whatever
+displays the output, typically a Windows console or PowerShell using a non-UTF-8
+code page. Inspect the output in a UTF-8 viewer, or switch the console first with
+`chcp 65001` (cmd) or `[Console]::OutputEncoding = [Text.Encoding]::UTF8` (PowerShell).
+
 ## Development
 
 See [`TESTING.md`](TESTING.md) for how to run the unit test suite and the local

@@ -135,6 +135,14 @@ pub fn is_inline(content_id: Option<&str>, hidden: bool, html_body: &str) -> boo
     })
 }
 
+/// Decodes a COM wide string (BSTR contents, UTF-16) into a Rust `String`.
+/// Well-formed UTF-16 (Hebrew, other BMP scripts, emoji as surrogate pairs)
+/// converts losslessly. Only an unpaired surrogate, which no `String` can
+/// hold, becomes U+FFFD; that matches `BSTR`'s own `Display`.
+pub fn string_from_utf16(wide: &[u16]) -> String {
+    String::from_utf16_lossy(wide)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +282,28 @@ mod tests {
     fn is_inline_hidden() {
         assert!(!is_inline(None, true, ""));
         assert!(is_inline(Some("logo@x"), true, ""));
+    }
+
+    #[test]
+    fn string_from_utf16_is_lossless_for_hebrew_and_emoji() {
+        for text in ["מייל שיקוף", "סיכום עשייה", "Re: סיכום (Q3) 📧", ""] {
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            assert_eq!(string_from_utf16(&wide), text);
+        }
+    }
+
+    #[test]
+    fn string_from_utf16_replaces_only_unpaired_surrogates() {
+        // "מ", a lone high surrogate, "x": only the surrogate is replaced.
+        assert_eq!(string_from_utf16(&[0x05DE, 0xD83D, 0x0078]), "מ\u{FFFD}x");
+        // A lone low surrogate at the end.
+        assert_eq!(string_from_utf16(&[0x0061, 0xDCE7]), "a\u{FFFD}");
+    }
+
+    #[test]
+    fn variant_to_string_round_trips_hebrew_bstr() {
+        let text = "מייל שיקוף — סיכום עשייה";
+        assert_eq!(variant_to_string(&variant_from_str(text)), text);
     }
 
     #[test]
@@ -519,9 +549,10 @@ pub fn variant_from_datetime(dt: &chrono::NaiveDateTime) -> WinResult<VARIANT> {
 /// For VT_BSTR-typed properties (Outlook `Subject`/`Name`/etc.). Returns an
 /// empty string if the VARIANT isn't a string — use `variant_to_i32`/
 /// `variant_to_bool`/`variant_to_iso_string` for other VT kinds instead of
-/// relying on this as a general-purpose fallback.
+/// relying on this as a general-purpose fallback. The text stays UTF-16 until
+/// `string_from_utf16`, so no code page is involved (see its doc comment).
 pub fn variant_to_string(value: &VARIANT) -> String {
-    BSTR::try_from(value).map(|b| b.to_string()).unwrap_or_default()
+    BSTR::try_from(value).map(|b| string_from_utf16(&b)).unwrap_or_default()
 }
 
 pub fn variant_to_i32(value: &VARIANT) -> Option<i32> {
