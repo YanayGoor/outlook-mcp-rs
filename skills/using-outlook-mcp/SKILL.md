@@ -93,6 +93,7 @@ permanent delete. Never set `confirm: true` on your own initiative.
 - **Attachments:**
   - `list_attachments` gives each attachment's `type`, `content_id`, `mime_type`, `hidden`, and `is_inline` (an image shown inside the HTML body, as opposed to a regular attachment). Pass a list of email ids to get `[{id, attachments}]` in one call.
   - Give `save_attachments` an absolute `save_dir` (or `~/...`). A relative path resolves against the server's working directory, not the user's.
+  - To re-send an email with its attachments, read it with `get_email` + `resolve_inline_images` (images travel inside the HTML) and save the rest with `save_attachments` + `inline: false`. Saving everything and re-attaching it would add each inline image a second time as a regular attachment.
 - **Inline images:**
   - **Writing:** on `send_email`, `create_draft`, `reply_email` and `update_draft`, `data:` image URIs in `html_body` (e.g. `<img src="data:image/png;base64,...">`) become real inline attachments automatically. Or pass `inline_images: [{content_id, path | data_base64}]` and reference each as `<img src="cid:CONTENT_ID">` (needs an HTML body).
   - **Reading:** `get_inline_image(email_id, content_id)` returns the image as a `data:` URI (max 10 MB). Add `context_lines` (max 50) to also get the text just before the image. `content_ids: [...]` fetches several at once; `output_dir` saves them as files (`data_file`).
