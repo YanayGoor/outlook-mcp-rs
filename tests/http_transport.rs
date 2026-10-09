@@ -110,3 +110,24 @@ async fn compressed_request_is_refused_explicitly() {
     assert!(status.contains("415"), "expected 415, got {status:?}");
     assert!(body.contains("Content-Encoding"), "{body}");
 }
+
+/// Issue #28: a tool call carrying a large HTML body with embedded base64
+/// images (76 KB in the report; ~1.5 MB here) goes through the HTTP transport.
+#[tokio::test]
+async fn large_html_body_tool_call_round_trips_over_http() {
+    let base = spawn_server(None).await;
+    let transport = StreamableHttpClientTransport::from_uri(format!("{base}{MCP_PATH}"));
+    let client = ().serve(transport).await.expect("handshake");
+    const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let html = format!(
+        "<p>{}</p><img src=\"data:image/png;base64,{PNG_B64}\">",
+        "lorem ipsum ".repeat(130_000)
+    );
+    let args = serde_json::json!({"email_id": "entry-1|store-1", "html_body": html});
+    let result = client
+        .call_tool(CallToolRequestParams::new("update_draft").with_arguments(args.as_object().unwrap().clone()))
+        .await
+        .expect("a ~1.5 MB update_draft call should succeed");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    client.cancel().await.ok();
+}
