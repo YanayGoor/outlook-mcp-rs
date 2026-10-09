@@ -454,7 +454,7 @@ impl OutlookClient for FakeOutlookClient {
             "inline": inline,
         }))?;
         // Same two attachments as list_attachments: a regular file and an
-        // inline image; filtered like the real client.
+        // inline image. Only `inline` filters here (names are just recorded).
         let all = vec![
             json!({
                 "index": 1, "filename": "report.pdf", "size": 1234, "type": "file",
@@ -467,12 +467,7 @@ impl OutlookClient for FakeOutlookClient {
                 "is_inline": true, "saved_to": save_dir, "status": "saved",
             }),
         ];
-        let wanted: Option<Vec<String>> =
-            attachment_names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
         let results: Vec<Value> = all.into_iter()
-            .filter(|a| wanted.as_ref().is_none_or(|w| {
-                w.contains(&a["filename"].as_str().unwrap_or_default().to_lowercase())
-            }))
             .filter(|a| inline.is_none_or(|want| a["is_inline"] == want))
             .collect();
         if results.is_empty() {
