@@ -2,6 +2,7 @@ pub mod client;
 pub mod com;
 pub mod dates;
 pub mod fake;
+pub mod text_query;
 pub mod types;
 
 use crate::error::ToolError;
