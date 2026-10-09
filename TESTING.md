@@ -106,6 +106,13 @@ subject/sender) is covered by the live suite:
 tool — `mark_complete: true`/`false` on `update_task` now covers completing
 *and* reopening a task) are covered by the live suite:
 `cargo test --test live_outlook -- --ignored list_tasks_filters_and_create_task_additions_round_trip update_task_marks_complete_then_reopens delete_task_removes_it`.
+
+`permanent: true` on `delete_task`, `delete_note` and `delete_event` is covered
+by the live suite (each soft-deletes one probe and finds it in Deleted Items,
+then hard-deletes it from there, and hard-deletes a second probe straight from
+its folder and asserts it never lands in Deleted Items; the meeting probe is
+saved unsent and deleted with `send_cancellation: false`, so nothing is sent):
+`cargo test --test live_outlook -- --ignored permanent_delete_task_skips_deleted_items permanent_delete_note_skips_deleted_items permanent_delete_event_skips_deleted_items permanent_delete_of_unsent_meeting_cancels_quietly_then_skips_deleted_items`.
 `list_tasks`'s `query` filter matching real task body text (not just
 subject) is covered separately by:
 `cargo test --test live_outlook -- --ignored list_tasks_query_matches_real_body_text`.

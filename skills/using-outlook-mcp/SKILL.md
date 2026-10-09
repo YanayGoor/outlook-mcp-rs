@@ -22,7 +22,7 @@ unless they already asked for that exact send in this conversation:
 | `reply_email` | `send` (default true) | `send: false` saves a draft |
 | `create_event` with attendees | `send` (default true) | `send: false` saves unsent |
 | `update_event` on a meeting | `send_update` (default true) | `send_update: false` |
-| `delete_event` you organize | `send_cancellation` (default true) | `send_cancellation: false` |
+| `delete_event` you organize | `send_cancellation` (default true; independent of `permanent`) | `send_cancellation: false` |
 | `respond_to_meeting` | `send` (default true) | `send: false` |
 
 When the user's intent is ambiguous ("write to Dana about…"), make a draft and say so.
@@ -32,8 +32,8 @@ To revise a draft before it goes out, use `update_draft`. It saves the draft and
 
 | Tool | Effect |
 |---|---|
-| `delete_email` (default) | Moves the email to Deleted Items, where it can be recovered |
-| `delete_email` with `permanent: true` | Hard delete, like Shift+Delete. **Can't be recovered from Deleted Items** |
+| `delete_email`, `delete_event`, `delete_task`, `delete_note` (default) | Moves the item to Deleted Items, where it can be recovered |
+| any of those with `permanent: true` | Hard delete, like Shift+Delete. **Can't be recovered from Deleted Items** |
 | `empty_deleted_items` with `confirm: true` | Permanently deletes **everything** in Deleted Items, including the user's own items |
 
 Use `permanent` or `empty_deleted_items` only when the user explicitly asks for a
@@ -83,7 +83,8 @@ permanent delete. Never set `confirm: true` on your own initiative.
 - **Tasks and notes:**
   - `list_tasks` hides completed tasks unless `include_completed` is set.
   - `update_task` with `mark_complete` completes or reopens a task.
-  - Deleting a task, note or event moves it to Deleted Items, where it can be recovered.
+  - Deleting a task, note or event moves it to Deleted Items, where it can be recovered, unless `permanent: true` (see above).
+  - Deleting any event of a recurring series (even via an occurrence id from `list_events`) deletes the whole series.
 
 ## Common mistakes
 

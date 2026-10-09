@@ -150,7 +150,7 @@ The Outlook tools then appear in that client.
 - `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out
 - `update_event` — change an existing event (subject, times, location, body, attendees, reminder, recurrence…); optionally notify attendees
 - `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative)
-- `delete_event` — delete/cancel an event (moves it to Deleted Items); optionally send a cancellation to attendees
+- `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); for a meeting you organize, `send_cancellation` (default true) notifies attendees first, independent of `permanent`. A recurring event's id (including an occurrence's) names the whole series, so the whole series is deleted
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**
@@ -162,14 +162,14 @@ The Outlook tools then appear in that client.
 - `list_tasks` — list Outlook tasks (filter by category, importance, or a text query matching subject or body)
 - `create_task` — create a new Outlook task
 - `update_task` — change an existing task: mark complete/reopen, subject, body, due_date, start_date, importance, add/remove categories, percent_complete, reminder_time
-- `delete_task` — delete a task (moves it to Deleted Items)
+- `delete_task` — delete a task (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**)
 
 **Notes**
 - `list_notes` — list Outlook notes (filter by category or a text query on the body)
 - `get_note` — get the full body of one note by id
 - `create_note` — create a new Outlook note (optional categories, color)
 - `update_note` — change an existing note: body, add/remove categories, color
-- `delete_note` — delete a note (moves it to Deleted Items)
+- `delete_note` — delete a note (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**)
 
 ### Inline images
 
@@ -216,10 +216,11 @@ The binary is produced at `target/release/outlook-mcp-rs.exe`.
 ## Safety and side effects
 
 Most tools are read-only or reversible. By default, deletes move items to Deleted Items
-rather than destroying them. Two deletes are permanent, and both must be asked for
-explicitly:
+rather than destroying them. Permanent deletes must always be asked for explicitly:
 
-- `delete_email` with `permanent=true` hard-deletes one email;
+- `delete_email`, `delete_event`, `delete_task` and `delete_note` with `permanent=true`
+  hard-delete one item (like Shift+Delete; not recoverable from Deleted Items, though
+  Exchange/Microsoft 365 retention may still keep it in Recoverable Items);
 - `empty_deleted_items` with `confirm=true` destroys everything in Deleted Items.
 
 A few tools have real, outbound effects, and these are also explicit in the tool call:
