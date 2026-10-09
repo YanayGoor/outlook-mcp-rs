@@ -268,27 +268,12 @@ fn email_text_matches(item: &IDispatch, query: &str) -> bool {
     text_matches(query, &[&body])
 }
 
-/// `client.py::_parse_dt`: parse a user-supplied ISO date/datetime. Mirrors
-/// Python's `datetime.fromisoformat`, accepting a bare date (`2026-06-10`) or a
-/// date-time with `T` or space separator, with or without seconds/fractional
-/// seconds. The error message mirrors the Python original (with this file's
-/// `{:?}` quoting convention rather than Python's `!r`).
+/// Parses a user-supplied date parameter with the shared grammar in
+/// [`crate::outlook::dates`] (ISO date/datetime, keywords like `today` or
+/// `start_of_week`, offsets like `-14d`), relative to the current local time.
+/// Every date parameter of every tool goes through here.
 fn parse_dt(value: &str, field: &str) -> Result<chrono::NaiveDateTime, ToolError> {
-    let trimmed = value.trim();
-    // Normalize a single space separator to `T` so one set of formats covers
-    // both `2026-06-10T14:30` and `2026-06-10 14:30` (Python 3.11+ accepts it).
-    let normalized = trimmed.replacen(' ', "T", 1);
-    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, fmt) {
-            return Ok(dt);
-        }
-    }
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        return Ok(d.and_hms_opt(0, 0, 0).unwrap());
-    }
-    Err(ToolError::new(format!(
-        "Invalid {field} {value:?}: expected ISO format like '2026-06-10' or '2026-06-10T14:30'"
-    )))
+    Ok(crate::outlook::dates::parse_date_param(value, field)?.at)
 }
 
 /// Adds `address` to `recipients` and marks it required or optional. The

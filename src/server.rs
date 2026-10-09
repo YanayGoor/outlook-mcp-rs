@@ -262,7 +262,8 @@ pub struct RecurrenceParams {
     /// (the event's own start date supplies the month/day).
     #[serde(default)]
     pub day_of_month: Option<i32>,
-    /// End date (ISO). At most one of `until`/`occurrences`; neither = no end date.
+    /// End date (any date form, e.g. '2026-12-31' or 'end_of_year'). At most one of
+    /// `until`/`occurrences`; neither = no end date.
     #[serde(default)]
     pub until: Option<String>,
     /// Number of occurrences. At most one of `until`/`occurrences`.
@@ -372,7 +373,9 @@ pub struct DeleteEventParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckAvailabilityParams {
     pub people: Vec<String>,
+    /// Window start (any date form, e.g. '2026-06-10T09:00' or 'tomorrow+9h').
     pub start: String,
+    /// Window end (any date form).
     pub end: String,
     #[serde(default = "default_interval_minutes")]
     pub interval_minutes: i32,
@@ -903,8 +906,15 @@ impl OutlookMcpServer {
 impl ServerHandler for OutlookMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Controls Microsoft Outlook desktop (email, calendar, tasks, notes) via COM.",
-            )
+            .with_instructions(concat!(
+                "Controls Microsoft Outlook desktop (email, calendar, tasks, notes) via COM. ",
+                "Every date parameter on every tool accepts the same grammar, in local time: ",
+                "an ISO date or datetime ('2026-06-10', '2026-06-10T14:30'); a keyword (now, ",
+                "today, yesterday, tomorrow, start_of_week, end_of_week, start_of_month, ",
+                "end_of_month, start_of_year, end_of_year; weeks start on Monday; today/yesterday/",
+                "tomorrow/start_of_* are midnight, end_of_* is 23:59:59 on the last day) optionally ",
+                "followed by signed offsets ('today-1d', 'start_of_week-1w'); or offsets from now ",
+                "('-14d', '+3h', '-2w'; units m=minutes, h=hours, d=days, w=weeks, mo=months, y=years).",
+            ))
     }
 }
