@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use super::types::*;
 use super::{
-    require_empty_confirm, validate_recurrence_update, CheckAvailabilityInput, CreateEventInput,
+    require_empty_confirm, deleted_note, validate_recurrence_update, CheckAvailabilityInput,
+    CreateEventInput,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate, InlineImage,
 };
@@ -189,7 +190,7 @@ impl OutlookClient for FakeOutlookClient {
 
     fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError> {
         self.record("delete_email", json!({"email_id": email_id, "permanent": permanent}))?;
-        Ok(json!({"status": "deleted", "permanent": permanent}))
+        Ok(json!({"status": "deleted", "permanent": permanent, "note": deleted_note(permanent)}))
     }
 
     fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError> {
@@ -294,9 +295,12 @@ impl OutlookClient for FakeOutlookClient {
         Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
     }
 
-    fn delete_event(&self, event_id: String, send_cancellation: bool) -> Result<Value, ToolError> {
-        self.record("delete_event", json!({"event_id": event_id, "send_cancellation": send_cancellation}))?;
-        Ok(json!({"status": "deleted", "note": "Moved to Deleted Items."}))
+    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
+        -> Result<Value, ToolError> {
+        self.record("delete_event", json!({
+            "event_id": event_id, "send_cancellation": send_cancellation, "permanent": permanent,
+        }))?;
+        Ok(json!({"status": "deleted", "permanent": permanent, "note": deleted_note(permanent)}))
     }
 
     fn check_availability(&self, input: CheckAvailabilityInput) -> Result<AvailabilityResult, ToolError> {
@@ -409,9 +413,9 @@ impl OutlookClient for FakeOutlookClient {
         Ok(json!({"status": "updated", "id": u.task_id, "changed": changed}))
     }
 
-    fn delete_task(&self, task_id: String) -> Result<Value, ToolError> {
-        self.record("delete_task", json!({"task_id": task_id}))?;
-        Ok(json!({"status": "deleted", "note": "Moved to Deleted Items."}))
+    fn delete_task(&self, task_id: String, permanent: bool) -> Result<Value, ToolError> {
+        self.record("delete_task", json!({"task_id": task_id, "permanent": permanent}))?;
+        Ok(json!({"status": "deleted", "permanent": permanent, "note": deleted_note(permanent)}))
     }
 
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError> {
@@ -447,9 +451,9 @@ impl OutlookClient for FakeOutlookClient {
         Ok(json!({"status": "updated", "id": u.note_id, "changed": changed}))
     }
 
-    fn delete_note(&self, note_id: String) -> Result<Value, ToolError> {
-        self.record("delete_note", json!({"note_id": note_id}))?;
-        Ok(json!({"status": "deleted", "note": "Moved to Deleted Items."}))
+    fn delete_note(&self, note_id: String, permanent: bool) -> Result<Value, ToolError> {
+        self.record("delete_note", json!({"note_id": note_id, "permanent": permanent}))?;
+        Ok(json!({"status": "deleted", "permanent": permanent, "note": deleted_note(permanent)}))
     }
 }
 

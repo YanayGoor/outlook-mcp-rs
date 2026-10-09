@@ -27,6 +27,7 @@ use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
     CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
+    deleted_note, delete_event_note,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
     validate_draft_update, DraftUpdate, InlineImage, InlineImageSource, ValidatedInlineImage,
@@ -156,6 +157,46 @@ fn deleted_items_for(ns: &IDispatch, item: &IDispatch) -> Result<IDispatch, Tool
             ns, "GetDefaultFolder", &mut [variant_from_i32(c::OL_FOLDER_DELETED_ITEMS)],
         )?),
     }
+}
+
+/// Delete one item. `permanent = false` is a plain `Delete()`, which moves it
+/// to Deleted Items. `permanent = true` hard-deletes it like Outlook's
+/// shift+delete: OOM has no hard-delete call, but `Delete()` on an item
+/// already in Deleted Items is permanent, so the item is moved to its own
+/// store's Deleted Items first (see [`permanent_delete_needs_move`]).
+/// Shared by `delete_email`, `delete_event`, `delete_task` and `delete_note`.
+fn delete_item(ns: &IDispatch, item: &IDispatch, permanent: bool) -> Result<(), ToolError> {
+    if !permanent {
+        call_method(item, "Delete", &mut [])?;
+        return Ok(());
+    }
+    let deleted = deleted_items_for(ns, item)?;
+    let deleted_id = variant_to_string(&get_property(&deleted, "EntryID")?);
+    // An unreadable parent id just means "move first" (always safe).
+    let parent_id = (|| -> Result<String, ToolError> {
+        let parent = to_disp(get_property(item, "Parent")?)?;
+        Ok(variant_to_string(&get_property(&parent, "EntryID")?))
+    })()
+    .unwrap_or_default();
+    if permanent_delete_needs_move(&parent_id, &deleted_id) {
+        // Move returns the item in its new home, but Delete() on that
+        // returned object is a silent no-op (confirmed with a raw
+        // PowerShell COM probe on an Outlook.com store, with or
+        // without a delay): the item stays in Deleted Items. Re-open
+        // the moved item by EntryID and delete that fresh object.
+        let moved = to_disp(call_method(item, "Move", &mut [VARIANT::from(deleted.clone())])?)?;
+        let moved_id = variant_to_string(&get_property(&moved, "EntryID")?);
+        let store_id = variant_to_string(&get_property(&deleted, "StoreID")?);
+        let fresh = to_disp(call_method(
+            ns,
+            "GetItemFromID",
+            &mut [variant_from_str(&moved_id), variant_from_str(&store_id)],
+        )?)?;
+        call_method(&fresh, "Delete", &mut [])?;
+    } else {
+        call_method(item, "Delete", &mut [])?;
+    }
+    Ok(())
 }
 
 /// `client.py::_resolve_folder`: a well-known folder name maps to a default
@@ -1618,48 +1659,10 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &email_id)?;
             let subject = variant_to_string(&get_property(&item, "Subject")?);
-            if !permanent {
-                call_method(&item, "Delete", &mut [])?;
-                return Ok(json!({
-                    "status": "deleted", "subject": subject, "permanent": false,
-                    "note": "Moved to Deleted Items.",
-                }));
-            }
-
-            // OOM has no hard-delete call; Delete() on an item already in
-            // Deleted Items is permanent, so move it there first (Outlook's
-            // shift+delete).
-            let deleted = deleted_items_for(&ns, &item)?;
-            let deleted_id = variant_to_string(&get_property(&deleted, "EntryID")?);
-            // An unreadable parent id just means "move first" (always safe).
-            let parent_id = (|| -> Result<String, ToolError> {
-                let parent = to_disp(get_property(&item, "Parent")?)?;
-                Ok(variant_to_string(&get_property(&parent, "EntryID")?))
-            })()
-            .unwrap_or_default();
-            if permanent_delete_needs_move(&parent_id, &deleted_id) {
-                // Move returns the item in its new home, but Delete() on that
-                // returned object is a silent no-op (confirmed with a raw
-                // PowerShell COM probe on an Outlook.com store, with or
-                // without a delay): the item stays in Deleted Items. Re-open
-                // the moved item by EntryID and delete that fresh object.
-                let moved = to_disp(call_method(
-                    &item, "Move", &mut [VARIANT::from(deleted.clone())],
-                )?)?;
-                let moved_id = variant_to_string(&get_property(&moved, "EntryID")?);
-                let store_id = variant_to_string(&get_property(&deleted, "StoreID")?);
-                let fresh = to_disp(call_method(
-                    &ns,
-                    "GetItemFromID",
-                    &mut [variant_from_str(&moved_id), variant_from_str(&store_id)],
-                )?)?;
-                call_method(&fresh, "Delete", &mut [])?;
-            } else {
-                call_method(&item, "Delete", &mut [])?;
-            }
+            delete_item(&ns, &item, permanent)?;
             Ok(json!({
-                "status": "deleted", "subject": subject, "permanent": true,
-                "note": "Permanently deleted (not recoverable from Deleted Items).",
+                "status": "deleted", "subject": subject, "permanent": permanent,
+                "note": deleted_note(permanent),
             }))
         })
     }
@@ -2032,28 +2035,32 @@ impl OutlookClient for WindowsOutlookClient {
         })
     }
 
-    fn delete_event(&self, event_id: String, send_cancellation: bool) -> Result<Value, ToolError> {
+    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
+        -> Result<Value, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
+            // An occurrence id from list_events carries the series master's
+            // EntryID, so this is always the whole series (or a single
+            // non-recurring event): soft or permanent, the series goes.
             let item = get_item(&ns, &event_id)?;
             let subject = variant_to_string(&get_property(&item, "Subject")?);
             let meeting_status =
                 variant_to_i32(&get_property(&item, "MeetingStatus")?).unwrap_or(c::OL_NONMEETING);
-            let note = if meeting_status == c::OL_MEETING {
-                // You organize this meeting: mark it canceled, optionally
-                // notify attendees, then remove your own copy.
+            let organized_meeting = meeting_status == c::OL_MEETING;
+            if organized_meeting {
+                // You organize this meeting: mark it canceled and optionally
+                // notify attendees *before* removing your own copy, so a
+                // permanent delete never loses the cancellation.
                 put_property(&item, "MeetingStatus", variant_from_i32(c::OL_MEETING_CANCELED))?;
                 if send_cancellation {
                     call_method(&item, "Send", &mut [])?;
-                    "Meeting canceled; attendees notified. Moved to Deleted Items."
-                } else {
-                    "Meeting canceled without notifying attendees. Moved to Deleted Items."
                 }
-            } else {
-                "Moved to Deleted Items."
-            };
-            call_method(&item, "Delete", &mut [])?;
-            Ok(json!({"status": "deleted", "subject": subject, "note": note}))
+            }
+            delete_item(&ns, &item, permanent)?;
+            Ok(json!({
+                "status": "deleted", "subject": subject, "permanent": permanent,
+                "note": delete_event_note(organized_meeting, send_cancellation, permanent),
+            }))
         })
     }
 
@@ -2437,13 +2444,16 @@ impl OutlookClient for WindowsOutlookClient {
         })
     }
 
-    fn delete_task(&self, task_id: String) -> Result<Value, ToolError> {
+    fn delete_task(&self, task_id: String, permanent: bool) -> Result<Value, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &task_id)?;
             let subject = variant_to_string(&get_property(&item, "Subject")?);
-            call_method(&item, "Delete", &mut [])?;
-            Ok(json!({"status": "deleted", "subject": subject, "note": "Moved to Deleted Items."}))
+            delete_item(&ns, &item, permanent)?;
+            Ok(json!({
+                "status": "deleted", "subject": subject, "permanent": permanent,
+                "note": deleted_note(permanent),
+            }))
         })
     }
 
@@ -2566,12 +2576,12 @@ impl OutlookClient for WindowsOutlookClient {
         })
     }
 
-    fn delete_note(&self, note_id: String) -> Result<Value, ToolError> {
+    fn delete_note(&self, note_id: String, permanent: bool) -> Result<Value, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &note_id)?;
-            call_method(&item, "Delete", &mut [])?;
-            Ok(json!({"status": "deleted", "note": "Moved to Deleted Items."}))
+            delete_item(&ns, &item, permanent)?;
+            Ok(json!({"status": "deleted", "permanent": permanent, "note": deleted_note(permanent)}))
         })
     }
 }

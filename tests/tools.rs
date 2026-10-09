@@ -1032,6 +1032,7 @@ async fn delete_event_returns_deleted_status() {
         .delete_event(Parameters(DeleteEventParams {
             event_id: EVENT_ID.to_string(),
             send_cancellation: true,
+            permanent: false,
         }))
         .await
         .unwrap();
@@ -1039,6 +1040,47 @@ async fn delete_event_returns_deleted_status() {
     let (name, args) = fake.calls().pop().unwrap();
     assert_eq!(name, "delete_event");
     assert_eq!(args["send_cancellation"], true);
+}
+
+#[tokio::test]
+async fn delete_event_defaults_to_soft_delete_with_cancellation() {
+    use outlook_mcp_rs::outlook::fake::EVENT_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // send_cancellation and permanent omitted → serde defaults true / false.
+    let params: DeleteEventParams =
+        serde_json::from_value(json!({"event_id": EVENT_ID})).unwrap();
+    let result = server.delete_event(Parameters(params)).await.unwrap();
+    let v = result_json(&result);
+    assert_eq!(v["permanent"], false);
+    assert_eq!(v["note"], "Moved to Deleted Items.");
+    assert_eq!(
+        fake.calls(),
+        vec![(
+            "delete_event".to_string(),
+            json!({"event_id": EVENT_ID, "send_cancellation": true, "permanent": false})
+        )]
+    );
+}
+
+#[tokio::test]
+async fn delete_event_forwards_permanent_independent_of_send_cancellation() {
+    use outlook_mcp_rs::outlook::fake::EVENT_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: DeleteEventParams = serde_json::from_value(
+        json!({"event_id": EVENT_ID, "send_cancellation": false, "permanent": true}),
+    )
+    .unwrap();
+    let result = server.delete_event(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["permanent"], true);
+    assert_eq!(
+        fake.calls(),
+        vec![(
+            "delete_event".to_string(),
+            json!({"event_id": EVENT_ID, "send_cancellation": false, "permanent": true})
+        )]
+    );
 }
 
 #[tokio::test]
@@ -1327,7 +1369,7 @@ async fn delete_task_records_call() {
     let server = OutlookMcpServer::new(fake.clone());
     use outlook_mcp_rs::outlook::fake::TASK_ID;
     let result = server
-        .delete_task(Parameters(DeleteTaskParams { task_id: TASK_ID.to_string() }))
+        .delete_task(Parameters(DeleteTaskParams { task_id: TASK_ID.to_string(), permanent: false }))
         .await
         .unwrap();
     let json = result_json(&result);
@@ -1335,6 +1377,40 @@ async fn delete_task_records_call() {
     let (name, args) = &fake.calls()[0];
     assert_eq!(name, "delete_task");
     assert_eq!(args["task_id"], TASK_ID);
+}
+
+#[tokio::test]
+async fn delete_task_defaults_to_soft_delete() {
+    use outlook_mcp_rs::outlook::fake::TASK_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // permanent omitted → serde default false.
+    let params: DeleteTaskParams = serde_json::from_value(json!({"task_id": TASK_ID})).unwrap();
+    let result = server.delete_task(Parameters(params)).await.unwrap();
+    let v = result_json(&result);
+    assert_eq!(v["permanent"], false);
+    assert_eq!(v["note"], "Moved to Deleted Items.");
+    assert_eq!(
+        fake.calls(),
+        vec![("delete_task".to_string(), json!({"task_id": TASK_ID, "permanent": false}))]
+    );
+}
+
+#[tokio::test]
+async fn delete_task_forwards_permanent() {
+    use outlook_mcp_rs::outlook::fake::TASK_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: DeleteTaskParams =
+        serde_json::from_value(json!({"task_id": TASK_ID, "permanent": true})).unwrap();
+    let result = server.delete_task(Parameters(params)).await.unwrap();
+    let v = result_json(&result);
+    assert_eq!(v["permanent"], true);
+    assert_eq!(v["note"], "Permanently deleted (not recoverable from Deleted Items).");
+    assert_eq!(
+        fake.calls(),
+        vec![("delete_task".to_string(), json!({"task_id": TASK_ID, "permanent": true}))]
+    );
 }
 
 // ---- Notes ----
@@ -1476,7 +1552,7 @@ async fn delete_note_records_call() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
-        .delete_note(Parameters(DeleteNoteParams { note_id: NOTE_ID.to_string() }))
+        .delete_note(Parameters(DeleteNoteParams { note_id: NOTE_ID.to_string(), permanent: false }))
         .await
         .unwrap();
     let json = result_json(&result);
@@ -1484,4 +1560,34 @@ async fn delete_note_records_call() {
     let (name, args) = &fake.calls()[0];
     assert_eq!(name, "delete_note");
     assert_eq!(args["note_id"], NOTE_ID);
+}
+
+#[tokio::test]
+async fn delete_note_defaults_to_soft_delete() {
+    use outlook_mcp_rs::outlook::fake::NOTE_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // permanent omitted → serde default false.
+    let params: DeleteNoteParams = serde_json::from_value(json!({"note_id": NOTE_ID})).unwrap();
+    let result = server.delete_note(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["permanent"], false);
+    assert_eq!(
+        fake.calls(),
+        vec![("delete_note".to_string(), json!({"note_id": NOTE_ID, "permanent": false}))]
+    );
+}
+
+#[tokio::test]
+async fn delete_note_forwards_permanent() {
+    use outlook_mcp_rs::outlook::fake::NOTE_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: DeleteNoteParams =
+        serde_json::from_value(json!({"note_id": NOTE_ID, "permanent": true})).unwrap();
+    let result = server.delete_note(Parameters(params)).await.unwrap();
+    assert_eq!(result_json(&result)["permanent"], true);
+    assert_eq!(
+        fake.calls(),
+        vec![("delete_note".to_string(), json!({"note_id": NOTE_ID, "permanent": true}))]
+    );
 }

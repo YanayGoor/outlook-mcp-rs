@@ -365,8 +365,13 @@ pub struct UpdateEventParams {
 pub struct DeleteEventParams {
     pub event_id: String,
     /// If you organize the meeting, notify attendees of the cancellation (default true).
+    /// Independent of `permanent`: the cancellation is sent before the delete.
     #[serde(default = "default_true")]
     pub send_cancellation: bool,
+    /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
+    /// moves the event to Deleted Items.
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -477,6 +482,10 @@ pub struct UpdateTaskParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteTaskParams {
     pub task_id: String,
+    /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
+    /// moves the task to Deleted Items.
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 // ---- Notes ----
@@ -524,6 +533,10 @@ pub struct UpdateNoteParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteNoteParams {
     pub note_id: String,
+    /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
+    /// moves the note to Deleted Items.
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 #[tool_router]
@@ -731,13 +744,15 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Delete/cancel a calendar event (moves it to Deleted Items). If you organize the meeting, send_cancellation (default true) notifies attendees; if false, it's canceled quietly.")]
+    #[tool(description = "Delete/cancel a calendar event. If you organize the meeting, send_cancellation (default true) notifies attendees; if false, it's canceled quietly; this is independent of permanent (the cancellation is sent first). For a recurring event, the id (including an occurrence's id from list_events) names the whole series, so the whole series is deleted. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
     pub async fn delete_event(
         &self,
-        Parameters(DeleteEventParams { event_id, send_cancellation }): Parameters<DeleteEventParams>,
+        Parameters(DeleteEventParams { event_id, send_cancellation, permanent }):
+            Parameters<DeleteEventParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.delete_event(event_id, send_cancellation)).await?;
+        let result =
+            run_blocking(move || client.delete_event(event_id, send_cancellation, permanent)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
@@ -831,13 +846,13 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Delete a task (moves it to Deleted Items).")]
+    #[tool(description = "Delete a task. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
     pub async fn delete_task(
         &self,
-        Parameters(DeleteTaskParams { task_id }): Parameters<DeleteTaskParams>,
+        Parameters(DeleteTaskParams { task_id, permanent }): Parameters<DeleteTaskParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.delete_task(task_id)).await?;
+        let result = run_blocking(move || client.delete_task(task_id, permanent)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
@@ -888,13 +903,13 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Delete a note (moves it to Deleted Items).")]
+    #[tool(description = "Delete a note. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
     pub async fn delete_note(
         &self,
-        Parameters(DeleteNoteParams { note_id }): Parameters<DeleteNoteParams>,
+        Parameters(DeleteNoteParams { note_id, permanent }): Parameters<DeleteNoteParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.delete_note(note_id)).await?;
+        let result = run_blocking(move || client.delete_note(note_id, permanent)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 }

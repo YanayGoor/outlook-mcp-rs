@@ -294,7 +294,11 @@ pub trait OutlookClient: Send + Sync {
     fn respond_to_meeting(&self, event_id: String, response: String,
         comment: Option<String>, send: bool) -> Result<Value, ToolError>;
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError>;
-    fn delete_event(&self, event_id: String, send_cancellation: bool) -> Result<Value, ToolError>;
+    /// `permanent` as in [`OutlookClient::delete_email`]. For a meeting you
+    /// organize, `send_cancellation` (independent of `permanent`) decides
+    /// whether attendees are notified before your copy is deleted.
+    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
+        -> Result<Value, ToolError>;
     fn check_availability(&self, input: CheckAvailabilityInput) -> Result<AvailabilityResult, ToolError>;
 
     fn list_attachments(&self, email_id: String)
@@ -309,13 +313,15 @@ pub trait OutlookClient: Send + Sync {
         due_date: Option<String>, importance: String, categories: Option<Vec<String>>,
         start_date: Option<String>, reminder_time: Option<String>) -> Result<Value, ToolError>;
     fn update_task(&self, u: TaskUpdate) -> Result<Value, ToolError>;
-    fn delete_task(&self, task_id: String) -> Result<Value, ToolError>;
+    /// `permanent` as in [`OutlookClient::delete_email`].
+    fn delete_task(&self, task_id: String, permanent: bool) -> Result<Value, ToolError>;
 
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError>;
     fn get_note(&self, note_id: String) -> Result<NoteDetail, ToolError>;
     fn create_note(&self, body: String, categories: Option<Vec<String>>, color: Option<String>) -> Result<Value, ToolError>;
     fn update_note(&self, u: NoteUpdate) -> Result<Value, ToolError>;
-    fn delete_note(&self, note_id: String) -> Result<Value, ToolError>;
+    /// `permanent` as in [`OutlookClient::delete_email`].
+    fn delete_note(&self, note_id: String, permanent: bool) -> Result<Value, ToolError>;
 }
 
 /// Guard for `empty_deleted_items`: it is irreversible, so it refuses unless
@@ -332,12 +338,35 @@ pub fn require_empty_confirm(confirm: bool) -> Result<(), ToolError> {
     ))
 }
 
-/// Whether a permanent `delete_email` must first move the item into Deleted
+/// Whether a permanent delete (`delete_email`/`delete_event`/`delete_task`/
+/// `delete_note`) must first move the item into Deleted
 /// Items. The object model has no hard-delete call, but `Delete()` on an item
 /// already in Deleted Items is permanent; so move there unless the item's
 /// parent folder already is that folder (EntryIDs compared exactly).
 pub fn permanent_delete_needs_move(parent_entry_id: &str, deleted_items_entry_id: &str) -> bool {
     parent_entry_id.is_empty() || parent_entry_id != deleted_items_entry_id
+}
+
+/// The `note` every `delete_*` tool returns for where the item went.
+pub fn deleted_note(permanent: bool) -> &'static str {
+    if permanent {
+        "Permanently deleted (not recoverable from Deleted Items)."
+    } else {
+        "Moved to Deleted Items."
+    }
+}
+
+/// `delete_event`'s `note`: whether a meeting you organize was canceled (and
+/// whether attendees were notified), then where your own copy went.
+/// `send_cancellation` only matters for an organized meeting and is
+/// independent of `permanent`.
+pub fn delete_event_note(organized_meeting: bool, send_cancellation: bool, permanent: bool) -> String {
+    let deleted = deleted_note(permanent);
+    match (organized_meeting, send_cancellation) {
+        (false, _) => deleted.to_string(),
+        (true, true) => format!("Meeting canceled; attendees notified. {deleted}"),
+        (true, false) => format!("Meeting canceled without notifying attendees. {deleted}"),
+    }
 }
 
 /// The status string `create_event` returns: `"meeting_sent"` (attendees +
@@ -887,6 +916,7 @@ mod tests {
         com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
         parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
         EventUpdate, RecurrenceInput, permanent_delete_needs_move, require_empty_confirm,
+        deleted_note, delete_event_note,
         draft_update_changes, validate_draft_update, DraftUpdate,
     };
     use std::cell::Cell;
@@ -952,6 +982,39 @@ mod tests {
         assert!(err.to_string().contains("confirm=true"));
         assert!(err.to_string().contains("cannot be undone"));
         assert!(require_empty_confirm(true).is_ok());
+    }
+
+    #[test]
+    fn deleted_note_names_where_the_item_went() {
+        assert_eq!(deleted_note(false), "Moved to Deleted Items.");
+        assert_eq!(deleted_note(true), "Permanently deleted (not recoverable from Deleted Items).");
+    }
+
+    #[test]
+    fn delete_event_note_keeps_cancellation_independent_of_permanent() {
+        assert_eq!(delete_event_note(false, true, false), "Moved to Deleted Items.");
+        assert_eq!(
+            delete_event_note(false, false, true),
+            "Permanently deleted (not recoverable from Deleted Items)."
+        );
+        assert_eq!(
+            delete_event_note(true, true, false),
+            "Meeting canceled; attendees notified. Moved to Deleted Items."
+        );
+        assert_eq!(
+            delete_event_note(true, false, false),
+            "Meeting canceled without notifying attendees. Moved to Deleted Items."
+        );
+        assert_eq!(
+            delete_event_note(true, true, true),
+            "Meeting canceled; attendees notified. \
+             Permanently deleted (not recoverable from Deleted Items)."
+        );
+        assert_eq!(
+            delete_event_note(true, false, true),
+            "Meeting canceled without notifying attendees. \
+             Permanently deleted (not recoverable from Deleted Items)."
+        );
     }
 
     #[test]

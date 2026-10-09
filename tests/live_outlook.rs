@@ -103,6 +103,152 @@ fn permanent_delete_of_draft_skips_deleted_items() {
     );
 }
 
+/// Ids of everything in Deleted Items whose subject is exactly `subject`
+/// (list_emails reads any item class there, including tasks, notes and
+/// appointments).
+fn deleted_items_with_subject(c: &WindowsOutlookClient, subject: &str) -> Vec<String> {
+    c.list_emails(EmailQuery {
+        query: Some(subject.to_string()), folder: "deleted".into(), count: 50, offset: 0,
+        unread_only: false, from: None, to: None, category: None, received_after: None,
+        received_before: None, since_days: None, has_attachments: None,
+        flagged: false, high_importance: false,
+    })
+    .expect("list_emails on Deleted Items should succeed")
+    .into_iter()
+    .filter(|e| e.subject == subject)
+    .map(|e| e.id)
+    .collect()
+}
+
+/// Shared shape of the permanent-delete live tests for tasks/notes/events:
+/// 1. soft-delete item A and find it in Deleted Items (proves the probe can
+///    see this item class), then permanently delete it from there (the
+///    "already in Deleted Items, no move" path);
+/// 2. permanently delete item B straight from its own folder (the
+///    move-then-delete path) and assert it never lands in Deleted Items.
+fn assert_permanent_delete_skips_deleted_items(
+    c: &WindowsOutlookClient,
+    subject: &str,
+    create: impl Fn() -> String,
+    delete: impl Fn(String, bool) -> serde_json::Value,
+) {
+    let a = create();
+    let soft = delete(a, false);
+    assert_eq!(soft["permanent"], false);
+    let found = deleted_items_with_subject(c, subject);
+    assert_eq!(found.len(), 1, "a soft-deleted item must be visible in Deleted Items");
+    let hard = delete(found[0].clone(), true);
+    assert_eq!(hard["permanent"], true);
+    assert!(
+        deleted_items_with_subject(c, subject).is_empty(),
+        "permanently deleting from Deleted Items must remove it"
+    );
+
+    let b = create();
+    let hard = delete(b, true);
+    assert_eq!(hard["status"], "deleted");
+    assert_eq!(hard["permanent"], true);
+    assert!(
+        deleted_items_with_subject(c, subject).is_empty(),
+        "a permanently deleted item must not remain in Deleted Items"
+    );
+}
+
+#[test]
+#[ignore]
+fn permanent_delete_task_skips_deleted_items() {
+    let c = client();
+    let subject = "outlook-mcp-rs permanent delete task probe zzqx-7732";
+    assert_permanent_delete_skips_deleted_items(
+        &c,
+        subject,
+        || {
+            let created = c.create_task(
+                subject.to_string(), None, None, "normal".to_string(), None, None, None,
+            ).expect("create_task should succeed");
+            created["id"].as_str().unwrap().to_string()
+        },
+        |id, permanent| c.delete_task(id, permanent).expect("delete_task should succeed"),
+    );
+}
+
+#[test]
+#[ignore]
+fn permanent_delete_note_skips_deleted_items() {
+    let c = client();
+    // A note's subject is its body's first line.
+    let subject = "outlook-mcp-rs permanent delete note probe zzqx-7733";
+    assert_permanent_delete_skips_deleted_items(
+        &c,
+        subject,
+        || {
+            let created = c.create_note(subject.to_string(), None, None)
+                .expect("create_note should succeed");
+            created["id"].as_str().unwrap().to_string()
+        },
+        |id, permanent| c.delete_note(id, permanent).expect("delete_note should succeed"),
+    );
+}
+
+#[test]
+#[ignore]
+fn permanent_delete_event_skips_deleted_items() {
+    let c = client();
+    let subject = "outlook-mcp-rs permanent delete event probe zzqx-7734";
+    assert_permanent_delete_skips_deleted_items(
+        &c,
+        subject,
+        || {
+            let created = c.create_event(CreateEventInput {
+                subject: subject.to_string(),
+                start: "2099-01-09T09:00".to_string(),
+                end: "2099-01-09T09:30".to_string(),
+                body: None, location: None, required_attendees: None, optional_attendees: None,
+                all_day: false, reminder_minutes: None, categories: None, show_as: None,
+                send: true, // no attendees present, so this just Saves — nothing is sent
+                recurrence: None,
+            }).expect("create_event should succeed");
+            created["id"].as_str().unwrap().to_string()
+        },
+        // Personal appointment: send_cancellation has nothing to cancel.
+        |id, permanent| c.delete_event(id, true, permanent).expect("delete_event should succeed"),
+    );
+}
+
+#[test]
+#[ignore]
+fn permanent_delete_of_unsent_meeting_cancels_quietly_then_skips_deleted_items() {
+    let c = client();
+    let subject = "outlook-mcp-rs permanent delete meeting probe zzqx-7735";
+    // Saved, never sent (send: false), and deleted with send_cancellation
+    // false, so nothing ever reaches the example.com attendee.
+    let created = c.create_event(CreateEventInput {
+        subject: subject.to_string(),
+        start: "2099-01-10T09:00".to_string(),
+        end: "2099-01-10T09:30".to_string(),
+        body: None, location: None,
+        required_attendees: Some(vec!["required-probe@example.com".to_string()]),
+        optional_attendees: None,
+        all_day: false, reminder_minutes: None, categories: None, show_as: None,
+        send: false,
+        recurrence: None,
+    }).expect("create_event should succeed");
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let deleted = c.delete_event(id.clone(), false, true).expect("delete_event should succeed");
+    assert_eq!(deleted["permanent"], true);
+    assert_eq!(
+        deleted["note"],
+        "Meeting canceled without notifying attendees. \
+         Permanently deleted (not recoverable from Deleted Items)."
+    );
+    assert!(c.get_event(id).is_err(), "deleted meeting's id should no longer resolve");
+    assert!(
+        deleted_items_with_subject(&c, subject).is_empty(),
+        "a permanently deleted meeting must not remain in Deleted Items"
+    );
+}
+
 #[test]
 #[ignore]
 fn create_task_update_task_marks_complete() {
@@ -117,7 +263,7 @@ fn create_task_update_task_marks_complete() {
     let tasks = c.list_tasks(TaskQuery { include_completed: true, ..Default::default() })
         .expect("list_tasks should succeed");
     assert!(tasks.iter().any(|t| t.id == id && t.complete));
-    c.delete_task(id).expect("cleanup delete_task");
+    c.delete_task(id, false).expect("cleanup delete_task");
 }
 
 #[test]
@@ -146,7 +292,7 @@ fn create_event_then_delete_it() {
     }).expect("create_event should succeed");
     let id = created["id"].as_str().unwrap().to_string();
     let _ = c.get_event(id.clone()).expect("get_event should round-trip before cleanup");
-    c.delete_event(id, true).expect("cleanup delete_event");
+    c.delete_event(id, true, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -178,7 +324,7 @@ fn create_event_with_tiers_categories_and_show_as() {
     assert!(detail.summary.categories.iter().any(|cat| cat == "Work"));
     assert_eq!(detail.summary.show_as, "tentative");
     assert!(detail.summary.is_meeting);
-    c.delete_event(id, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -231,7 +377,7 @@ fn update_event_edits_fields_and_manages_attendees() {
     assert!(!detail.summary.required_attendees.contains("required-probe@example.com"));
     assert!(detail.summary.optional_attendees.contains("optional-probe@example.com"));
 
-    c.delete_event(id, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -249,7 +395,7 @@ fn delete_event_removes_a_personal_appointment() {
     }).expect("create_event should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let deleted = c.delete_event(id.clone(), true).expect("delete_event should succeed");
+    let deleted = c.delete_event(id.clone(), true, false).expect("delete_event should succeed");
     assert_eq!(deleted["status"], "deleted");
     assert_eq!(deleted["note"], "Moved to Deleted Items.");
 
@@ -800,7 +946,7 @@ fn create_event_weekly_recurrence_round_trips() {
     assert_eq!(recurrence.occurrences, Some(10));
     assert!(!recurrence.no_end);
 
-    c.delete_event(id, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -839,7 +985,7 @@ fn create_event_monthly_recurrence_with_until_round_trips() {
     // here rather than asserted absent.
     assert_eq!(recurrence.occurrences, Some(6));
 
-    c.delete_event(id, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -873,7 +1019,7 @@ fn create_event_yearly_recurrence_with_no_end_round_trips() {
     assert!(recurrence.until.is_none());
     assert!(recurrence.occurrences.is_none());
 
-    c.delete_event(id, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -933,7 +1079,7 @@ fn update_event_changes_then_clears_recurrence() {
     assert!(!detail.summary.is_recurring);
     assert!(detail.recurrence.is_none());
 
-    c.delete_event(id, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -1017,7 +1163,7 @@ fn list_tasks_filters_and_create_task_additions_round_trip() {
     }).expect("list_tasks should succeed");
     assert!(found.iter().any(|t| t.id == id), "filtered list_tasks should find the new task");
 
-    c.delete_task(id).expect("cleanup delete_task");
+    c.delete_task(id, false).expect("cleanup delete_task");
 }
 
 #[test]
@@ -1039,7 +1185,7 @@ fn list_tasks_query_matches_real_body_text() {
         query: Some(token.to_string()),
     }).expect("list_tasks query should succeed");
 
-    c.delete_task(id.clone()).expect("cleanup: delete the task");
+    c.delete_task(id.clone(), false).expect("cleanup: delete the task");
 
     assert!(
         found.iter().any(|t| t.id == id),
@@ -1077,7 +1223,7 @@ fn update_task_marks_complete_then_reopens() {
     }).expect("update_task reopen should succeed");
     assert!(reopened["changed"].as_array().unwrap().iter().any(|v| v == "mark_complete"));
 
-    c.delete_task(id).expect("cleanup delete_task");
+    c.delete_task(id, false).expect("cleanup delete_task");
 }
 
 #[test]
@@ -1090,7 +1236,7 @@ fn delete_task_removes_it() {
     ).expect("create_task should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let deleted = c.delete_task(id).expect("delete_task should succeed");
+    let deleted = c.delete_task(id, false).expect("delete_task should succeed");
     assert_eq!(deleted["status"], "deleted");
 }
 
@@ -1111,7 +1257,7 @@ fn list_notes_filters_and_create_note_additions_round_trip() {
     }).expect("list_notes should succeed");
     assert!(found.iter().any(|n| n.id == id), "filtered list_notes should find the new note");
 
-    c.delete_note(id).expect("cleanup delete_note");
+    c.delete_note(id, false).expect("cleanup delete_note");
 }
 
 #[test]
@@ -1144,7 +1290,7 @@ fn get_note_includes_modified_after_update() {
         "modified ({after_modified}) should not go backwards after update_note ({before_modified})");
     assert!(note.body.starts_with("outlook-mcp-rs P12 live modified probe (edited)"));
 
-    c.delete_note(id).expect("cleanup delete_note");
+    c.delete_note(id, false).expect("cleanup delete_note");
 }
 
 #[test]
@@ -1168,7 +1314,7 @@ fn update_note_manages_categories_and_color() {
     let note = c.get_note(id.clone()).expect("get_note should succeed");
     assert!(note.summary.categories.iter().any(|cat| cat == "Blue Category"));
 
-    c.delete_note(id).expect("cleanup delete_note");
+    c.delete_note(id, false).expect("cleanup delete_note");
 }
 
 #[test]
@@ -1180,7 +1326,7 @@ fn delete_note_removes_it() {
     ).expect("create_note should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let deleted = c.delete_note(id).expect("delete_note should succeed");
+    let deleted = c.delete_note(id, false).expect("delete_note should succeed");
     assert_eq!(deleted["status"], "deleted");
 }
 

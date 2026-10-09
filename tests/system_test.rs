@@ -807,7 +807,7 @@ fn system_test_plans_1_to_9() {
         for label in ["B2", "B4", "B5"] {
             if let Some(pos) = cleanup_events.iter().position(|(l, _, _)| l == label) {
                 let (_, id, send_cancellation) = cleanup_events.remove(pos);
-                match c.delete_event(id, send_cancellation) {
+                match c.delete_event(id, send_cancellation, false) {
                     Ok(v) => notes.push(format!("{label}: {}", v["status"])),
                     Err(e) => { ok = false; notes.push(format!("{label} FAILED: {e}")); }
                 }
@@ -831,7 +831,7 @@ fn system_test_plans_1_to_9() {
         }
     }
     for (label, id, _) in cleanup_events {
-        match c.delete_event(id.clone(), false) {
+        match c.delete_event(id.clone(), false, false) {
             Ok(_) => println!("cleaned up event {label} ({id})"),
             Err(e) => {
                 println!("FAILED to clean up event {label} ({id}): {e}");
