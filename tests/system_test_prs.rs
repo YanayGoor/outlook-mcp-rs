@@ -63,8 +63,8 @@ impl Results {
 fn q(folder: &str) -> EmailQuery {
     EmailQuery {
         query: None, folder: folder.to_string(), count: 50, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }
 }
 
@@ -213,7 +213,7 @@ fn system_test_open_prs_14_to_25() {
     // ================= PR #15: non-ASCII search =================
     println!("\n--- PR #15 ---");
     let search = |query: &str, to: Option<&str>| -> Result<HashSet<String>, String> {
-        c.list_emails(EmailQuery { query: Some(query.to_string()), to: to.map(str::to_string), ..q("drafts") })
+        c.list_emails(EmailQuery { query: Some(query.to_string()), to: to.map(str::to_string).into_iter().collect(), ..q("drafts") })
             .map(|l| ids(&l))
             .map_err(|e| e.0)
     };
@@ -240,7 +240,7 @@ fn system_test_open_prs_14_to_25() {
     // ================= PR #17: to filter =================
     println!("\n--- PR #17 ---");
     let to_search = |to: &str| -> Result<HashSet<String>, String> {
-        c.list_emails(EmailQuery { query: Some("to-".to_string()), to: Some(to.to_string()), count: 200, ..q("drafts") })
+        c.list_emails(EmailQuery { query: Some("to-".to_string()), to: vec![to.to_string()], count: 200, ..q("drafts") })
             .map(|l| l.iter().filter(|e| e.subject.contains(&run)).map(|e| e.id.clone()).collect())
             .map_err(|e| e.0)
     };

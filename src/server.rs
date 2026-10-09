@@ -9,6 +9,9 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::error::ToolError;
+use crate::outlook::filters::{self, normalize_choices};
+use crate::outlook::{DEFAULT_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
+use crate::params::OneOrMany;
 use crate::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 
 /// Runs a blocking `OutlookClient` call on a dedicated blocking thread so the
@@ -41,10 +44,15 @@ impl OutlookMcpServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListEmailsParams {
+    /// Text search. Terms are ANDed, case-insensitive, any language;
+    /// "quoted phrase" keeps words together; * is a wildcard; field:term
+    /// limits a term to subject, from, to or body. Unscoped terms search
+    /// subject, sender and body.
     #[serde(default)]
     pub query: Option<String>,
     #[serde(default = "default_folder")]
     pub folder: String,
+    /// Page size: default 10, max 200.
     #[serde(default = "default_count")]
     pub count: i32,
     /// Matches to skip before this page starts (default 0). To page, call
@@ -53,27 +61,47 @@ pub struct ListEmailsParams {
     pub offset: i32,
     #[serde(default)]
     pub unread_only: bool,
+    /// Sender name or address (caseless substring); a list matches any of them.
     #[serde(default)]
-    pub from: Option<String>,
+    pub from: Option<OneOrMany<String>>,
+    /// To/CC recipient name or address (caseless substring); a list matches any of them.
     #[serde(default)]
-    pub to: Option<String>,
+    pub to: Option<OneOrMany<String>>,
+    /// Category name; a list matches any of them.
     #[serde(default)]
-    pub category: Option<String>,
+    pub category: Option<OneOrMany<String>>,
+    /// Received at or after this date, e.g. '2026-06-01', 'start_of_week', '-14d'.
     #[serde(default)]
     pub received_after: Option<String>,
+    /// Received at or before this date; a bare date like '2026-06-30'
+    /// includes that whole day, 'today' means before today.
     #[serde(default)]
     pub received_before: Option<String>,
+    /// Deprecated: use received_after: "-<N>d" instead.
     #[serde(default)]
     pub since_days: Option<i32>,
     #[serde(default)]
     pub has_attachments: Option<bool>,
+    /// Item type as get_email reports it: "email" | "meeting" | "bounce" |
+    /// "read_receipt" | "other"; a list matches any of them.
+    #[serde(default)]
+    pub item_type: Option<OneOrMany<String>>,
+    /// "low" | "normal" | "high"; a list matches any of them.
+    #[serde(default)]
+    pub importance: Option<OneOrMany<String>>,
+    /// Flag state, same values as update_email's flag: "follow_up" |
+    /// "complete" | "clear" (not flagged); a list matches any of them.
+    #[serde(default)]
+    pub flag: Option<OneOrMany<String>>,
+    /// Deprecated: use flag: ["follow_up", "complete"] instead.
     #[serde(default)]
     pub flagged: bool,
+    /// Deprecated: use importance: "high" instead.
     #[serde(default)]
     pub high_importance: bool,
 }
 fn default_folder() -> String { "inbox".to_string() }
-fn default_count() -> i32 { 10 }
+fn default_count() -> i32 { DEFAULT_EMAIL_COUNT }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetEmailParams {
@@ -210,25 +238,33 @@ pub struct EmptyDeletedItemsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListEventsParams {
-    #[serde(default)]
-    pub start_date: Option<String>,
-    #[serde(default)]
-    pub end_date: Option<String>,
-    /// Text match on subject + location.
+    /// Events starting at or after this date (default today 00:00), e.g.
+    /// '2026-06-10', 'start_of_week', '-1d'. `start_date` is a deprecated alias.
+    #[serde(default, alias = "start_date")]
+    pub start_after: Option<String>,
+    /// Events starting at or before this date (default 7 days after
+    /// start_after); a bare date includes that whole day. `end_date` is a
+    /// deprecated alias.
+    #[serde(default, alias = "end_date")]
+    pub start_before: Option<String>,
+    /// Text search with the shared list query syntax; field:term scopes are
+    /// subject, location, organizer and attendees. Unscoped terms search
+    /// subject and location.
     #[serde(default)]
     pub query: Option<String>,
-    /// Filter to a color category.
+    /// Category name; a list matches any of them.
     #[serde(default)]
-    pub category: Option<String>,
-    /// "free" | "tentative" | "busy" | "out_of_office" | "working_elsewhere".
+    pub category: Option<OneOrMany<String>>,
+    /// "free" | "tentative" | "busy" | "out_of_office" | "working_elsewhere"; a list matches any.
     #[serde(default)]
-    pub show_as: Option<String>,
-    /// This mailbox's response: "organizer" | "accepted" | "declined" | "tentative" | "not_responded".
+    pub show_as: Option<OneOrMany<String>>,
+    /// This mailbox's response: "organizer" | "accepted" | "declined" |
+    /// "tentative" | "not_responded" | "none"; a list matches any.
     #[serde(default)]
-    pub my_response: Option<String>,
+    pub my_response: Option<OneOrMany<String>>,
     /// Names/emails; match events where ANY listed person participates.
     #[serde(default)]
-    pub attendees: Option<Vec<String>>,
+    pub attendees: Option<OneOrMany<String>>,
     /// "required" | "optional" | "any" (default "any").
     #[serde(default)]
     pub attendee_role: Option<String>,
@@ -241,7 +277,14 @@ pub struct ListEventsParams {
     /// Email/name of another person whose shared calendar to view (default: your own).
     #[serde(default)]
     pub calendar_of: Option<String>,
+    /// Page size: default and max 250.
+    #[serde(default = "default_event_count")]
+    pub count: i32,
+    /// Matches to skip before this page starts (default 0).
+    #[serde(default)]
+    pub offset: i32,
 }
+fn default_event_count() -> i32 { MAX_EVENT_COUNT }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetEventParams {
@@ -418,16 +461,31 @@ pub struct GetInlineImageParams {
 pub struct ListTasksParams {
     #[serde(default)]
     pub include_completed: bool,
-    /// Filter to a color category.
+    /// Category name; a list matches any of them.
     #[serde(default)]
-    pub category: Option<String>,
-    /// "low" | "normal" | "high".
+    pub category: Option<OneOrMany<String>>,
+    /// "low" | "normal" | "high"; a list matches any of them.
     #[serde(default)]
-    pub importance: Option<String>,
-    /// Text match on the task's subject.
+    pub importance: Option<OneOrMany<String>>,
+    /// Text search with the shared list query syntax; field:term scopes are
+    /// subject and body. Unscoped terms search both.
     #[serde(default)]
     pub query: Option<String>,
+    /// Due at or after this date, e.g. 'today'. Tasks without a due date
+    /// never match a due range.
+    #[serde(default)]
+    pub due_after: Option<String>,
+    /// Due at or before this date, e.g. 'end_of_week'; a bare date includes that whole day.
+    #[serde(default)]
+    pub due_before: Option<String>,
+    /// Page size: default and max 500.
+    #[serde(default = "default_task_count")]
+    pub count: i32,
+    /// Matches to skip before this page starts (default 0).
+    #[serde(default)]
+    pub offset: i32,
 }
+fn default_task_count() -> i32 { MAX_TASK_COUNT }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateTaskParams {
@@ -486,13 +544,27 @@ pub struct DeleteTaskParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListNotesParams {
-    /// Filter to a color category.
+    /// Category name; a list matches any of them.
     #[serde(default)]
-    pub category: Option<String>,
-    /// Text match on the note's body.
+    pub category: Option<OneOrMany<String>>,
+    /// Text search with the shared list query syntax; field:term scopes are
+    /// subject (the first line) and body. Unscoped terms search the body.
     #[serde(default)]
     pub query: Option<String>,
+    /// Created at or after this date, e.g. '-30d'.
+    #[serde(default)]
+    pub created_after: Option<String>,
+    /// Created at or before this date; a bare date includes that whole day.
+    #[serde(default)]
+    pub created_before: Option<String>,
+    /// Page size: default and max 500.
+    #[serde(default = "default_note_count")]
+    pub count: i32,
+    /// Matches to skip before this page starts (default 0).
+    #[serde(default)]
+    pub offset: i32,
 }
+fn default_note_count() -> i32 { MAX_NOTE_COUNT }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetNoteParams {
@@ -529,6 +601,60 @@ pub struct DeleteNoteParams {
     pub note_id: String,
 }
 
+/// An optional one-or-many tool parameter as a plain list (empty = not given).
+fn list(v: Option<OneOrMany<String>>) -> Vec<String> {
+    v.map(OneOrMany::into_vec).unwrap_or_default()
+}
+
+/// A free-text one-or-many filter as a trimmed list without empty values.
+fn list_values(v: Option<OneOrMany<String>>) -> Vec<String> {
+    filters::clean_values(list(v))
+}
+
+/// Maps `list_emails`' parameters onto an [`EmailQuery`]: list-valued
+/// filters become lists, enum values are validated, and the deprecated
+/// `since_days` / `flagged` / `high_importance` are folded into
+/// `received_after` / `flag` / `importance`, refusing contradictions.
+pub fn email_query(p: ListEmailsParams) -> Result<EmailQuery, ToolError> {
+    let mut received_after = p.received_after.filter(|s| !s.trim().is_empty());
+    if let Some(days) = p.since_days.filter(|d| *d != 0) {
+        if received_after.is_some() {
+            return Err(ToolError::new(
+                "pass either `received_after` or `since_days`, not both (since_days is deprecated: use received_after: \"-14d\")",
+            ));
+        }
+        received_after = Some(format!("{:+}d", -i64::from(days)));
+    }
+    let mut importance = normalize_choices(list(p.importance), "importance", filters::IMPORTANCES)?;
+    if p.high_importance {
+        if !importance.is_empty() && importance != ["high"] {
+            return Err(ToolError::new(
+                "pass either `importance` or `high_importance`, not both (high_importance is deprecated: use importance: \"high\")",
+            ));
+        }
+        importance = vec!["high".to_string()];
+    }
+    let mut flag = normalize_choices(list(p.flag), "flag", filters::FLAGS)?;
+    if p.flagged {
+        if flag.iter().any(|f| f == "clear") {
+            return Err(ToolError::new(
+                "pass either `flag` or `flagged`, not both (flagged is deprecated: use flag: [\"follow_up\", \"complete\"])",
+            ));
+        }
+        if flag.is_empty() {
+            flag = vec!["follow_up".to_string(), "complete".to_string()];
+        }
+    }
+    Ok(EmailQuery {
+        query: p.query, folder: p.folder, count: p.count, offset: p.offset,
+        unread_only: p.unread_only, from: list_values(p.from), to: list_values(p.to),
+        category: list_values(p.category), received_after,
+        received_before: p.received_before, has_attachments: p.has_attachments,
+        item_type: normalize_choices(list(p.item_type), "item_type", filters::ITEM_TYPES)?,
+        importance, flag,
+    })
+}
+
 #[tool_router]
 impl OutlookMcpServer {
     #[tool(description = "List Outlook mail folders (name, path, item counts).")]
@@ -538,20 +664,13 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Find emails in a folder (newest first) with optional text query and filters (sender, recipient, category, date range, attachments, flagged, importance). `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). count is capped at 200. To page through more, call again with offset += count until fewer than count results come back.")]
+    #[tool(description = "Find emails in a folder (newest first). Filters (all optional, ANDed): query; from / to / category (one value or a list, matching any); item_type (as get_email reports it, e.g. [\"email\"] to skip meeting invites and bounces); importance; flag (follow_up/complete/clear, as in update_email); unread_only; has_attachments; received_after / received_before. `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). query syntax (shared by all list_* tools): space-separated terms that must all match, case-insensitive, any language; \"quoted phrase\" keeps words together; * is a wildcard (status*report); field:term limits a term to subject, from, to or body. Dates accept ISO ('2026-06-10'), keywords ('today', 'start_of_week') or offsets ('-14d'). Paging: count (default 10, max 200) and offset; to page, call again with offset += count until fewer than count results come back. Deprecated: since_days (use received_after: \"-14d\"), flagged (use flag), high_importance (use importance).")]
     pub async fn list_emails(
         &self,
         Parameters(p): Parameters<ListEmailsParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let q = EmailQuery {
-            query: p.query, folder: p.folder, count: p.count, offset: p.offset,
-            unread_only: p.unread_only, from: p.from, category: p.category,
-            received_after: p.received_after, to: p.to,
-            received_before: p.received_before, since_days: p.since_days,
-            has_attachments: p.has_attachments, flagged: p.flagged,
-            high_importance: p.high_importance,
-        };
+        let q = email_query(p)?;
         let result = run_blocking(move || client.list_emails(q)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
@@ -647,18 +766,20 @@ impl OutlookMcpServer {
 
     // ---- Calendar ----
 
-    #[tool(description = "List/search calendar events. Filter by date range, text (subject/location), category, show_as, your response, attendees (+role), meetings-only, all-day; or view another person's shared calendar via calendar_of.")]
+    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day. calendar_of views another person's shared calendar. Paging: count (default and max 250) and offset.")]
     pub async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
         let q = EventQuery {
-            start_date: p.start_date, end_date: p.end_date, query: p.query,
-            category: p.category, show_as: p.show_as, my_response: p.my_response,
-            attendees: p.attendees, attendee_role: p.attendee_role,
+            start_after: p.start_after, start_before: p.start_before, query: p.query,
+            category: list_values(p.category),
+            show_as: normalize_choices(list(p.show_as), "show_as", filters::SHOW_AS)?,
+            my_response: normalize_choices(list(p.my_response), "my_response", filters::MY_RESPONSES)?,
+            attendees: list_values(p.attendees), attendee_role: p.attendee_role,
             meetings_only: p.meetings_only, all_day: p.all_day,
-            calendar_of: p.calendar_of,
+            calendar_of: p.calendar_of, count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_events(q)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
@@ -790,15 +911,17 @@ impl OutlookMcpServer {
 
     // ---- Tasks ----
 
-    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filter by category, importance, or a text query matching the subject.")]
+    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filters (all optional, ANDed): category and importance (one value or a list, matching any); due_after / due_before (any date form, e.g. 'end_of_week'); query (shared list query syntax; field scopes subject and body; unscoped terms search both). Paging: count (default and max 500) and offset.")]
     pub async fn list_tasks(
         &self,
         Parameters(p): Parameters<ListTasksParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
         let q = TaskQuery {
-            include_completed: p.include_completed, category: p.category,
-            importance: p.importance, query: p.query,
+            include_completed: p.include_completed, category: list_values(p.category),
+            importance: normalize_choices(list(p.importance), "importance", filters::IMPORTANCES)?,
+            query: p.query, due_after: p.due_after, due_before: p.due_before,
+            count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_tasks(q)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
@@ -846,13 +969,17 @@ impl OutlookMcpServer {
 
     // ---- Notes ----
 
-    #[tool(description = "List Outlook notes. Filter by category or a text query matching the note's body.")]
+    #[tool(description = "List Outlook notes. Filters (all optional, ANDed): category (one value or a list, matching any); created_after / created_before (any date form); query (shared list query syntax; field scopes subject, i.e. the first line, and body; unscoped terms search the body). Paging: count (default and max 500) and offset.")]
     pub async fn list_notes(
         &self,
-        Parameters(ListNotesParams { category, query }): Parameters<ListNotesParams>,
+        Parameters(p): Parameters<ListNotesParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let q = NoteQuery { category, query };
+        let q = NoteQuery {
+            category: list_values(p.category), query: p.query,
+            created_after: p.created_after, created_before: p.created_before,
+            count: p.count, offset: p.offset,
+        };
         let result = run_blocking(move || client.list_notes(q)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }

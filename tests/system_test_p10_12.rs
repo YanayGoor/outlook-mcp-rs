@@ -141,12 +141,12 @@ fn system_test_plans_10_to_12() {
         }
 
         if t1a_id.is_some() && t1b_id.is_some() {
-            match c.list_tasks(TaskQuery { category: Some("Red Category".to_string()), ..Default::default() }) {
+            match c.list_tasks(TaskQuery { category: vec!["Red Category".to_string()], ..Default::default() }) {
                 Ok(list) => check_task_set(&mut r, "T1-category", tagged_task_suffixes(&list),
                     &["T1 quokkaTask"], "category:Red Category"),
                 Err(e) => r.record("T1-category", false, format!("failed: {e}")),
             }
-            match c.list_tasks(TaskQuery { importance: Some("high".to_string()), ..Default::default() }) {
+            match c.list_tasks(TaskQuery { importance: vec!["high".to_string()], ..Default::default() }) {
                 Ok(list) => check_task_set(&mut r, "T1-importance", tagged_task_suffixes(&list),
                     &["T1 quokkaTask"], "importance:high"),
                 Err(e) => r.record("T1-importance", false, format!("failed: {e}")),
@@ -313,7 +313,7 @@ fn system_test_plans_10_to_12() {
         }
 
         if n1a_id.is_some() && n1b_id.is_some() {
-            match c.list_notes(NoteQuery { category: Some("Green Category".to_string()), ..Default::default() }) {
+            match c.list_notes(NoteQuery { category: vec!["Green Category".to_string()], ..Default::default() }) {
                 Ok(list) => check_task_set(&mut r, "N1-category", tagged_note_suffixes(&list),
                     &["N1 category note - remember zephyrling"], "category:Green Category"),
                 Err(e) => r.record("N1-category", false, format!("failed: {e}")),

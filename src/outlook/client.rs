@@ -22,7 +22,9 @@ use crate::outlook::com::{
 };
 use crate::outlook::types::*;
 use chrono::Datelike;
-use unicode_normalization::UnicodeNormalization;
+use crate::outlook::filters::{self, DateRange};
+use crate::outlook::text_query::TextQuery;
+use crate::outlook::{MAX_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
 use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
@@ -33,19 +35,12 @@ use crate::outlook::{
     validate_inline_images,
 };
 
-/// Matches `MAX_EMAIL_COUNT` in `client.py`. Larger result sets are paged
-/// with `EmailQuery::offset`.
-const MAX_EMAIL_COUNT: i32 = 200;
 /// How many items (newest first, after every other filter) `list_emails`
 /// will open one by one when the `to` filter falls back to scanning each
 /// item's `Recipients` collection. Bounds the cost of a per-item COM walk.
 const RECIPIENT_SCAN_LIMIT: i32 = 2000;
 /// MAPI `PR_SMTP_ADDRESS` (Unicode), read through `Recipient.PropertyAccessor`.
 const PR_SMTP_ADDRESS: &str = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F";
-/// Matches `MAX_CALENDAR_ITEMS` in `client.py`. Caps `list_events` because a
-/// recurring appointment without an end date expands forever under
-/// `IncludeRecurrences`.
-const MAX_CALENDAR_ITEMS: usize = 250;
 /// Matches `MAX_BODY_CHARS` in `client.py`. The default body cut, and the
 /// fixed cut for `get_event`/`get_note`.
 const MAX_BODY_CHARS: usize = 100_000;
@@ -240,32 +235,6 @@ fn clamp_body_limit(max_body_chars: Option<u32>) -> usize {
         None => MAX_BODY_CHARS,
         Some(n) => (n as usize).clamp(MIN_BODY_CHARS_LIMIT, MAX_BODY_CHARS_LIMIT),
     }
-}
-
-/// Normalize text for caseless matching: NFC (so composed and decomposed
-/// forms of the same character compare equal), then lowercase.
-fn fold_text(text: &str) -> String {
-    text.nfc().collect::<String>().to_lowercase()
-}
-
-/// True if `query` occurs (caseless, NFC-normalized) in any of `fields`.
-/// Empty fields are skipped.
-fn text_matches(query: &str, fields: &[&str]) -> bool {
-    let needle = fold_text(query);
-    fields.iter().filter(|f| !f.is_empty()).any(|f| fold_text(f).contains(&needle))
-}
-
-/// Client-side text match for the `list_emails` non-ASCII fallback: subject
-/// and sender name first, then the body only if those miss (Body is the
-/// expensive property to fetch).
-fn email_text_matches(item: &IDispatch, query: &str) -> bool {
-    let subject = variant_to_string(&get_property(item, "Subject").unwrap_or_default());
-    let sender = variant_to_string(&get_property(item, "SenderName").unwrap_or_default());
-    if text_matches(query, &[&subject, &sender]) {
-        return true;
-    }
-    let body = variant_to_string(&get_property(item, "Body").unwrap_or_default());
-    text_matches(query, &[&body])
 }
 
 /// Parses a user-supplied date parameter with the shared grammar in
@@ -465,6 +434,20 @@ fn recurrence_info(item: &IDispatch) -> Result<Option<RecurrenceInfo>, ToolError
     }))
 }
 
+/// One `list_emails` query field of `item`, for the client-side query
+/// fallback (see [`filters::EMAIL_QUERY_FIELDS`]). Read lazily per field, so
+/// the body is only fetched when the subject/sender didn't already match.
+fn email_query_field(item: &IDispatch, field: &str) -> String {
+    let prop = |name: &str| variant_to_string(&get_property(item, name).unwrap_or_default());
+    match field {
+        "subject" => prop("Subject"),
+        "from" => format!("{} {}", prop("SenderName"), prop("SenderEmailAddress")),
+        "to" => format!("{}; {}; {}", prop("To"), prop("CC"), recipient_strings(item).join("; ")),
+        "body" => prop("Body"),
+        _ => String::new(),
+    }
+}
+
 /// True if `needle` is a case-insensitive substring of any of `candidates`
 /// (a recipient's display name, address, SMTP address, …). Callers skip
 /// the filter entirely for an empty needle.
@@ -513,110 +496,6 @@ fn recipient_strings(item: &IDispatch) -> Vec<String> {
     out
 }
 
-/// True if `summary` passes every filter set on `q`. All comparisons are
-/// case-insensitive. Attendee matching is a substring test against the
-/// semicolon-separated `RequiredAttendees`/`OptionalAttendees` strings.
-fn event_matches(summary: &EventSummary, q: &EventQuery) -> bool {
-    if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
-        let needle = query.to_lowercase();
-        if !summary.subject.to_lowercase().contains(&needle)
-            && !summary.location.to_lowercase().contains(&needle)
-        {
-            return false;
-        }
-    }
-    if let Some(cat) = q.category.as_deref().filter(|s| !s.is_empty()) {
-        let want = cat.to_lowercase();
-        if !summary.categories.iter().any(|c| c.to_lowercase() == want) {
-            return false;
-        }
-    }
-    if let Some(show_as) = q.show_as.as_deref().filter(|s| !s.is_empty()) {
-        if !summary.show_as.eq_ignore_ascii_case(show_as) {
-            return false;
-        }
-    }
-    if let Some(resp) = q.my_response.as_deref().filter(|s| !s.is_empty()) {
-        if !summary.my_response.eq_ignore_ascii_case(resp) {
-            return false;
-        }
-    }
-    if q.meetings_only && !summary.is_meeting {
-        return false;
-    }
-    if let Some(want_all_day) = q.all_day {
-        if summary.all_day != want_all_day {
-            return false;
-        }
-    }
-    if let Some(people) = q.attendees.as_ref().filter(|v| !v.is_empty()) {
-        // Which attendee tier(s) to search, per attendee_role (default "any").
-        let role = q.attendee_role.as_deref().unwrap_or("any").to_lowercase();
-        let required = summary.required_attendees.to_lowercase();
-        let optional = summary.optional_attendees.to_lowercase();
-        let haystack = match role.as_str() {
-            "required" => required,
-            "optional" => optional,
-            _ => format!("{required}; {optional}"), // "any"
-        };
-        if !people
-            .iter()
-            .any(|p| !p.is_empty() && haystack.contains(&p.to_lowercase()))
-        {
-            return false;
-        }
-    }
-    true
-}
-
-/// Client-side filter for `list_tasks`'s `category`/`importance`/`query`.
-/// `include_completed` is applied earlier via `Restrict`, not here. `query`
-/// matches either the subject or the real task body — `body` is the task's
-/// real, untruncated body text, read once per item by the caller (see
-/// `list_tasks` below), the same pattern `note_matches` uses for notes.
-fn task_matches(body: &str, summary: &TaskSummary, q: &TaskQuery) -> bool {
-    if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
-        let needle = query.to_lowercase();
-        if !summary.subject.to_lowercase().contains(&needle)
-            && !body.to_lowercase().contains(&needle)
-        {
-            return false;
-        }
-    }
-    if let Some(cat) = q.category.as_deref().filter(|s| !s.is_empty()) {
-        let want = cat.to_lowercase();
-        if !summary.categories.iter().any(|c| c.to_lowercase() == want) {
-            return false;
-        }
-    }
-    if let Some(imp) = q.importance.as_deref().filter(|s| !s.is_empty()) {
-        if !summary.importance.eq_ignore_ascii_case(imp) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Client-side filter for `list_notes`'s `category`/`query`. `body` is the
-/// note's real, untruncated body text (read once per item by the caller —
-/// see `list_notes` below). A note has no separate subject, so `query`
-/// matches only this body, whereas `task_matches` also matches a task's
-/// subject.
-fn note_matches(body: &str, summary: &NoteSummary, q: &NoteQuery) -> bool {
-    if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
-        if !body.to_lowercase().contains(&query.to_lowercase()) {
-            return false;
-        }
-    }
-    if let Some(cat) = q.category.as_deref().filter(|s| !s.is_empty()) {
-        let want = cat.to_lowercase();
-        if !summary.categories.iter().any(|c| c.to_lowercase() == want) {
-            return false;
-        }
-    }
-    true
-}
-
 /// `DISP_E_UNKNOWNNAME` ("Unknown name"), formatted the way `format_com_error`
 /// renders it (`{:#010x}` on the HRESULT). `ToolError` only carries a
 /// formatted string (no structured HRESULT), but `format_com_error` embeds
@@ -631,7 +510,9 @@ fn is_transient_unknown_name(err: &ToolError) -> bool {
 }
 
 /// Runs the `Restrict` + `GetFirst`/`GetNext` enumeration sequence for
-/// `list_events`.
+/// `list_events`, keeping events that pass [`filters::event_matches`] and
+/// returning the page `offset..offset + count` of them (`count` already
+/// clamped to `MAX_EVENT_COUNT`).
 ///
 /// `calendar_store_id` is threaded through to `event_summary` to sidestep a
 /// confirmed-live, deterministic bug (see `event_summary`'s doc comment):
@@ -649,24 +530,32 @@ fn enumerate_events_with_retry(
     items: &IDispatch,
     flt: &str,
     q: &EventQuery,
+    text: &TextQuery,
     calendar_store_id: &str,
+    count: usize,
 ) -> Result<Vec<EventSummary>, ToolError> {
     const MAX_ATTEMPTS: u32 = 3;
+    let offset = q.offset.max(0) as usize;
     for attempt in 1..=MAX_ATTEMPTS {
         let outcome = (|| -> Result<Vec<EventSummary>, ToolError> {
             let restricted =
                 to_disp(call_method(items, "Restrict", &mut [variant_from_str(flt)])?)?;
             // Enumerate with GetFirst/GetNext (not Count/Item): under
             // IncludeRecurrences the collection can expand without bound, so
-            // we must stream it and stop at MAX_CALENDAR_ITEMS.
+            // we must stream it and stop once the page is full.
+            let mut skipped = 0;
             let mut results = Vec::new();
             let mut current = call_method(&restricted, "GetFirst", &mut [])?;
             while let Ok(item) = IDispatch::try_from(&current) {
                 let summary = event_summary(&item, Some(calendar_store_id))?;
-                if event_matches(&summary, q) {
-                    results.push(summary);
-                    if results.len() >= MAX_CALENDAR_ITEMS {
-                        break;
+                if filters::event_matches(&summary, q, text) {
+                    if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        results.push(summary);
+                        if results.len() >= count {
+                            break;
+                        }
                     }
                 }
                 current = call_method(&restricted, "GetNext", &mut [])?;
@@ -1102,32 +991,53 @@ impl OutlookClient for WindowsOutlookClient {
     }
 
     // Cheap filters become sequential COM `Restrict` calls (they AND together);
-    // `category`, `has_attachments`, and `flagged` are filtered client-side
-    // while iterating.
+    // `category`, `has_attachments`, `flag`, `item_type` and the `query`/`to`
+    // fallbacks are filtered client-side while iterating, before paging.
     fn list_emails(&self, q: EmailQuery) -> Result<Vec<EmailSummary>, ToolError> {
+        // Resolve and validate every input before touching Outlook.
+        let received = DateRange::parse(
+            q.received_after.as_deref(), q.received_before.as_deref(),
+            "received_after", "received_before", chrono::Local::now().naive_local(),
+        )?;
+        let importance_ids = q.importance.iter()
+            .map(|i| c::importance_name_to_id(i.trim()).ok_or_else(|| {
+                ToolError::new(format!("Invalid importance {i:?}: use one of low, normal, high"))
+            }))
+            .collect::<Result<Vec<i32>, ToolError>>()?;
+        let flag_ids = q.flag.iter()
+            .map(|f| filters::flag_status_id(f.trim()).ok_or_else(|| {
+                ToolError::new(format!("Invalid flag {f:?}: use one of {}", filters::FLAGS.join(", ")))
+            }))
+            .collect::<Result<Vec<i32>, ToolError>>()?;
+        let item_types = filters::normalize_choices(q.item_type.clone(), "item_type", filters::ITEM_TYPES)?;
+        let from = filters::clean_values(q.from.clone());
+        let to = filters::clean_values(q.to.clone());
+        let text = TextQuery::parse(q.query.as_deref().unwrap_or(""), filters::EMAIL_QUERY_FIELDS);
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let count = q.count.clamp(1, MAX_EMAIL_COUNT);
             let folder_obj = resolve_folder(&ns, Some(&q.folder))?;
             let mut items = to_disp(get_property(&folder_obj, "Items")?)?;
+            let restrict = |items: &IDispatch, filter: &str| -> Result<IDispatch, ToolError> {
+                to_disp(call_method(items, "Restrict", &mut [variant_from_str(filter)])?)
+            };
+            let count_of = |items: &IDispatch| -> Result<i32, ToolError> {
+                Ok(variant_to_i32(&get_property(items, "Count")?).unwrap_or(0))
+            };
 
-            // Sender: DASL @SQL against fromname + fromemail.
-            if let Some(from) = q.from.as_deref().filter(|s| !s.is_empty()) {
-                let e = from.replace('\'', "''");
-                let dasl = format!(
-                    "@SQL=(\"urn:schemas:httpmail:fromname\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:fromemail\" LIKE '%{e}%')"
-                );
-                items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
+            // Sender: DASL @SQL against fromname + fromemail, ORed over the needles.
+            if !from.is_empty() {
+                let ors: Vec<String> = from.iter().map(|f| {
+                    let e = f.replace('\'', "''");
+                    format!("\"urn:schemas:httpmail:fromname\" LIKE '%{e}%' \
+                             OR \"urn:schemas:httpmail:fromemail\" LIKE '%{e}%'")
+                }).collect();
+                items = restrict(&items, &format!("@SQL=({})", ors.join(" OR ")))?;
             }
             if q.unread_only {
-                items = to_disp(call_method(
-                    &items,
-                    "Restrict",
-                    &mut [variant_from_str("[UnRead] = True")],
-                )?)?;
+                items = restrict(&items, "[UnRead] = True")?;
             }
-            // `flagged` is deliberately NOT a Restrict call: confirmed via a
+            // `flag` is deliberately NOT a Restrict call: confirmed via a
             // raw PowerShell COM probe outside this codebase that
             // `Items.Restrict("[FlagStatus] = 2")` doesn't reliably match on
             // this account class, even though `Item.FlagStatus` reads
@@ -1136,53 +1046,33 @@ impl OutlookClient for WindowsOutlookClient {
             // MAPI, and the legacy DASL bracket filter doesn't see that
             // state reliably). Filtered client-side below instead, alongside
             // category/has_attachments.
-            if q.high_importance {
-                items = to_disp(call_method(
-                    &items,
-                    "Restrict",
-                    &mut [variant_from_str("[Importance] = 2")],
-                )?)?;
+            if !importance_ids.is_empty() {
+                let ors: Vec<String> =
+                    importance_ids.iter().map(|id| format!("[Importance] = {id}")).collect();
+                items = restrict(&items, &ors.join(" OR "))?;
             }
-            // Date filters: since_days (relative), received_after/before (absolute).
-            if q.since_days.is_some_and(|d| d != 0) {
-                let cutoff = chrono::Local::now().naive_local()
-                    - chrono::Duration::days(q.since_days.unwrap() as i64);
-                let f = format!("[ReceivedTime] >= '{}'", jet_datetime(&cutoff));
-                items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&f)])?)?;
+            // Date range, already resolved by the shared date grammar. The
+            // JET string format (and its day-first-locale bug) is issue #1.
+            if let Some(after) = received.after {
+                items = restrict(&items, &format!("[ReceivedTime] >= '{}'", jet_datetime(&after)))?;
             }
-            if let Some(after) = q.received_after.as_deref().filter(|s| !s.is_empty()) {
-                let dt = parse_dt(after, "received_after")?;
-                let f = format!("[ReceivedTime] >= '{}'", jet_datetime(&dt));
-                items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&f)])?)?;
-            }
-            if let Some(before) = q.received_before.as_deref().filter(|s| !s.is_empty()) {
-                let dt = parse_dt(before, "received_before")?;
-                let f = format!("[ReceivedTime] <= '{}'", jet_datetime(&dt));
-                items = to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&f)])?)?;
+            if let Some(before) = received.before {
+                items = restrict(&items, &format!("[ReceivedTime] <= '{}'", jet_datetime(&before)))?;
             }
 
             // Text query near-last, so the fallback scan below only walks
-            // items that already passed every other filter. DASL @SQL across
-            // subject/sender/body (escaped).
-            let mut text_fallback: Option<String> = None;
-            if let Some(query) = q.query.as_deref().filter(|s| !s.is_empty()) {
-                let query: String = query.nfc().collect();
-                let e = query.replace('\'', "''");
-                let dasl = format!(
-                    "@SQL=(\"urn:schemas:httpmail:subject\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:fromname\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:textdescription\" LIKE '%{e}%')"
-                );
-                let matched =
-                    to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
-                let matched_count = variant_to_i32(&get_property(&matched, "Count")?).unwrap_or(0);
+            // items that already passed every other filter: the shared query
+            // syntax as one DASL @SQL filter (see `TextQuery::to_dasl`).
+            let mut text_fallback = false;
+            if let Some(dasl) = text.to_dasl(filters::EMAIL_QUERY_DEFAULTS, filters::EMAIL_QUERY_DASL) {
+                let matched = restrict(&items, &dasl)?;
                 // DASL LIKE has been observed to return nothing for Hebrew
                 // (and other non-Latin) terms even when matching mail exists
                 // (issue #2). For a non-ASCII query, treat an empty DASL
                 // result as unreliable and scan the pre-filtered items
                 // client-side instead. ASCII queries stay DASL-only.
-                if matched_count == 0 && !query.is_ascii() {
-                    text_fallback = Some(query);
+                if count_of(&matched)? == 0 && !text.is_ascii() {
+                    text_fallback = true;
                 } else {
                     items = matched;
                 }
@@ -1195,24 +1085,29 @@ impl OutlookClient for WindowsOutlookClient {
             // resolved Exchange/contact recipients that's the display NAME
             // ("Ada Lovelace"), not the address, so an address needle can
             // match nothing even though the mail was sent to that address.
-            // So when the DASL restrict comes back empty, fall back to
-            // scanning each item's Recipients (Name, Address, SMTP address)
-            // client-side, over at most RECIPIENT_SCAN_LIMIT newest items.
-            // A non-empty DASL result is kept as-is: every hit genuinely has
-            // the needle in its To/CC line, and it avoids the per-item walk.
-            let mut to_scan: Option<&str> = None;
-            if let Some(to) = q.to.as_deref().filter(|s| !s.is_empty()) {
-                let e = to.replace('\'', "''");
-                let dasl = format!(
-                    "@SQL=(\"urn:schemas:httpmail:displayto\" LIKE '%{e}%' \
-                     OR \"urn:schemas:httpmail:displaycc\" LIKE '%{e}%')"
-                );
-                let restricted =
-                    to_disp(call_method(&items, "Restrict", &mut [variant_from_str(&dasl)])?)?;
-                if variant_to_i32(&get_property(&restricted, "Count")?).unwrap_or(0) > 0 {
-                    items = restricted;
-                } else {
-                    to_scan = Some(to);
+            // So when the DASL restrict for any one needle comes back empty,
+            // fall back to scanning each item's Recipients (Name, Address,
+            // SMTP address) client-side for every needle, over at most
+            // RECIPIENT_SCAN_LIMIT newest items. When every needle has DASL
+            // hits, their ORed DASL result is kept as-is: every hit
+            // genuinely has a needle in its To/CC line, and it avoids the
+            // per-item walk.
+            let mut to_scan = false;
+            if !to.is_empty() {
+                let clause = |needle: &str| {
+                    let e = needle.replace('\'', "''");
+                    format!("\"urn:schemas:httpmail:displayto\" LIKE '%{e}%' \
+                             OR \"urn:schemas:httpmail:displaycc\" LIKE '%{e}%'")
+                };
+                for needle in &to {
+                    if count_of(&restrict(&items, &format!("@SQL=({})", clause(needle)))?)? == 0 {
+                        to_scan = true;
+                        break;
+                    }
+                }
+                if !to_scan {
+                    let ors: Vec<String> = to.iter().map(|n| clause(n)).collect();
+                    items = restrict(&items, &format!("@SQL=({})", ors.join(" OR ")))?;
                 }
             }
 
@@ -1222,52 +1117,56 @@ impl OutlookClient for WindowsOutlookClient {
                 &mut [variant_from_str("[ReceivedTime]"), variant_from_bool(true)],
             )?;
 
-            // Client-side fuzzy filters: non-ASCII text fallback and `to`
-            // recipient fallback (if active) + category + has_attachments +
-            // flagged. Lazily build each summary and keep it only if it
-            // passes; then `take_page` skips the first `offset` matches (after
-            // these filters, so pages line up) and stops at count.
-            let cat_want = q.category.as_deref().map(|c| c.to_lowercase());
-            let mut total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
-            if text_fallback.is_some() {
+            // Client-side filters: item_type + flag (one property read each),
+            // the non-ASCII query fallback and `to` recipient fallback (if
+            // active), then category + has_attachments on the summary.
+            // Lazily build each summary and keep it only if it passes; then
+            // `take_page` skips the first `offset` matches (after these
+            // filters, so pages line up) and stops at count.
+            let mut total = count_of(&items)?;
+            if text_fallback {
                 // The fallback reads Subject/SenderName (and maybe Body) per
                 // item, so cap how far back it scans (newest first).
                 total = total.min(MAX_SCAN_ITEMS);
             }
-            if to_scan.is_some() {
+            if to_scan {
                 // Same for the per-item Recipients walk of the `to` fallback.
                 total = total.min(RECIPIENT_SCAN_LIMIT);
             }
             let matches = (1..=total).filter_map(|i| {
                 (|| -> Result<Option<EmailSummary>, ToolError> {
                     let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
-                    if text_fallback.as_deref().is_some_and(|query| !email_text_matches(&item, query)) {
+                    if !item_types.is_empty() {
+                        let class = variant_to_string(&get_property(&item, "MessageClass").unwrap_or_default());
+                        let kind = crate::friendly::item_type_from_class(&class);
+                        if !item_types.iter().any(|t| t == kind) {
+                            return Ok(None);
+                        }
+                    }
+                    if !flag_ids.is_empty() {
+                        let status = variant_to_i32(&get_property(&item, "FlagStatus").unwrap_or_default())
+                            .unwrap_or(c::OL_NO_FLAG);
+                        if !flag_ids.contains(&status) {
+                            return Ok(None);
+                        }
+                    }
+                    if text_fallback
+                        && !text.matches(filters::EMAIL_QUERY_DEFAULTS, |field| email_query_field(&item, field))
+                    {
                         return Ok(None);
                     }
-                    if to_scan.is_some_and(|to| !recipient_matches(to, &recipient_strings(&item))) {
-                        return Ok(None);
+                    if to_scan {
+                        let candidates = recipient_strings(&item);
+                        if !to.iter().any(|needle| recipient_matches(needle, &candidates)) {
+                            return Ok(None);
+                        }
                     }
                     let summary = email_summary(&item)?;
-                    if let Some(want) = &cat_want {
-                        if !summary.categories.iter().any(|c| c.to_lowercase() == *want) {
-                            return Ok(None);
-                        }
+                    if !filters::has_category(&summary.categories, &q.category) {
+                        return Ok(None);
                     }
-                    if let Some(want_att) = q.has_attachments {
-                        if summary.has_attachments != want_att {
-                            return Ok(None);
-                        }
-                    }
-                    if q.flagged {
-                        // "Flagged" means any non-zero FlagStatus: both a
-                        // follow-up flag (OL_FLAG_MARKED = 2) and a completed
-                        // flag (OL_FLAG_COMPLETE = 1) count; 0 = no flag/cleared.
-                        let flag_status =
-                            variant_to_i32(&get_property(&item, "FlagStatus").unwrap_or_default())
-                                .unwrap_or(0);
-                        if flag_status == 0 {
-                            return Ok(None);
-                        }
+                    if q.has_attachments.is_some_and(|want| summary.has_attachments != want) {
+                        return Ok(None);
                     }
                     Ok(Some(summary))
                 })()
@@ -1701,26 +1600,24 @@ impl OutlookClient for WindowsOutlookClient {
     // ---- Calendar (Task 13) --------------------------------------------
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError> {
+        // Resolve the scan window with the shared date grammar (a bare ISO
+        // `start_before` date includes that whole day). Defaults: from today
+        // 00:00, for 7 days.
+        let now = chrono::Local::now().naive_local();
+        let range = DateRange::parse(
+            q.start_after.as_deref(), q.start_before.as_deref(), "start_after", "start_before", now,
+        )?;
+        let start = range.after.unwrap_or_else(|| now.date().and_hms_opt(0, 0, 0).unwrap());
+        let end = range.before.unwrap_or(start + chrono::Duration::days(7));
+        if start > end {
+            return Err(ToolError::new(format!(
+                "start_before ({end}) is earlier than the default start_after (today, {start}): pass start_after too"
+            )));
+        }
+        let text = TextQuery::parse(q.query.as_deref().unwrap_or(""), filters::EVENT_QUERY_FIELDS);
+        let count = q.count.clamp(1, MAX_EVENT_COUNT) as usize;
         self.with_com(|| {
             let (_app, ns) = mapi()?;
-            let start = match &q.start_date {
-                Some(s) => parse_dt(s, "start_date")?,
-                None => chrono::Local::now()
-                    .date_naive()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-            };
-            let mut end = match &q.end_date {
-                Some(s) => parse_dt(s, "end_date")?,
-                None => start + chrono::Duration::days(7),
-            };
-            // If only a bare date was given for the end, treat it as the whole
-            // end day (Python: `end.time() == time.min and "T" not in end_date`).
-            if let Some(ed) = &q.end_date {
-                if end.time() == chrono::NaiveTime::MIN && !ed.contains('T') {
-                    end = end.date().and_hms_micro_opt(23, 59, 59, 999_999).unwrap();
-                }
-            }
             // `calendar_of`: open another person's shared calendar; otherwise
             // our own default calendar (current behavior).
             let calendar = match q.calendar_of.as_deref().filter(|s| !s.is_empty()) {
@@ -1770,7 +1667,7 @@ impl OutlookClient for WindowsOutlookClient {
                 jet_datetime(&start),
                 jet_datetime(&end)
             );
-            enumerate_events_with_retry(&items, &flt, &q, &calendar_store_id)
+            enumerate_events_with_retry(&items, &flt, &q, &text, &calendar_store_id, count)
         })
     }
 
@@ -2256,6 +2153,12 @@ impl OutlookClient for WindowsOutlookClient {
     // ---- Tasks (Task 15) -----------------------------------------------
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError> {
+        let due = DateRange::parse(
+            q.due_after.as_deref(), q.due_before.as_deref(), "due_after", "due_before",
+            chrono::Local::now().naive_local(),
+        )?;
+        let text = TextQuery::parse(q.query.as_deref().unwrap_or(""), filters::TASK_QUERY_FIELDS);
+        let count = q.count.clamp(1, MAX_TASK_COUNT);
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let tasks = to_disp(call_method(
@@ -2271,20 +2174,19 @@ impl OutlookClient for WindowsOutlookClient {
                     &mut [variant_from_str("[Complete] = False")],
                 )?)?;
             }
-            let count = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
-            let mut results = Vec::new();
-            for i in 1..=count {
-                let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
-                let summary = task_summary(&item)?;
-                // Read the real body directly for query matching — `task_summary`
-                // doesn't expose the body at all, so this is a second, deliberate
-                // property read (same pattern `list_notes` already uses).
-                let body = variant_to_string(&get_property(&item, "Body").unwrap_or_default());
-                if task_matches(&body, &summary, &q) {
-                    results.push(summary);
-                }
-            }
-            Ok(results)
+            let total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
+            let matches = (1..=total).filter_map(|i| {
+                (|| -> Result<Option<TaskSummary>, ToolError> {
+                    let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                    let summary = task_summary(&item)?;
+                    // `task_summary` doesn't expose the body, so a query that
+                    // needs it reads the real body here, lazily.
+                    let body = || variant_to_string(&get_property(&item, "Body").unwrap_or_default());
+                    Ok(filters::task_matches(&summary, &q, &due, &text, body).then_some(summary))
+                })()
+                .transpose()
+            });
+            take_page(matches, q.offset, count)
         })
     }
 
@@ -2435,6 +2337,12 @@ impl OutlookClient for WindowsOutlookClient {
     // ---- Notes (Task 16) -----------------------------------------------
 
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError> {
+        let created = DateRange::parse(
+            q.created_after.as_deref(), q.created_before.as_deref(), "created_after",
+            "created_before", chrono::Local::now().naive_local(),
+        )?;
+        let text = TextQuery::parse(q.query.as_deref().unwrap_or(""), filters::NOTE_QUERY_FIELDS);
+        let count = q.count.clamp(1, MAX_NOTE_COUNT);
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let notes = to_disp(call_method(
@@ -2443,22 +2351,20 @@ impl OutlookClient for WindowsOutlookClient {
                 &mut [variant_from_i32(c::OL_FOLDER_NOTES)],
             )?)?;
             let items = to_disp(get_property(&notes, "Items")?)?;
-            let count = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
-            let mut results = Vec::new();
-            for i in 1..=count {
-                let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
-                let summary = note_summary(&item)?;
-                // Read the real body directly for query matching — `note_summary`
-                // only exposes the derived (120-char-truncated) subject, not the
-                // full body, so this is a second, deliberate property read (same
-                // pattern `get_note` already uses: it re-reads `Body` outside
-                // `note_summary` too, for its own untruncated-body purpose).
-                let body = variant_to_string(&get_property(&item, "Body").unwrap_or_default());
-                if note_matches(&body, &summary, &q) {
-                    results.push(summary);
-                }
-            }
-            Ok(results)
+            let total = variant_to_i32(&get_property(&items, "Count")?).unwrap_or(0);
+            let matches = (1..=total).filter_map(|i| {
+                (|| -> Result<Option<NoteSummary>, ToolError> {
+                    let item = to_disp(call_method(&items, "Item", &mut [variant_from_i32(i)])?)?;
+                    let summary = note_summary(&item)?;
+                    // `note_summary` only exposes the derived (120-char)
+                    // subject, so a query on the body re-reads the real,
+                    // untruncated body here, lazily.
+                    let body = || variant_to_string(&get_property(&item, "Body").unwrap_or_default());
+                    Ok(filters::note_matches(&summary, &q, &created, &text, body).then_some(summary))
+                })()
+                .transpose()
+            });
+            take_page(matches, q.offset, count)
         })
     }
 
@@ -2562,509 +2468,6 @@ impl OutlookClient for WindowsOutlookClient {
 }
 
 #[cfg(test)]
-mod event_filter_tests {
-    use super::*;
-
-    /// Create a representative base EventSummary for testing.
-    fn base() -> EventSummary {
-        EventSummary {
-            id: "test-id|store-id".to_string(),
-            subject: "Weekly Review".to_string(),
-            start: Some("2026-06-10T14:00:00".to_string()),
-            end: Some("2026-06-10T15:00:00".to_string()),
-            location: "Room A".to_string(),
-            organizer: "Alice Smith; alice@example.com".to_string(),
-            all_day: false,
-            is_recurring: false,
-            is_meeting: true,
-            categories: vec!["Work".to_string()],
-            show_as: "busy".to_string(),
-            my_response: "accepted".to_string(),
-            required_attendees: "Alice Smith; alice@example.com".to_string(),
-            optional_attendees: "Bob Jones; bob@example.com".to_string(),
-        }
-    }
-
-    #[test]
-    fn empty_query_matches_any_summary() {
-        let summary = base();
-        let query = EventQuery::default();
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn query_substring_matches_subject() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("weekly".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn query_substring_matches_location() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("room".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn query_substring_no_match() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("nonexistent".to_string()),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn query_substring_case_insensitive() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("WEEKLY REVIEW".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn empty_query_string_is_noop() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn category_present_case_insensitive() {
-        let summary = base();
-        let query = EventQuery {
-            category: Some("work".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn category_absent() {
-        let summary = base();
-        let query = EventQuery {
-            category: Some("Personal".to_string()),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn category_multiple_matches_one() {
-        let mut summary = base();
-        summary.categories = vec!["Work".to_string(), "Meeting".to_string()];
-        let query = EventQuery {
-            category: Some("MEETING".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn show_as_match_case_insensitive() {
-        let summary = base();
-        let query = EventQuery {
-            show_as: Some("BUSY".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn show_as_mismatch() {
-        let summary = base();
-        let query = EventQuery {
-            show_as: Some("free".to_string()),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn my_response_match_case_insensitive() {
-        let summary = base();
-        let query = EventQuery {
-            my_response: Some("ACCEPTED".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn my_response_mismatch() {
-        let summary = base();
-        let query = EventQuery {
-            my_response: Some("declined".to_string()),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn meetings_only_true_with_meeting() {
-        let summary = base();
-        let query = EventQuery {
-            meetings_only: true,
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn meetings_only_true_without_meeting() {
-        let mut summary = base();
-        summary.is_meeting = false;
-        let query = EventQuery {
-            meetings_only: true,
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn all_day_true_matches_all_day_event() {
-        let mut summary = base();
-        summary.all_day = true;
-        let query = EventQuery {
-            all_day: Some(true),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn all_day_true_rejects_non_all_day_event() {
-        let summary = base();
-        let query = EventQuery {
-            all_day: Some(true),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn all_day_false_matches_non_all_day_event() {
-        let summary = base();
-        let query = EventQuery {
-            all_day: Some(false),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn all_day_false_rejects_all_day_event() {
-        let mut summary = base();
-        summary.all_day = true;
-        let query = EventQuery {
-            all_day: Some(false),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn all_day_none_is_noop() {
-        let summary = base();
-        let query = EventQuery {
-            all_day: None,
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_required_role_substring_match() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["alice".to_string()]),
-            attendee_role: Some("required".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_required_role_no_match() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["bob".to_string()]),
-            attendee_role: Some("required".to_string()),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_optional_role_substring_match() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["bob".to_string()]),
-            attendee_role: Some("optional".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_optional_role_no_match() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["alice".to_string()]),
-            attendee_role: Some("optional".to_string()),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_any_role_matches_required() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["alice".to_string()]),
-            attendee_role: Some("any".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_any_role_matches_optional() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["bob".to_string()]),
-            attendee_role: Some("any".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_no_role_defaults_to_any() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["alice".to_string()]),
-            attendee_role: None,
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_case_insensitive_search() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["ALICE".to_string()]),
-            attendee_role: Some("required".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_multiple_in_list_any_matches() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["nonexistent".to_string(), "bob".to_string()]),
-            attendee_role: Some("optional".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_empty_string_does_not_match() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["".to_string()]),
-            attendee_role: None,
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_empty_list_is_noop() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec![]),
-            attendee_role: None,
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn multiple_filters_all_satisfied() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("weekly".to_string()),
-            category: Some("work".to_string()),
-            show_as: Some("busy".to_string()),
-            meetings_only: true,
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn multiple_filters_one_fails() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("weekly".to_string()),
-            category: Some("work".to_string()),
-            show_as: Some("free".to_string()),
-            meetings_only: true,
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn complex_scenario_meeting_with_required_attendee_and_category() {
-        let summary = base();
-        let query = EventQuery {
-            meetings_only: true,
-            category: Some("Work".to_string()),
-            attendees: Some(vec!["alice".to_string()]),
-            attendee_role: Some("required".to_string()),
-            query: Some("review".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn complex_scenario_wrong_attendee_tier() {
-        let summary = base();
-        let query = EventQuery {
-            meetings_only: true,
-            category: Some("Work".to_string()),
-            attendees: Some(vec!["bob".to_string()]),
-            attendee_role: Some("required".to_string()),
-            query: Some("review".to_string()),
-            ..Default::default()
-        };
-        assert!(!event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn attendees_full_email_substring_match() {
-        let summary = base();
-        let query = EventQuery {
-            attendees: Some(vec!["example.com".to_string()]),
-            attendee_role: Some("required".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-
-    #[test]
-    fn query_location_exact_match_case_insensitive() {
-        let summary = base();
-        let query = EventQuery {
-            query: Some("ROOM A".to_string()),
-            ..Default::default()
-        };
-        assert!(event_matches(&summary, &query));
-    }
-}
-
-#[cfg(test)]
-mod task_filter_tests {
-    use super::*;
-
-    fn base() -> TaskSummary {
-        TaskSummary {
-            id: "test-id|store-id".to_string(),
-            subject: "Quarterly Report".to_string(),
-            due_date: Some("2026-06-10T00:00:00".to_string()),
-            complete: false,
-            status: "not_started".to_string(),
-            importance: "normal".to_string(),
-            categories: vec!["Work".to_string()],
-        }
-    }
-
-    #[test]
-    fn empty_query_matches_any_summary() {
-        let summary = base();
-        let query = TaskQuery::default();
-        assert!(task_matches("some body text", &summary, &query));
-    }
-
-    #[test]
-    fn query_substring_matches_subject() {
-        let summary = base();
-        let query = TaskQuery { query: Some("quarterly".to_string()), ..Default::default() };
-        assert!(task_matches("unrelated body", &summary, &query));
-    }
-
-    #[test]
-    fn query_substring_matches_body() {
-        let summary = base();
-        let query = TaskQuery { query: Some("budget numbers".to_string()), ..Default::default() };
-        assert!(task_matches("here are the budget numbers for review", &summary, &query));
-    }
-
-    #[test]
-    fn query_substring_no_match_in_subject_or_body() {
-        let summary = base();
-        let query = TaskQuery { query: Some("nonexistent".to_string()), ..Default::default() };
-        assert!(!task_matches("also nothing here", &summary, &query));
-    }
-
-    #[test]
-    fn query_substring_case_insensitive_against_body() {
-        let summary = base();
-        let query = TaskQuery { query: Some("BUDGET NUMBERS".to_string()), ..Default::default() };
-        assert!(task_matches("here are the budget numbers", &summary, &query));
-    }
-
-    #[test]
-    fn empty_query_string_is_noop() {
-        let summary = base();
-        let query = TaskQuery { query: Some("".to_string()), ..Default::default() };
-        assert!(task_matches("anything", &summary, &query));
-    }
-
-    #[test]
-    fn category_filter_still_applies_alongside_body_query() {
-        let summary = base();
-        let query = TaskQuery {
-            query: Some("budget".to_string()),
-            category: Some("Personal".to_string()),
-            ..Default::default()
-        };
-        assert!(!task_matches("budget numbers", &summary, &query));
-    }
-
-    #[test]
-    fn importance_filter_still_applies_alongside_body_query() {
-        let summary = base();
-        let query = TaskQuery {
-            query: Some("budget".to_string()),
-            importance: Some("high".to_string()),
-            ..Default::default()
-        };
-        assert!(!task_matches("budget numbers", &summary, &query));
-    }
-}
-
-#[cfg(test)]
 mod attachment_tests {
     use super::*;
 
@@ -3161,56 +2564,6 @@ mod attachment_tests {
         assert_ne!(other.path(), dir.as_path());
         drop(guard);
         assert!(!dir.exists());
-    }
-}
-
-#[cfg(test)]
-mod text_match_tests {
-    use super::*;
-
-    #[test]
-    fn hebrew_matches_subject_or_later_field() {
-        assert!(text_matches("מייל שיקוף", &["Re: מייל שיקוף שבועי"]));
-        assert!(text_matches("סיכום עשייה", &["", "Dana", "גוף: סיכום עשייה Q3"]));
-        assert!(!text_matches("מייל שיקוף", &["Weekly report", "Dana"]));
-    }
-
-    #[test]
-    fn mixed_hebrew_and_english() {
-        assert!(text_matches("Q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
-        assert!(text_matches("q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
-        assert!(!text_matches("Q4 סיכום", &["Weekly Q3 סיכום עשייה"]));
-    }
-
-    #[test]
-    fn matching_is_caseless() {
-        assert!(text_matches("weekly", &["WEEKLY Report"]));
-        assert!(text_matches("ÉCOLE", &["notes from école today"]));
-        assert!(text_matches("ΣΟΦΊΑ", &["σοφία"]));
-    }
-
-    #[test]
-    fn matching_ignores_normalization_form() {
-        // Latin with an accent: composed (NFC) vs decomposed (NFD).
-        let nfc: String = "café".nfc().collect();
-        let nfd: String = "café".nfd().collect();
-        assert_ne!(nfc, nfd);
-        assert!(text_matches(&nfd, &[&format!("subject {nfc}")]));
-        assert!(text_matches(&nfc, &[&format!("subject {nfd}")]));
-        // Hebrew niqqud has no precomposed forms, but the same marks typed
-        // in a different order (shin dot + qamats vs qamats + shin dot) are
-        // canonically equivalent and must still match.
-        let a = "\u{05E9}\u{05C1}\u{05B8}לום";
-        let b = "\u{05E9}\u{05B8}\u{05C1}לום";
-        assert_ne!(a, b);
-        assert!(text_matches(a, &[&format!("subject {b}")]));
-        assert!(text_matches(b, &[&format!("subject {a}")]));
-    }
-
-    #[test]
-    fn empty_fields_never_match() {
-        assert!(!text_matches("שלום", &[]));
-        assert!(!text_matches("שלום", &["", ""]));
     }
 }
 

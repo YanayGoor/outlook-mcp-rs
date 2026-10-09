@@ -53,8 +53,8 @@ impl Results {
 fn eq_default(folder: &str) -> EmailQuery {
     EmailQuery {
         query: None, folder: folder.to_string(), count: 25, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }
 }
 
@@ -304,36 +304,36 @@ fn system_test_plans_1_to_9() {
             "unread_only:true in inbox"),
         Err(e) => r.record("A3-unread", false, format!("failed: {e}")),
     }
-    match c.list_emails(EmailQuery { flagged: true, ..eq_default("inbox") }) {
+    match c.list_emails(EmailQuery { flag: vec!["follow_up".into(), "complete".into()], ..eq_default("inbox") }) {
         Ok(list) => check_set(&mut r, "A3-flagged", tagged_suffixes(&list),
             &["seed urgent", "seed completed"], "flagged:true in inbox"),
         Err(e) => r.record("A3-flagged", false, format!("failed: {e}")),
     }
-    match c.list_emails(EmailQuery { high_importance: true, ..eq_default("inbox") }) {
+    match c.list_emails(EmailQuery { importance: vec!["high".into()], ..eq_default("inbox") }) {
         Ok(list) => check_set(&mut r, "A3-importance", tagged_suffixes(&list),
             &["seed urgent"], "high_importance:true in inbox"),
         Err(e) => r.record("A3-importance", false, format!("failed: {e}")),
     }
-    match c.list_emails(EmailQuery { category: Some("Red Category".into()), ..eq_default("inbox") }) {
+    match c.list_emails(EmailQuery { category: vec!["Red Category".into()], ..eq_default("inbox") }) {
         Ok(list) => check_set(&mut r, "A3-cat-red", tagged_suffixes(&list),
             &["seed urgent", "seed completed"], "category Red Category in inbox"),
         Err(e) => r.record("A3-cat-red", false, format!("failed: {e}")),
     }
-    match c.list_emails(EmailQuery { category: Some("Blue Category".into()), ..eq_default("inbox") }) {
+    match c.list_emails(EmailQuery { category: vec!["Blue Category".into()], ..eq_default("inbox") }) {
         Ok(list) => check_set(&mut r, "A3-cat-blue-inbox", tagged_suffixes(&list),
             &["seed work read"], "category Blue Category in inbox"),
         Err(e) => r.record("A3-cat-blue-inbox", false, format!("failed: {e}")),
     }
-    match c.list_emails(EmailQuery { category: Some("Blue Category".into()), ..eq_default(&dest_folder) }) {
+    match c.list_emails(EmailQuery { category: vec!["Blue Category".into()], ..eq_default(&dest_folder) }) {
         Ok(list) => check_set(&mut r, "A3-cat-blue-dest", tagged_suffixes(&list),
             &["seed archived"], &format!("category Blue Category in {dest_folder}")),
         Err(e) => r.record("A3-cat-blue-dest", false, format!("failed: {e}")),
     }
-    match c.list_emails(EmailQuery { since_days: Some(1), ..eq_default("inbox") }) {
+    match c.list_emails(EmailQuery { received_after: Some("-1d".into()), ..eq_default("inbox") }) {
         Ok(list) => check_set(&mut r, "A3-since-days", tagged_suffixes(&list),
             &["seed urgent", "seed work read", "seed personal", "seed docs+attachment",
               "seed completed", "seed low importance", "seed plain"],
-            "since_days:1 in inbox (S5 excluded - moved out of inbox)"),
+            "received_after:-1d in inbox (S5 excluded - moved out of inbox)"),
         Err(e) => r.record("A3-since-days", false, format!("failed: {e}")),
     }
     match c.list_emails(EmailQuery { query: Some("docs".into()), ..eq_default("inbox") }) {
@@ -341,7 +341,7 @@ fn system_test_plans_1_to_9() {
             &["seed docs+attachment"], "query:docs in inbox"),
         Err(e) => r.record("A3-query", false, format!("failed: {e}")),
     }
-    match c.list_emails(EmailQuery { category: Some("Green Category".into()), unread_only: true, ..eq_default("inbox") }) {
+    match c.list_emails(EmailQuery { category: vec!["Green Category".into()], unread_only: true, ..eq_default("inbox") }) {
         Ok(list) => check_set(&mut r, "A3-combo", tagged_suffixes(&list),
             &["seed personal", "seed low importance"], "category Green + unread_only in inbox"),
         Err(e) => r.record("A3-combo", false, format!("failed: {e}")),
@@ -557,7 +557,7 @@ fn system_test_plans_1_to_9() {
     // ================= B1: list_events defaults, then filters =================
     println!("\n--- B1: list_events ---");
     match c.list_events(EventQuery {
-        start_date: Some("2026-07-16".to_string()), end_date: Some("2026-08-15".to_string()),
+        start_after: Some("2026-07-16".to_string()), start_before: Some("2026-08-15".to_string()),
         ..Default::default()
     }) {
         Ok(list) => r.record("B1-default", true, format!("{} real near-term events returned, no error", list.len())),
@@ -573,7 +573,7 @@ fn system_test_plans_1_to_9() {
         r.record(id, pass, format!("{note}: expected {expected:?}, got {actual:?}"));
     }
     let seeded_range = || EventQuery {
-        start_date: Some("2099-06-01".to_string()), end_date: Some("2099-06-10".to_string()),
+        start_after: Some("2099-06-01".to_string()), start_before: Some("2099-06-10".to_string()),
         ..Default::default()
     };
     match c.list_events(seeded_range()) {
@@ -591,27 +591,27 @@ fn system_test_plans_1_to_9() {
             &["seed cal busy", "seed cal free", "seed cal tentative", "seed cal ooo", "seed cal working-elsewhere"], "all_day:false"),
         Err(e) => r.record("B1-allday-false", false, format!("failed: {e}")),
     }
-    match c.list_events(EventQuery { show_as: Some("busy".into()), ..seeded_range() }) {
+    match c.list_events(EventQuery { show_as: vec!["busy".into()], ..seeded_range() }) {
         Ok(list) => check_cal_set(&mut r, "B1-busy", cal_tagged_suffixes(&list), &["seed cal busy", "seed cal allday"], "show_as:busy"),
         Err(e) => r.record("B1-busy", false, format!("failed: {e}")),
     }
-    match c.list_events(EventQuery { show_as: Some("tentative".into()), ..seeded_range() }) {
+    match c.list_events(EventQuery { show_as: vec!["tentative".into()], ..seeded_range() }) {
         Ok(list) => check_cal_set(&mut r, "B1-tentative", cal_tagged_suffixes(&list), &["seed cal tentative"], "show_as:tentative"),
         Err(e) => r.record("B1-tentative", false, format!("failed: {e}")),
     }
-    match c.list_events(EventQuery { show_as: Some("out_of_office".into()), ..seeded_range() }) {
+    match c.list_events(EventQuery { show_as: vec!["out_of_office".into()], ..seeded_range() }) {
         Ok(list) => check_cal_set(&mut r, "B1-ooo", cal_tagged_suffixes(&list), &["seed cal ooo"], "show_as:out_of_office"),
         Err(e) => r.record("B1-ooo", false, format!("failed: {e}")),
     }
-    match c.list_events(EventQuery { show_as: Some("working_elsewhere".into()), ..seeded_range() }) {
+    match c.list_events(EventQuery { show_as: vec!["working_elsewhere".into()], ..seeded_range() }) {
         Ok(list) => check_cal_set(&mut r, "B1-we", cal_tagged_suffixes(&list), &["seed cal working-elsewhere"], "show_as:working_elsewhere"),
         Err(e) => r.record("B1-we", false, format!("failed: {e}")),
     }
-    match c.list_events(EventQuery { category: Some("Blue Category".into()), ..seeded_range() }) {
+    match c.list_events(EventQuery { category: vec!["Blue Category".into()], ..seeded_range() }) {
         Ok(list) => check_cal_set(&mut r, "B1-cat-blue", cal_tagged_suffixes(&list), &["seed cal busy", "seed cal tentative"], "category Blue Category"),
         Err(e) => r.record("B1-cat-blue", false, format!("failed: {e}")),
     }
-    match c.list_events(EventQuery { category: Some("Green Category".into()), ..seeded_range() }) {
+    match c.list_events(EventQuery { category: vec!["Green Category".into()], ..seeded_range() }) {
         Ok(list) => check_cal_set(&mut r, "B1-cat-green", cal_tagged_suffixes(&list), &["seed cal free", "seed cal allday"], "category Green Category"),
         Err(e) => r.record("B1-cat-green", false, format!("failed: {e}")),
     }
@@ -704,7 +704,7 @@ fn system_test_plans_1_to_9() {
 
     // ================= B6: list_events confirm B2/B4/B5 =================
     println!("\n--- B6: list_events confirms B2/B4/B5 ---");
-    let b_range = || EventQuery { start_date: Some("2099-05-01".into()), end_date: Some("2099-05-04".into()), ..Default::default() };
+    let b_range = || EventQuery { start_after: Some("2099-05-01".into()), start_before: Some("2099-05-04".into()), ..Default::default() };
     match c.list_events(b_range()) {
         Ok(list) => {
             let ids: HashSet<&str> = list.iter().map(|e| e.id.as_str()).collect();
@@ -845,7 +845,7 @@ fn system_test_plans_1_to_9() {
     let email_sweep_clean = c.list_emails(EmailQuery { query: Some("systest".into()), ..eq_default("inbox") })
         .map(|l| l.is_empty()).unwrap_or(false);
     let event_sweep_clean = c.list_events(EventQuery {
-        start_date: Some("2099-05-01".into()), end_date: Some("2099-06-10".into()), ..Default::default()
+        start_after: Some("2099-05-01".into()), start_before: Some("2099-06-10".into()), ..Default::default()
     }).map(|l| l.is_empty()).unwrap_or(false);
     r.record("cleanup", leftovers.is_empty() && email_sweep_clean && event_sweep_clean,
         format!("leftovers={leftovers:?} email_sweep_clean={email_sweep_clean} event_sweep_clean={event_sweep_clean}"));

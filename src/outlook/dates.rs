@@ -182,7 +182,12 @@ pub fn parse_date_value(input: &str, now: NaiveDateTime) -> Result<DateValue, St
 /// [`parse_date_value`] relative to the current local time, with a
 /// [`ToolError`] naming the parameter on failure.
 pub fn parse_date_param(value: &str, field: &str) -> Result<DateValue, ToolError> {
-    parse_date_value(value, chrono::Local::now().naive_local())
+    parse_date_param_at(value, field, chrono::Local::now().naive_local())
+}
+
+/// [`parse_date_value`] with a [`ToolError`] naming the parameter on failure.
+pub fn parse_date_param_at(value: &str, field: &str, now: NaiveDateTime) -> Result<DateValue, ToolError> {
+    parse_date_value(value, now)
         .map_err(|reason| ToolError::new(format!("Invalid {field} {value:?}: {reason}; {DATE_GRAMMAR_HELP}")))
 }
 

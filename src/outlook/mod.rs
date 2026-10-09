@@ -2,6 +2,7 @@ pub mod client;
 pub mod com;
 pub mod dates;
 pub mod fake;
+pub mod filters;
 pub mod text_query;
 pub mod types;
 
@@ -9,8 +10,22 @@ use crate::error::ToolError;
 use serde_json::Value;
 use types::*;
 
-/// All filters for `list_emails`. All optional except `folder`/`count`/`offset`
-/// (which the server fills with defaults). Supplying several ANDs them.
+/// Paging caps shared by the `list_*` tools (issue #34). Every list tool
+/// takes `count` (clamped to `1..=` its cap) and `offset` (matches to skip,
+/// after every filter). `list_emails` defaults to 10; the others default to
+/// their cap, which is what they returned before paging existed.
+pub const DEFAULT_EMAIL_COUNT: i32 = 10;
+pub const MAX_EMAIL_COUNT: i32 = 200;
+/// `list_events` cap: a recurring series without an end date expands
+/// without bound under `IncludeRecurrences`.
+pub const MAX_EVENT_COUNT: i32 = 250;
+pub const MAX_TASK_COUNT: i32 = 500;
+pub const MAX_NOTE_COUNT: i32 = 500;
+
+/// All filters for `list_emails`. Every filter is optional; supplying
+/// several ANDs them, and the values of one list-valued filter are ORed
+/// (an empty list means "no filter"). Dates use the shared grammar in
+/// [`dates`]; `query` uses the shared syntax in [`text_query`].
 #[derive(Debug, Clone)]
 pub struct EmailQuery {
     pub query: Option<String>,
@@ -20,17 +35,34 @@ pub struct EmailQuery {
     /// values are treated as 0.
     pub offset: i32,
     pub unread_only: bool,
-    pub from: Option<String>,
+    /// Sender filter: caseless substring of the sender's name or address.
+    pub from: Vec<String>,
     /// Recipient filter: caseless substring of any To/CC recipient's
     /// display name or address.
-    pub to: Option<String>,
-    pub category: Option<String>,
+    pub to: Vec<String>,
+    pub category: Vec<String>,
+    /// `ReceivedTime >=` this date.
     pub received_after: Option<String>,
+    /// `ReceivedTime <=` this date (a bare ISO date includes that whole day).
     pub received_before: Option<String>,
-    pub since_days: Option<i32>,
     pub has_attachments: Option<bool>,
-    pub flagged: bool,
-    pub high_importance: bool,
+    /// `get_email`'s `item_type`: "email" | "meeting" | "bounce" | "read_receipt" | "other".
+    pub item_type: Vec<String>,
+    /// "low" | "normal" | "high".
+    pub importance: Vec<String>,
+    /// `update_email`'s `flag` values: "follow_up" | "complete" | "clear" (no flag).
+    pub flag: Vec<String>,
+}
+
+impl Default for EmailQuery {
+    fn default() -> Self {
+        Self {
+            query: None, folder: "inbox".to_string(), count: DEFAULT_EMAIL_COUNT, offset: 0,
+            unread_only: false, from: Vec::new(), to: Vec::new(), category: Vec::new(),
+            received_after: None, received_before: None, has_attachments: None,
+            item_type: Vec::new(), importance: Vec::new(), flag: Vec::new(),
+        }
+    }
 }
 
 /// All changes `update_email` can apply to one existing email. Every field
@@ -150,48 +182,93 @@ pub struct NoteUpdate {
 }
 
 /// All filters for `list_events`. Every field is optional; supplying several
-/// ANDs them. `start_date`/`end_date` bound the (recurrence-expanded) scan;
-/// the rest filter the streamed events client-side. `calendar_of` (an
-/// email/name) opens another person's shared calendar instead of your own.
-#[derive(Debug, Clone, Default)]
+/// ANDs them, and the values of one list-valued filter are ORed.
+/// `start_after`/`start_before` bound the (recurrence-expanded) scan on the
+/// event's start (default: today 00:00 to 7 days later); the rest filter the
+/// streamed events client-side (see [`filters::event_matches`]).
+/// `calendar_of` (an email/name) opens another person's shared calendar
+/// instead of your own.
+#[derive(Debug, Clone)]
 pub struct EventQuery {
-    pub start_date: Option<String>,
-    pub end_date: Option<String>,
-    pub query: Option<String>,                 // text match on subject + location
-    pub category: Option<String>,
-    pub show_as: Option<String>,               // "free"|"tentative"|"busy"|"out_of_office"|"working_elsewhere"
-    pub my_response: Option<String>,           // "organizer"|"accepted"|"declined"|"tentative"|"not_responded"
-    pub attendees: Option<Vec<String>>,        // match events where ANY listed person participates
+    pub start_after: Option<String>,
+    /// A bare ISO date includes that whole day.
+    pub start_before: Option<String>,
+    pub query: Option<String>,
+    pub category: Vec<String>,
+    pub show_as: Vec<String>,                  // "free"|"tentative"|"busy"|"out_of_office"|"working_elsewhere"
+    pub my_response: Vec<String>,              // "organizer"|"accepted"|"declined"|"tentative"|"not_responded"|"none"
+    pub attendees: Vec<String>,                // match events where ANY listed person participates
     pub attendee_role: Option<String>,         // "required"|"optional"|"any" (default "any")
     pub meetings_only: bool,
     pub all_day: Option<bool>,
     pub calendar_of: Option<String>,
+    pub count: i32,
+    pub offset: i32,
+}
+
+impl Default for EventQuery {
+    fn default() -> Self {
+        Self {
+            start_after: None, start_before: None, query: None, category: Vec::new(),
+            show_as: Vec::new(), my_response: Vec::new(), attendees: Vec::new(),
+            attendee_role: None, meetings_only: false, all_day: None, calendar_of: None,
+            count: MAX_EVENT_COUNT, offset: 0,
+        }
+    }
 }
 
 /// All filters for `list_tasks`. Every field is optional except
-/// `include_completed`; supplying several ANDs them. `include_completed`
-/// drives a server-side `Restrict`; the rest filter the streamed tasks
-/// client-side (there's no established DASL text-search path for the Tasks
-/// folder in this codebase, unlike email's `@SQL` queries — same approach
-/// `EventQuery`'s `query`/`category` already use). `query` matches either
-/// the subject or the real task body, read per-item — same as `NoteQuery`'s
-/// `query` below.
-#[derive(Debug, Clone, Default)]
+/// `include_completed`; supplying several ANDs them, and the values of one
+/// list-valued filter are ORed. `include_completed` drives a server-side
+/// `Restrict`; the rest filter the streamed tasks client-side (see
+/// [`filters::task_matches`]). `query` searches the subject and the real
+/// task body, read per item.
+#[derive(Debug, Clone)]
 pub struct TaskQuery {
     pub include_completed: bool,
-    pub category: Option<String>,
-    pub importance: Option<String>,
-    pub query: Option<String>, // text match on subject OR body
+    pub category: Vec<String>,
+    pub importance: Vec<String>,
+    pub query: Option<String>,
+    /// `DueDate >=` this date; tasks without a due date never match.
+    pub due_after: Option<String>,
+    /// `DueDate <=` this date (a bare ISO date includes that whole day).
+    pub due_before: Option<String>,
+    pub count: i32,
+    pub offset: i32,
 }
 
-/// All filters for `list_notes`. Both fields optional; supplying both ANDs
-/// them. A note's *only* content is its body (it has no separate subject),
-/// so `note_matches` reads the real body text to match `query` — the same
-/// approach `TaskQuery`'s `query` above now uses alongside its subject.
-#[derive(Debug, Clone, Default)]
+impl Default for TaskQuery {
+    fn default() -> Self {
+        Self {
+            include_completed: false, category: Vec::new(), importance: Vec::new(), query: None,
+            due_after: None, due_before: None, count: MAX_TASK_COUNT, offset: 0,
+        }
+    }
+}
+
+/// All filters for `list_notes`. Every field is optional; supplying several
+/// ANDs them. A note's only content is its body (its `subject` is the
+/// body's first line), so `query` searches the real body text (see
+/// [`filters::note_matches`]).
+#[derive(Debug, Clone)]
 pub struct NoteQuery {
-    pub category: Option<String>,
+    pub category: Vec<String>,
     pub query: Option<String>,
+    /// `CreationTime >=` this date.
+    pub created_after: Option<String>,
+    /// `CreationTime <=` this date (a bare ISO date includes that whole day).
+    pub created_before: Option<String>,
+    pub count: i32,
+    pub offset: i32,
+}
+
+impl Default for NoteQuery {
+    fn default() -> Self {
+        Self {
+            category: Vec::new(), query: None, created_after: None, created_before: None,
+            count: MAX_NOTE_COUNT, offset: 0,
+        }
+    }
 }
 
 /// All inputs for `create_event`. `required_attendees`/`optional_attendees`

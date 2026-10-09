@@ -27,8 +27,8 @@ fn list_folders_returns_at_least_inbox() {
 fn list_emails_returns_inbox_items() {
     let emails = client().list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 5, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("list_emails should succeed against a live Outlook");
     // Not asserting a specific count/content since the real mailbox varies —
     // just confirm the call succeeds and returns well-formed summaries.
@@ -44,8 +44,8 @@ fn list_emails_offset_pages_tile_without_overlap() {
     let page = |count: i32, offset: i32| -> Vec<String> {
         c.list_emails(EmailQuery {
             query: None, folder: "inbox".into(), count, offset, unread_only: false,
-            from: None, to: None, category: None, received_after: None, received_before: None,
-            since_days: None, has_attachments: None, flagged: false, high_importance: false,
+            from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+            item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
         }).expect("list_emails should succeed against a live Outlook")
             .into_iter().map(|e| e.id).collect()
     };
@@ -93,9 +93,8 @@ fn permanent_delete_of_draft_skips_deleted_items() {
     // ...and nothing with that subject may be sitting in Deleted Items.
     let leftovers = c.list_emails(EmailQuery {
         query: Some(subject.to_string()), folder: "deleted".into(), count: 50, offset: 0,
-        unread_only: false, from: None, to: None, category: None, received_after: None,
-        received_before: None, since_days: None, has_attachments: None,
-        flagged: false, high_importance: false,
+        unread_only: false, from: vec![], to: vec![], category: vec![], received_after: None,
+        received_before: None, item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("list_emails on Deleted Items should succeed");
     assert!(
         !leftovers.iter().any(|e| e.subject == subject),
@@ -276,8 +275,8 @@ fn list_events_filters_by_query_and_category() {
 
     // A matching query in the window finds it.
     let hits = c.list_events(EventQuery {
-        start_date: Some("2099-01-05".to_string()),
-        end_date: Some("2099-01-05".to_string()),
+        start_after: Some("2099-01-05".to_string()),
+        start_before: Some("2099-01-05".to_string()),
         query: Some("filter probe".to_string()),
         ..Default::default()
     }).expect("list_events query");
@@ -288,8 +287,8 @@ fn list_events_filters_by_query_and_category() {
 
     // A non-matching query in the same window excludes it.
     let misses = c.list_events(EventQuery {
-        start_date: Some("2099-01-05".to_string()),
-        end_date: Some("2099-01-05".to_string()),
+        start_after: Some("2099-01-05".to_string()),
+        start_before: Some("2099-01-05".to_string()),
         query: Some("no-such-subject-xyz".to_string()),
         ..Default::default()
     }).expect("list_events non-matching query");
@@ -327,15 +326,15 @@ fn list_emails_query_filter_narrows_results() {
     let c = WindowsOutlookClient::new();
     let all = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("plain list should work");
     // A query that almost certainly matches nothing should return <= all.
     let filtered = c.list_emails(EmailQuery {
         query: Some("zzqx-improbable-token-9137".into()),
         folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("query list should work");
     assert!(filtered.len() <= all.len());
 }
@@ -355,9 +354,8 @@ fn list_emails_query_matches_real_body_text() {
 
     let found = c.list_emails(EmailQuery {
         query: Some(token.to_string()), folder: "drafts".into(), count: 25, offset: 0,
-        unread_only: false, from: None, to: None, category: None, received_after: None,
-        received_before: None, since_days: None, has_attachments: None,
-        flagged: false, high_importance: false,
+        unread_only: false, from: vec![], to: vec![], category: vec![], received_after: None,
+        received_before: None, item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("list_emails query should succeed");
 
     c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
@@ -379,8 +377,8 @@ fn list_emails_hebrew_query_finds_matching_subject() {
     let c = client();
     let inbox = |query: Option<String>| EmailQuery {
         query, folder: "inbox".into(), count: 50, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     };
     let is_hebrew = |ch: char| ('\u{0590}'..='\u{05FF}').contains(&ch);
     let mut term = std::env::var("OUTLOOK_MCP_LIVE_HEBREW_QUERY").ok().filter(|s| !s.is_empty());
@@ -529,8 +527,8 @@ fn inline_flag_consistent_on_a_real_inbox_email() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("list");
     let Some(email) = list.iter().find(|e| e.has_attachments) else {
         eprintln!("skipping: none of the newest 25 inbox emails has attachments");
@@ -555,8 +553,8 @@ fn get_inline_image_round_trips_a_real_content_id() {
     let c = WindowsOutlookClient::new();
     let emails = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 25, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("list_emails");
     let found = emails.iter().find_map(|e| {
         // Some item types don't support attachments; just skip those.
@@ -593,8 +591,8 @@ fn get_email_reports_item_type_for_real_inbox_item() {
     let c = WindowsOutlookClient::new();
     let list = c.list_emails(EmailQuery {
         query: None, folder: "inbox".into(), count: 1, offset: 0, unread_only: false,
-        from: None, to: None, category: None, received_after: None, received_before: None,
-        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+        from: vec![], to: vec![], category: vec![], received_after: None, received_before: None,
+        item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     }).expect("list");
     if let Some(first) = list.first() {
         let detail = c.get_email(first.id.clone(), false, None).expect("get_email");
@@ -1011,9 +1009,10 @@ fn list_tasks_filters_and_create_task_additions_round_trip() {
 
     let found = c.list_tasks(TaskQuery {
         include_completed: false,
-        category: Some("Red Category".to_string()),
-        importance: Some("high".to_string()),
+        category: vec!["Red Category".to_string()],
+        importance: vec!["high".to_string()],
         query: Some("filtered task".to_string()),
+        ..Default::default()
     }).expect("list_tasks should succeed");
     assert!(found.iter().any(|t| t.id == id), "filtered list_tasks should find the new task");
 
@@ -1033,10 +1032,8 @@ fn list_tasks_query_matches_real_body_text() {
     let id = created["id"].as_str().unwrap().to_string();
 
     let found = c.list_tasks(TaskQuery {
-        include_completed: false,
-        category: None,
-        importance: None,
         query: Some(token.to_string()),
+        ..Default::default()
     }).expect("list_tasks query should succeed");
 
     c.delete_task(id.clone()).expect("cleanup: delete the task");
@@ -1106,8 +1103,9 @@ fn list_notes_filters_and_create_note_additions_round_trip() {
     let id = created["id"].as_str().unwrap().to_string();
 
     let found = c.list_notes(NoteQuery {
-        category: Some("Green Category".to_string()),
+        category: vec!["Green Category".to_string()],
         query: Some("renew".to_string()),
+        ..Default::default()
     }).expect("list_notes should succeed");
     assert!(found.iter().any(|n| n.id == id), "filtered list_notes should find the new note");
 
@@ -1198,9 +1196,8 @@ fn list_emails_to_filter_matches_draft_recipient() {
 
     let query = |to: &str| EmailQuery {
         query: None, folder: "drafts".into(), count: 50, offset: 0, unread_only: false,
-        from: None, to: Some(to.to_string()), category: None, received_after: None,
-        received_before: None, since_days: None, has_attachments: None,
-        flagged: false, high_importance: false,
+        from: vec![], to: vec![to.to_string()], category: vec![], received_after: None,
+        received_before: None, item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     };
     let hit = c.list_emails(query("nobody@example.invalid"));
     let miss = c.list_emails(query("someone-else@example.invalid"));
@@ -1230,9 +1227,8 @@ fn hebrew_subject_and_body_round_trip_through_com() {
     let detail = c.get_email(id.clone(), false, None);
     let found = c.list_emails(EmailQuery {
         query: Some("מייל שיקוף".to_string()), folder: "drafts".into(), count: 25, offset: 0,
-        unread_only: false, from: None, to: None, category: None, received_after: None,
-        received_before: None, since_days: None, has_attachments: None,
-        flagged: false, high_importance: false,
+        unread_only: false, from: vec![], to: vec![], category: vec![], received_after: None,
+        received_before: None, item_type: vec![], importance: vec![], flag: vec![], has_attachments: None,
     });
 
     c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
@@ -1245,4 +1241,129 @@ fn hebrew_subject_and_body_round_trip_through_com() {
     );
     let found = found.expect("list_emails with a Hebrew query should succeed");
     assert!(found.iter().any(|e| e.id == id && e.subject == subject));
+}
+
+// ---- Shared list_* conventions (issues #30, #32, #34). All read-only. ----
+
+/// `received` as the summaries report it, parsed back.
+fn received_at(e: &outlook_mcp_rs::outlook::types::EmailSummary) -> Option<chrono::NaiveDateTime> {
+    e.received.as_deref().and_then(|r| chrono::NaiveDateTime::parse_from_str(r, "%Y-%m-%dT%H:%M:%S").ok())
+}
+
+#[test]
+#[ignore]
+fn list_emails_relative_dates_bound_received_time() {
+    // `-14d` / `start_of_week` / `today` go through the shared date grammar
+    // and then the existing JET formatter. NOTE: on a day-first Windows
+    // locale this can still misfilter: that is issue #1 (jet_datetime), not
+    // the grammar.
+    let c = client();
+    let now = chrono::Local::now().naive_local();
+    let recent = c.list_emails(EmailQuery { received_after: Some("-14d".into()), count: 50, ..Default::default() })
+        .expect("received_after: -14d should parse and run");
+    for e in &recent {
+        let at = received_at(e).expect("received time");
+        // JET filters have minute precision; allow a minute of slack.
+        assert!(at >= now - chrono::Duration::days(14) - chrono::Duration::minutes(1), "{at} is older than 14 days");
+    }
+    let before_today = c.list_emails(EmailQuery { received_before: Some("today".into()), count: 20, ..Default::default() })
+        .expect("received_before: today should parse and run");
+    let midnight = now.date().and_hms_opt(0, 0, 0).unwrap();
+    for e in &before_today {
+        assert!(received_at(e).expect("received time") <= midnight + chrono::Duration::minutes(1));
+    }
+    c.list_emails(EmailQuery {
+        received_after: Some("start_of_week-1w".into()), received_before: Some("end_of_week".into()),
+        count: 5, ..Default::default()
+    }).expect("keyword+offset range should parse and run");
+    let err = c.list_emails(EmailQuery { received_after: Some("next tuesday".into()), ..Default::default() })
+        .expect_err("garbage date must be rejected");
+    assert!(err.0.contains("Invalid received_after"), "{}", err.0);
+}
+
+#[test]
+#[ignore]
+fn list_emails_item_type_filter_matches_get_email() {
+    let c = client();
+    let emails = c.list_emails(EmailQuery { item_type: vec!["email".into()], count: 15, ..Default::default() })
+        .expect("item_type filter should run");
+    for e in &emails {
+        let detail = c.get_email(e.id.clone(), false, Some(1_000)).expect("get_email");
+        assert_eq!(detail.item_type, "email", "{} is a {}", e.subject, detail.item_type);
+    }
+    let not_email = c.list_emails(EmailQuery {
+        item_type: vec!["meeting".into(), "bounce".into(), "read_receipt".into(), "other".into()],
+        count: 15, ..Default::default()
+    }).expect("non-mail item_type filter should run");
+    for e in &not_email {
+        let detail = c.get_email(e.id.clone(), false, Some(1_000)).expect("get_email");
+        assert_ne!(detail.item_type, "email", "{} should not be plain mail", e.subject);
+    }
+}
+
+#[test]
+#[ignore]
+fn list_emails_flag_states_partition_the_folder() {
+    // Read-only: `clear` and `follow_up`/`complete` must never return the same item.
+    let c = client();
+    let ids = |flag: &[&str]| -> Vec<String> {
+        c.list_emails(EmailQuery { flag: flag.iter().map(|f| f.to_string()).collect(), count: 200, ..Default::default() })
+            .expect("flag filter should run")
+            .into_iter().map(|e| e.id).collect()
+    };
+    let clear = ids(&["clear"]);
+    let flagged = ids(&["follow_up", "complete"]);
+    assert!(clear.iter().all(|id| !flagged.contains(id)), "an item is both clear and flagged");
+    let follow_up = ids(&["follow_up"]);
+    assert!(follow_up.iter().all(|id| flagged.contains(id) || flagged.len() == 200));
+}
+
+#[test]
+#[ignore]
+fn list_emails_subject_scope_and_phrase_find_a_recent_subject() {
+    let c = client();
+    let recent = c.list_emails(EmailQuery { count: 20, ..Default::default() }).expect("plain list");
+    // Pick a recent subject with at least two words and no quote characters.
+    let Some(target) = recent.iter().find(|e| {
+        let words: Vec<&str> = e.subject.split_whitespace().collect();
+        words.len() >= 2 && !e.subject.contains('"') && !e.subject.contains('*')
+    }) else {
+        eprintln!("skipping: no multi-word subject in the 20 newest inbox items");
+        return;
+    };
+    let words: Vec<&str> = target.subject.split_whitespace().take(2).collect();
+    let phrase = format!("subject:\"{} {}\"", words[0], words[1]);
+    let found = c.list_emails(EmailQuery { query: Some(phrase.clone()), count: 200, ..Default::default() })
+        .expect("scoped phrase query should run");
+    assert!(found.iter().any(|e| e.id == target.id), "{phrase} should find {:?}", target.subject);
+    let wildcard = format!("subject:{}*{}", words[0], words[1]);
+    let found = c.list_emails(EmailQuery { query: Some(wildcard.clone()), count: 200, ..Default::default() })
+        .expect("wildcard query should run");
+    assert!(found.iter().any(|e| e.id == target.id), "{wildcard} should find {:?}", target.subject);
+}
+
+#[test]
+#[ignore]
+fn list_events_tasks_notes_pages_tile_without_overlap() {
+    let c = client();
+    let events = |count: i32, offset: i32| -> Vec<String> {
+        c.list_events(EventQuery {
+            start_after: Some("today-30d".into()), start_before: Some("today+30d".into()),
+            count, offset, ..Default::default()
+        }).expect("list_events page").into_iter().map(|e| e.id).collect()
+    };
+    let tasks = |count: i32, offset: i32| -> Vec<String> {
+        c.list_tasks(TaskQuery { include_completed: true, count, offset, ..Default::default() })
+            .expect("list_tasks page").into_iter().map(|t| t.id).collect()
+    };
+    let notes = |count: i32, offset: i32| -> Vec<String> {
+        c.list_notes(NoteQuery { count, offset, ..Default::default() })
+            .expect("list_notes page").into_iter().map(|n| n.id).collect()
+    };
+    for (name, page) in [("events", &events as &dyn Fn(i32, i32) -> Vec<String>), ("tasks", &tasks), ("notes", &notes)] {
+        let (p1, p2, both) = (page(3, 0), page(3, 3), page(6, 0));
+        assert!(p1.len() <= 3 && p2.len() <= 3, "{name}: count not honored");
+        // Recurring-event occurrences can share an id, so compare as sequences.
+        assert_eq!([p1, p2].concat(), both, "{name}: pages don't tile");
+    }
 }

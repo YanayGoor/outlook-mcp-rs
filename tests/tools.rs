@@ -60,7 +60,11 @@ async fn list_emails_uses_defaults() {
     assert_eq!(args["count"], 10);
     assert_eq!(args["offset"], 0);
     assert_eq!(args["unread_only"], false);
-    assert!(args["to"].is_null());
+    assert_eq!(args["to"], json!([]));
+    assert_eq!(args["item_type"], json!([]));
+    assert_eq!(args["importance"], json!([]));
+    assert_eq!(args["flag"], json!([]));
+    assert!(args["received_after"].is_null());
 }
 
 #[tokio::test]
@@ -75,8 +79,8 @@ async fn list_emails_forwards_recipient_filter() {
     let (name, args) = &fake.calls()[0];
     assert_eq!(name, "list_emails");
     assert_eq!(args["folder"], "sent");
-    assert_eq!(args["to"], "ada@x.com");
-    assert_eq!(args["from"], "me@x.com");
+    assert_eq!(args["to"], json!(["ada@x.com"]));
+    assert_eq!(args["from"], json!(["me@x.com"]));
 }
 
 #[tokio::test]
@@ -84,19 +88,124 @@ async fn list_emails_forwards_query_and_filters() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
     let params: ListEmailsParams = serde_json::from_value(json!({
-        "query": "invoice", "from": "ada@x.com", "category": "Work",
-        "since_days": 30, "has_attachments": true, "flagged": true, "high_importance": true
+        "query": "subject:\"weekly update\" q3*", "from": "ada@x.com", "category": "Work",
+        "received_after": "-30d", "received_before": "today", "has_attachments": true,
+        "flag": "follow_up", "importance": "HIGH", "item_type": ["email", "meeting"]
     }))
     .unwrap();
     server.list_emails(Parameters(params)).await.unwrap();
     let (_, args) = &fake.calls()[0];
-    assert_eq!(args["query"], "invoice");
-    assert_eq!(args["from"], "ada@x.com");
-    assert_eq!(args["category"], "Work");
-    assert_eq!(args["since_days"], 30);
+    assert_eq!(args["query"], "subject:\"weekly update\" q3*");
+    assert_eq!(args["from"], json!(["ada@x.com"]));
+    assert_eq!(args["category"], json!(["Work"]));
+    assert_eq!(args["received_after"], "-30d");
+    assert_eq!(args["received_before"], "today");
     assert_eq!(args["has_attachments"], true);
-    assert_eq!(args["flagged"], true);
-    assert_eq!(args["high_importance"], true);
+    assert_eq!(args["flag"], json!(["follow_up"]));
+    assert_eq!(args["importance"], json!(["high"]));
+    assert_eq!(args["item_type"], json!(["email", "meeting"]));
+}
+
+#[tokio::test]
+async fn list_emails_string_filters_accept_lists() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "from": ["Person A", " ", "Person B"], "to": ["ada@x.com", "bob@x.com"],
+        "category": ["Work", "Red Category"], "importance": ["low", "high", "low"]
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    let (_, args) = &fake.calls()[0];
+    assert_eq!(args["from"], json!(["Person A", "Person B"]));
+    assert_eq!(args["to"], json!(["ada@x.com", "bob@x.com"]));
+    assert_eq!(args["category"], json!(["Work", "Red Category"]));
+    assert_eq!(args["importance"], json!(["low", "high"]));
+}
+
+#[tokio::test]
+async fn list_emails_maps_deprecated_filters() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "since_days": 14, "flagged": true, "high_importance": true
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    let (_, args) = &fake.calls()[0];
+    assert_eq!(args["received_after"], "-14d");
+    assert_eq!(args["flag"], json!(["follow_up", "complete"]));
+    assert_eq!(args["importance"], json!(["high"]));
+    assert!(args.get("since_days").is_none());
+    assert!(args.get("flagged").is_none());
+    assert!(args.get("high_importance").is_none());
+}
+
+#[tokio::test]
+async fn list_emails_deprecated_filters_agree_with_new_ones() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    // since_days 0 was "no filter"; flagged + a flagged state narrows; the
+    // same importance twice is not a contradiction.
+    let params: ListEmailsParams = serde_json::from_value(json!({
+        "since_days": 0, "received_after": "2026-06-01", "flagged": true, "flag": "complete",
+        "high_importance": true, "importance": "high"
+    }))
+    .unwrap();
+    server.list_emails(Parameters(params)).await.unwrap();
+    let (_, args) = &fake.calls()[0];
+    assert_eq!(args["received_after"], "2026-06-01");
+    assert_eq!(args["flag"], json!(["complete"]));
+    assert_eq!(args["importance"], json!(["high"]));
+}
+
+#[tokio::test]
+async fn list_emails_rejects_contradicting_deprecated_filters() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    for (args, names) in [
+        (json!({"since_days": 7, "received_after": "-14d"}), ["received_after", "since_days"]),
+        (json!({"flagged": true, "flag": "clear"}), ["flag", "flagged"]),
+        (json!({"high_importance": true, "importance": "low"}), ["importance", "high_importance"]),
+    ] {
+        let params: ListEmailsParams = serde_json::from_value(args).unwrap();
+        let err = server.list_emails(Parameters(params)).await.unwrap_err();
+        let both = format!("pass either `{}` or `{}`, not both", names[0], names[1]);
+        assert!(err.message.contains(&both), "{}", err.message);
+    }
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn list_emails_rejects_unknown_enum_values() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    for (args, needle) in [
+        (json!({"importance": "urgent"}), "Invalid importance \"urgent\""),
+        (json!({"flag": ["follow_up", "flagged"]}), "Invalid flag \"flagged\""),
+        (json!({"item_type": "invite"}), "Invalid item_type \"invite\""),
+    ] {
+        let params: ListEmailsParams = serde_json::from_value(args).unwrap();
+        let err = server.list_emails(Parameters(params)).await.unwrap_err();
+        assert!(err.message.contains(needle), "{}", err.message);
+    }
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn list_emails_rejects_bad_dates_naming_the_parameter() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEmailsParams =
+        serde_json::from_value(json!({"received_before": "next tuesday"})).unwrap();
+    let err = server.list_emails(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid received_before \"next tuesday\""), "{}", err.message);
+    assert!(err.message.contains("'-14d'"), "{}", err.message);
+    let params: ListEmailsParams =
+        serde_json::from_value(json!({"received_after": "today", "received_before": "yesterday"})).unwrap();
+    let err = server.list_emails(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("later than received_before"), "{}", err.message);
+    assert!(fake.calls().is_empty());
 }
 
 #[tokio::test]
@@ -233,8 +342,8 @@ async fn hebrew_arguments_reach_the_client_unchanged() {
         .unwrap();
     let calls = fake.calls();
     assert_eq!(calls[0].1["query"], HE_SUBJECT);
-    assert_eq!(calls[0].1["from"], HE_SENDER);
-    assert_eq!(calls[0].1["category"], "סיכום עשייה");
+    assert_eq!(calls[0].1["from"], json!([HE_SENDER]));
+    assert_eq!(calls[0].1["category"], json!(["סיכום עשייה"]));
     assert_eq!(calls[1].1["subject"], HE_SUBJECT);
     assert_eq!(calls[1].1["body"], HE_BODY);
 }
@@ -672,52 +781,102 @@ async fn client_error_propagates_as_tool_error() {
 async fn list_events_passes_date_range() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
-        .list_events(Parameters(ListEventsParams {
-            start_date: Some("2026-06-10".to_string()),
-            end_date: Some("2026-06-17".to_string()),
-            query: None, category: None, show_as: None, my_response: None,
-            attendees: None, attendee_role: None, meetings_only: false,
-            all_day: None, calendar_of: None,
-        }))
-        .await
-        .unwrap();
+    let params: ListEventsParams = serde_json::from_value(json!({
+        "start_after": "2026-06-10", "start_before": "2026-06-17"
+    }))
+    .unwrap();
+    server.list_events(Parameters(params)).await.unwrap();
     let (name, args) = fake.calls().pop().unwrap();
     assert_eq!(name, "list_events");
-    assert_eq!(args["start_date"], "2026-06-10");
-    assert_eq!(args["end_date"], "2026-06-17");
+    assert_eq!(args["start_after"], "2026-06-10");
+    assert_eq!(args["start_before"], "2026-06-17");
+}
+
+#[tokio::test]
+async fn list_events_accepts_deprecated_start_date_end_date() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams = serde_json::from_value(json!({
+        "start_date": "start_of_week", "end_date": "end_of_week"
+    }))
+    .unwrap();
+    server.list_events(Parameters(params)).await.unwrap();
+    let (_, args) = fake.calls().pop().unwrap();
+    assert_eq!(args["start_after"], "start_of_week");
+    assert_eq!(args["start_before"], "end_of_week");
+    // Old and new name for the same bound together is a duplicate field.
+    assert!(serde_json::from_value::<ListEventsParams>(json!({
+        "start_date": "today", "start_after": "today"
+    }))
+    .is_err());
+}
+
+#[tokio::test]
+async fn list_events_rejects_bad_dates() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams = serde_json::from_value(json!({"start_after": "2026-13-01"})).unwrap();
+    let err = server.list_events(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid start_after \"2026-13-01\""), "{}", err.message);
+}
+
+#[tokio::test]
+async fn list_events_pages_with_count_and_offset() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams = serde_json::from_value(json!({})).unwrap();
+    server.list_events(Parameters(params)).await.unwrap();
+    let params: ListEventsParams = serde_json::from_value(json!({"count": 20, "offset": 40})).unwrap();
+    server.list_events(Parameters(params)).await.unwrap();
+    let calls = fake.calls();
+    assert_eq!(calls[0].1["count"], 250);
+    assert_eq!(calls[0].1["offset"], 0);
+    assert_eq!(calls[1].1["count"], 20);
+    assert_eq!(calls[1].1["offset"], 40);
 }
 
 #[tokio::test]
 async fn list_events_forwards_all_filters() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
-        .list_events(Parameters(ListEventsParams {
-            start_date: None, end_date: None,
-            query: Some("review".to_string()),
-            category: Some("Work".to_string()),
-            show_as: Some("busy".to_string()),
-            my_response: Some("accepted".to_string()),
-            attendees: Some(vec!["alice@example.com".to_string()]),
-            attendee_role: Some("required".to_string()),
-            meetings_only: true,
-            all_day: Some(false),
-            calendar_of: Some("bob@example.com".to_string()),
-        }))
-        .await
-        .unwrap();
+    let params: ListEventsParams = serde_json::from_value(json!({
+        "query": "review", "category": "Work", "show_as": "Busy", "my_response": "accepted",
+        "attendees": ["alice@example.com"], "attendee_role": "required", "meetings_only": true,
+        "all_day": false, "calendar_of": "bob@example.com"
+    }))
+    .unwrap();
+    server.list_events(Parameters(params)).await.unwrap();
     let (name, args) = fake.calls().pop().unwrap();
     assert_eq!(name, "list_events");
     assert_eq!(args["query"], "review");
-    assert_eq!(args["category"], "Work");
-    assert_eq!(args["show_as"], "busy");
-    assert_eq!(args["my_response"], "accepted");
+    assert_eq!(args["category"], json!(["Work"]));
+    assert_eq!(args["show_as"], json!(["busy"]));
+    assert_eq!(args["my_response"], json!(["accepted"]));
     assert_eq!(args["attendees"], serde_json::json!(["alice@example.com"]));
     assert_eq!(args["attendee_role"], "required");
     assert_eq!(args["meetings_only"], true);
     assert_eq!(args["all_day"], false);
     assert_eq!(args["calendar_of"], "bob@example.com");
+}
+
+#[tokio::test]
+async fn list_events_filters_accept_lists_and_single_values() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams = serde_json::from_value(json!({
+        "category": ["Work", "Home"], "show_as": ["busy", "out_of_office"],
+        "my_response": ["accepted", "tentative"], "attendees": "alice@example.com"
+    }))
+    .unwrap();
+    server.list_events(Parameters(params)).await.unwrap();
+    let (_, args) = fake.calls().pop().unwrap();
+    assert_eq!(args["category"], json!(["Work", "Home"]));
+    assert_eq!(args["show_as"], json!(["busy", "out_of_office"]));
+    assert_eq!(args["my_response"], json!(["accepted", "tentative"]));
+    assert_eq!(args["attendees"], json!(["alice@example.com"]));
+    let params: ListEventsParams = serde_json::from_value(json!({"show_as": "away"})).unwrap();
+    let err = server.list_events(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid show_as \"away\""), "{}", err.message);
 }
 
 #[tokio::test]
@@ -1184,18 +1343,12 @@ async fn get_inline_image_surfaces_client_errors() {
 async fn list_tasks_passes_include_completed() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
-        .list_tasks(Parameters(ListTasksParams {
-            include_completed: true,
-            category: None,
-            importance: None,
-            query: None,
-        }))
-        .await
-        .unwrap();
+    let params: ListTasksParams = serde_json::from_value(json!({"include_completed": true})).unwrap();
+    server.list_tasks(Parameters(params)).await.unwrap();
     assert_eq!(fake.calls(), vec![
         ("list_tasks".to_string(), json!({
-            "include_completed": true, "category": null, "importance": null, "query": null,
+            "include_completed": true, "category": [], "importance": [], "query": null,
+            "due_after": null, "due_before": null, "count": 500, "offset": 0,
         })),
     ]);
 }
@@ -1204,21 +1357,36 @@ async fn list_tasks_passes_include_completed() {
 async fn list_tasks_forwards_filters() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
-        .list_tasks(Parameters(ListTasksParams {
-            include_completed: true,
-            category: Some("Red Category".to_string()),
-            importance: Some("high".to_string()),
-            query: Some("milk".to_string()),
-        }))
-        .await
-        .unwrap();
+    let params: ListTasksParams = serde_json::from_value(json!({
+        "include_completed": true, "category": "Red Category", "importance": ["High", "normal"],
+        "query": "body:milk", "due_after": "today", "due_before": "end_of_week",
+        "count": 25, "offset": 25
+    }))
+    .unwrap();
+    server.list_tasks(Parameters(params)).await.unwrap();
     let (name, args) = &fake.calls()[0];
     assert_eq!(name, "list_tasks");
     assert_eq!(args["include_completed"], true);
-    assert_eq!(args["category"], "Red Category");
-    assert_eq!(args["importance"], "high");
-    assert_eq!(args["query"], "milk");
+    assert_eq!(args["category"], json!(["Red Category"]));
+    assert_eq!(args["importance"], json!(["high", "normal"]));
+    assert_eq!(args["query"], "body:milk");
+    assert_eq!(args["due_after"], "today");
+    assert_eq!(args["due_before"], "end_of_week");
+    assert_eq!(args["count"], 25);
+    assert_eq!(args["offset"], 25);
+}
+
+#[tokio::test]
+async fn list_tasks_rejects_bad_importance_and_dates() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListTasksParams = serde_json::from_value(json!({"importance": "urgent"})).unwrap();
+    let err = server.list_tasks(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid importance \"urgent\""), "{}", err.message);
+    let params: ListTasksParams = serde_json::from_value(json!({"due_before": "soon"})).unwrap();
+    let err = server.list_tasks(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid due_before \"soon\""), "{}", err.message);
+    assert!(fake.calls().is_empty());
 }
 
 #[tokio::test]
@@ -1229,9 +1397,11 @@ async fn list_tasks_defaults_all_filters_to_none() {
     server.list_tasks(Parameters(params)).await.unwrap();
     let (_, args) = &fake.calls()[0];
     assert_eq!(args["include_completed"], false);
-    assert!(args["category"].is_null());
-    assert!(args["importance"].is_null());
+    assert_eq!(args["category"], json!([]));
+    assert_eq!(args["importance"], json!([]));
     assert!(args["query"].is_null());
+    assert_eq!(args["count"], 500);
+    assert_eq!(args["offset"], 0);
 }
 
 #[tokio::test]
@@ -1343,25 +1513,41 @@ async fn delete_task_records_call() {
 async fn list_notes_records_call() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server.list_notes(Parameters(ListNotesParams { category: None, query: None })).await.unwrap();
-    assert_eq!(fake.calls(), vec![("list_notes".to_string(), json!({"category": null, "query": null}))]);
+    let params: ListNotesParams = serde_json::from_value(json!({})).unwrap();
+    server.list_notes(Parameters(params)).await.unwrap();
+    assert_eq!(fake.calls(), vec![("list_notes".to_string(), json!({
+        "category": [], "query": null, "created_after": null, "created_before": null,
+        "count": 500, "offset": 0,
+    }))]);
 }
 
 #[tokio::test]
 async fn list_notes_forwards_filters() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server
-        .list_notes(Parameters(ListNotesParams {
-            category: Some("Green Category".to_string()),
-            query: Some("renew".to_string()),
-        }))
-        .await
-        .unwrap();
+    let params: ListNotesParams = serde_json::from_value(json!({
+        "category": ["Green Category", "Blue Category"], "query": "\"renew passport\"",
+        "created_after": "-30d", "created_before": "2026-06-30", "count": 5, "offset": 10
+    }))
+    .unwrap();
+    server.list_notes(Parameters(params)).await.unwrap();
     let (name, args) = &fake.calls()[0];
     assert_eq!(name, "list_notes");
-    assert_eq!(args["category"], "Green Category");
-    assert_eq!(args["query"], "renew");
+    assert_eq!(args["category"], json!(["Green Category", "Blue Category"]));
+    assert_eq!(args["query"], "\"renew passport\"");
+    assert_eq!(args["created_after"], "-30d");
+    assert_eq!(args["created_before"], "2026-06-30");
+    assert_eq!(args["count"], 5);
+    assert_eq!(args["offset"], 10);
+}
+
+#[tokio::test]
+async fn list_notes_rejects_bad_dates() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListNotesParams = serde_json::from_value(json!({"created_after": "-3x"})).unwrap();
+    let err = server.list_notes(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid created_after \"-3x\""), "{}", err.message);
 }
 
 #[tokio::test]
@@ -1371,7 +1557,7 @@ async fn list_notes_defaults_filters_to_none() {
     let params: ListNotesParams = serde_json::from_value(json!({})).unwrap();
     server.list_notes(Parameters(params)).await.unwrap();
     let (_, args) = &fake.calls()[0];
-    assert!(args["category"].is_null());
+    assert_eq!(args["category"], json!([]));
     assert!(args["query"].is_null());
 }
 

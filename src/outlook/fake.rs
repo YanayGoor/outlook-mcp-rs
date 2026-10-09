@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use super::types::*;
+use super::filters::DateRange;
 use super::{
     require_empty_confirm, validate_recurrence_update, CheckAvailabilityInput, CreateEventInput,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
@@ -88,12 +89,15 @@ impl OutlookClient for FakeOutlookClient {
     }
 
     fn list_emails(&self, q: EmailQuery) -> Result<Vec<EmailSummary>, ToolError> {
+        // Same up-front date validation as the real client.
+        DateRange::parse(q.received_after.as_deref(), q.received_before.as_deref(),
+            "received_after", "received_before", chrono::Local::now().naive_local())?;
         self.record("list_emails", json!({
             "query": q.query, "folder": q.folder, "count": q.count, "offset": q.offset,
             "unread_only": q.unread_only, "from": q.from, "to": q.to, "category": q.category,
             "received_after": q.received_after, "received_before": q.received_before,
-            "since_days": q.since_days, "has_attachments": q.has_attachments,
-            "flagged": q.flagged, "high_importance": q.high_importance,
+            "has_attachments": q.has_attachments, "item_type": q.item_type,
+            "importance": q.importance, "flag": q.flag,
         }))?;
         let text = self.email_text("Hello", "Ada", "");
         Ok(vec![EmailSummary {
@@ -200,12 +204,14 @@ impl OutlookClient for FakeOutlookClient {
     }
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError> {
+        DateRange::parse(q.start_after.as_deref(), q.start_before.as_deref(),
+            "start_after", "start_before", chrono::Local::now().naive_local())?;
         self.record("list_events", json!({
-            "start_date": q.start_date, "end_date": q.end_date, "query": q.query,
+            "start_after": q.start_after, "start_before": q.start_before, "query": q.query,
             "category": q.category, "show_as": q.show_as, "my_response": q.my_response,
             "attendees": q.attendees, "attendee_role": q.attendee_role,
             "meetings_only": q.meetings_only, "all_day": q.all_day,
-            "calendar_of": q.calendar_of,
+            "calendar_of": q.calendar_of, "count": q.count, "offset": q.offset,
         }))?;
         Ok(vec![EventSummary {
             id: EVENT_ID.into(), subject: "Standup".into(), start: None, end: None,
@@ -367,9 +373,12 @@ impl OutlookClient for FakeOutlookClient {
     }
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError> {
+        DateRange::parse(q.due_after.as_deref(), q.due_before.as_deref(),
+            "due_after", "due_before", chrono::Local::now().naive_local())?;
         self.record("list_tasks", json!({
             "include_completed": q.include_completed, "category": q.category,
-            "importance": q.importance, "query": q.query,
+            "importance": q.importance, "query": q.query, "due_after": q.due_after,
+            "due_before": q.due_before, "count": q.count, "offset": q.offset,
         }))?;
         Ok(vec![TaskSummary {
             id: TASK_ID.into(), subject: "Buy milk".into(), due_date: None,
@@ -415,7 +424,12 @@ impl OutlookClient for FakeOutlookClient {
     }
 
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError> {
-        self.record("list_notes", json!({"category": q.category, "query": q.query}))?;
+        DateRange::parse(q.created_after.as_deref(), q.created_before.as_deref(),
+            "created_after", "created_before", chrono::Local::now().naive_local())?;
+        self.record("list_notes", json!({
+            "category": q.category, "query": q.query, "created_after": q.created_after,
+            "created_before": q.created_before, "count": q.count, "offset": q.offset,
+        }))?;
         Ok(vec![NoteSummary { id: NOTE_ID.into(), subject: "Ideas".into(), created: None, categories: vec![] }])
     }
 
@@ -458,11 +472,7 @@ mod tests {
     use super::*;
 
     fn basic_query() -> EmailQuery {
-        EmailQuery {
-            query: None, folder: "inbox".into(), count: 10, offset: 0, unread_only: false,
-            from: None, to: None, category: None, received_after: None, received_before: None,
-            since_days: None, has_attachments: None, flagged: false, high_importance: false,
-        }
+        EmailQuery::default()
     }
 
     #[test]
@@ -474,9 +484,9 @@ mod tests {
             ("list_folders".to_string(), json!({})),
             ("list_emails".to_string(), json!({
                 "query": null, "folder": "inbox", "count": 10, "offset": 0, "unread_only": false,
-                "from": null, "to": null, "category": null, "received_after": null,
-                "received_before": null, "since_days": null, "has_attachments": null,
-                "flagged": false, "high_importance": false,
+                "from": [], "to": [], "category": [], "received_after": null,
+                "received_before": null, "has_attachments": null,
+                "item_type": [], "importance": [], "flag": [],
             })),
         ]);
     }

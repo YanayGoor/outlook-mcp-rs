@@ -317,3 +317,61 @@ mod tests {
         assert!(glob_contains("שלום עולם", "של*לם"));
     }
 }
+
+#[cfg(test)]
+mod text_match_tests {
+    use super::*;
+
+    /// The pre-#32 `client.rs` helper: does `query` match any of `fields`?
+    fn text_matches(query: &str, fields: &[&str]) -> bool {
+        let names: Vec<String> = (0..fields.len()).map(|i| i.to_string()).collect();
+        let defaults: Vec<&str> = names.iter().map(String::as_str).collect();
+        TextQuery::parse(query, &[])
+            .matches(&defaults, |f| fields[f.parse::<usize>().unwrap()].to_string())
+    }
+
+    #[test]
+    fn hebrew_matches_subject_or_later_field() {
+        assert!(text_matches("מייל שיקוף", &["Re: מייל שיקוף שבועי"]));
+        assert!(text_matches("סיכום עשייה", &["", "Dana", "גוף: סיכום עשייה Q3"]));
+        assert!(!text_matches("מייל שיקוף", &["Weekly report", "Dana"]));
+    }
+
+    #[test]
+    fn mixed_hebrew_and_english() {
+        assert!(text_matches("Q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
+        assert!(text_matches("q3 סיכום", &["Weekly Q3 סיכום עשייה"]));
+        assert!(!text_matches("Q4 סיכום", &["Weekly Q3 סיכום עשייה"]));
+    }
+
+    #[test]
+    fn matching_is_caseless() {
+        assert!(text_matches("weekly", &["WEEKLY Report"]));
+        assert!(text_matches("ÉCOLE", &["notes from école today"]));
+        assert!(text_matches("ΣΟΦΊΑ", &["σοφία"]));
+    }
+
+    #[test]
+    fn matching_ignores_normalization_form() {
+        // Latin with an accent: composed (NFC) vs decomposed (NFD).
+        let nfc: String = "café".nfc().collect();
+        let nfd: String = "café".nfd().collect();
+        assert_ne!(nfc, nfd);
+        assert!(text_matches(&nfd, &[&format!("subject {nfc}")]));
+        assert!(text_matches(&nfc, &[&format!("subject {nfd}")]));
+        // Hebrew niqqud has no precomposed forms, but the same marks typed
+        // in a different order (shin dot + qamats vs qamats + shin dot) are
+        // canonically equivalent and must still match.
+        let a = "\u{05E9}\u{05C1}\u{05B8}לום";
+        let b = "\u{05E9}\u{05B8}\u{05C1}לום";
+        assert_ne!(a, b);
+        assert!(text_matches(a, &[&format!("subject {b}")]));
+        assert!(text_matches(b, &[&format!("subject {a}")]));
+    }
+
+    #[test]
+    fn empty_fields_never_match() {
+        assert!(!text_matches("שלום", &[]));
+        assert!(!text_matches("שלום", &["", ""]));
+    }
+}
