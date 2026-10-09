@@ -15,6 +15,7 @@ use windows::Win32::System::Variant::VARIANT;
 use crate::constants as c;
 use crate::error::ToolError;
 use crate::outlook::com::{
+    self,
     call_method, clean_content_id, create_com_object, format_com_error, get_item_categories,
     get_mapi_prop, get_property, guess_mime, has_member, is_inline, jet_datetime, make_item_id, normalize_cid_request, parse_item_id, put_property, safe_filename,
     set_item_categories, variant_from_bool, variant_from_datetime, variant_from_i32, variant_from_str,
@@ -191,10 +192,12 @@ fn resolve_folder(ns: &IDispatch, folder: Option<&str>) -> Result<IDispatch, Too
 
 /// Parses a user-supplied date parameter with the shared grammar in
 /// [`crate::outlook::dates`] (ISO date/datetime, keywords like `today` or
-/// `start_of_week`, offsets like `-14d`), relative to the current local time.
-/// Every date parameter of every tool goes through here.
+/// `start_of_week`, offsets like `-14d`), relative to the current local time
+/// and with weeks starting on the Windows user's first day of the week.
+/// Every single date parameter goes through here; `*_after`/`*_before` ranges
+/// go through `DateRange::parse` with the same `com::user_first_day_of_week`.
 fn parse_dt(value: &str, field: &str) -> Result<chrono::NaiveDateTime, ToolError> {
-    Ok(crate::outlook::dates::parse_date_param(value, field)?.at)
+    Ok(crate::outlook::dates::parse_date_param(value, field, com::user_first_day_of_week())?.at)
 }
 
 /// Adds `address` to `recipients` and marks it required or optional. The
@@ -1278,6 +1281,7 @@ impl OutlookClient for WindowsOutlookClient {
         let received = DateRange::parse(
             q.received_after.as_deref(), q.received_before.as_deref(),
             "received_after", "received_before", chrono::Local::now().naive_local(),
+            com::user_first_day_of_week(),
         )?;
         let importance_ids = q.importance.iter()
             .map(|i| c::importance_name_to_id(i.trim()).ok_or_else(|| {
@@ -1832,6 +1836,7 @@ impl OutlookClient for WindowsOutlookClient {
         let now = chrono::Local::now().naive_local();
         let range = DateRange::parse(
             q.start_after.as_deref(), q.start_before.as_deref(), "start_after", "start_before", now,
+            com::user_first_day_of_week(),
         )?;
         let start = range.after.unwrap_or_else(|| now.date().and_hms_opt(0, 0, 0).unwrap());
         let end = range.before.unwrap_or(start + chrono::Duration::days(7));
@@ -2346,7 +2351,7 @@ impl OutlookClient for WindowsOutlookClient {
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError> {
         let due = DateRange::parse(
             q.due_after.as_deref(), q.due_before.as_deref(), "due_after", "due_before",
-            chrono::Local::now().naive_local(),
+            chrono::Local::now().naive_local(), com::user_first_day_of_week(),
         )?;
         let text = TextQuery::parse(q.query.as_deref().unwrap_or(""), filters::TASK_QUERY_FIELDS);
         let count = q.count.clamp(1, MAX_TASK_COUNT);
@@ -2538,7 +2543,7 @@ impl OutlookClient for WindowsOutlookClient {
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError> {
         let created = DateRange::parse(
             q.created_after.as_deref(), q.created_before.as_deref(), "created_after",
-            "created_before", chrono::Local::now().naive_local(),
+            "created_before", chrono::Local::now().naive_local(), com::user_first_day_of_week(),
         )?;
         let text = TextQuery::parse(q.query.as_deref().unwrap_or(""), filters::NOTE_QUERY_FIELDS);
         let count = q.count.clamp(1, MAX_NOTE_COUNT);

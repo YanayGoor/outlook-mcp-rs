@@ -51,7 +51,8 @@ permanent delete. Never set `confirm: true` on your own initiative.
 
 - **Dates (every tool):** local time, as ISO (`2026-06-10`, `2026-06-10T14:30`), a keyword
   (`today`, `yesterday`, `tomorrow`, `now`, `start_of_week`/`end_of_week`, `start_of_month`/`end_of_month`,
-  `start_of_year`/`end_of_year`; weeks start Monday), an offset from now (`-14d`, `+3h`, `-2w`;
+  `start_of_year`/`end_of_year`; weeks start on the first day of the week in the Windows user's
+  regional settings, e.g. Monday or Sunday), an offset from now (`-14d`, `+3h`, `-2w`;
   units `m h d w mo y`), or a keyword plus offsets (`start_of_week-1w`). A bare date in a
   `*_before` filter includes that whole day.
 - **All `list_*` tools:**
