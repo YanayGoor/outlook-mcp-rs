@@ -134,7 +134,7 @@ The Outlook tools then appear in that client.
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
-- `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body; non-ASCII queries such as Hebrew fall back to a client-side scan when Outlook's search finds nothing) and filters (sender via `from`, recipient via `to` — any To/CC name or address, category, date range, attachments, flagged, importance); newest first, `count` up to 200, page with `offset`
+- `list_emails` — find emails in a folder with an optional text `query` (subject, sender, and body; see [List tool conventions](#list-tool-conventions); non-ASCII queries such as Hebrew fall back to a client-side scan when Outlook's search finds nothing) and filters: sender via `from`, recipient via `to` (any To/CC name or address), `category`, `item_type` (e.g. `"email"` to skip meeting invites and bounces), `importance`, `flag` (`follow_up`/`complete`/`clear`), attachments, unread, `received_after`/`received_before`; newest first, `count` default 10, max 200, page with `offset`
 - `get_email` — get the full body and attachment list of one email by id; reports `body_truncated`/`body_length` (and `html_truncated`/`html_length` with `prefer_html`), and `max_body_chars` (default 100,000, up to 5,000,000) fetches a larger body
 - `send_email` — send a new email immediately (to/cc/bcc, plain or HTML body, file attachments, inline images)
 - `create_draft` — create a draft email without sending it (same options as `send_email`)
@@ -145,7 +145,7 @@ The Outlook tools then appear in that client.
 - `empty_deleted_items` — **permanently** delete everything in Deleted Items (items and subfolders); **irreversible**, refuses unless `confirm=true`. On Exchange/Microsoft 365, retention policy may still keep items in Recoverable Items
 
 **Calendar**
-- `list_events` — list/search calendar events by date range, text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`
+- `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `count` default and max 250, page with `offset`
 - `get_event` — get the full details of one calendar event by id
 - `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out
 - `update_event` — change an existing event (subject, times, location, body, attendees, reminder, recurrence…); optionally notify attendees
@@ -159,17 +159,43 @@ The Outlook tools then appear in that client.
 - `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB); optional `context_lines` (max 50) also returns `context`, the plain-text lines just before the image's first `cid:` reference in the HTML body (`""` if it isn't referenced)
 
 **Tasks**
-- `list_tasks` — list Outlook tasks (filter by category, importance, or a text query matching subject or body)
+- `list_tasks` — list Outlook tasks (filter by category, importance, due date via `due_after`/`due_before`, or a text query matching subject or body); `count` default and max 500, page with `offset`
 - `create_task` — create a new Outlook task
 - `update_task` — change an existing task: mark complete/reopen, subject, body, due_date, start_date, importance, add/remove categories, percent_complete, reminder_time
 - `delete_task` — delete a task (moves it to Deleted Items)
 
 **Notes**
-- `list_notes` — list Outlook notes (filter by category or a text query on the body)
+- `list_notes` — list Outlook notes (filter by category, creation date via `created_after`/`created_before`, or a text query on the body); `count` default and max 500, page with `offset`
 - `get_note` — get the full body of one note by id
 - `create_note` — create a new Outlook note (optional categories, color)
 - `update_note` — change an existing note: body, add/remove categories, color
 - `delete_note` — delete a note (moves it to Deleted Items)
+
+### List tool conventions
+
+`list_emails`, `list_events`, `list_tasks` and `list_notes` share these rules:
+
+- **Filters combine with AND.** A string filter (`from`, `to`, `category`, `attendees`, `show_as`, `my_response`, `importance`, `item_type`, `flag`) takes one value or a list, and a list matches **any** of its values: `from: ["Person A", "Person B"]`.
+- **`query`** is a list of terms that must all match, case-insensitive and in any language:
+  - `"quoted phrase"` keeps words together, in order;
+  - `*` matches any run of characters: `status*report`;
+  - `field:term` limits a term to one field: `subject:invoice`, `from:"Ada Lovelace"`. Fields: `subject`, `from`, `to`, `body` (emails); `subject`, `location`, `organizer`, `attendees` (events); `subject`, `body` (tasks and notes). Any other `word:` is plain text, so `10:30` still matches literally.
+- **Date ranges** are `<field>_after` / `<field>_before`, both inclusive: `received_*` (emails), `start_*` (events; `start_date`/`end_date` still work), `due_*` (tasks), `created_*` (notes). A bare date in `*_before` includes that whole day.
+- **Paging:** `count` and `offset` on every list tool. Caps: emails 200 (default 10), events 250, tasks 500, notes 500 (default = cap). Call again with `offset += count` until a page comes back short.
+- **Deprecated** (still accepted): `since_days` (use `received_after: "-14d"`), `flagged` (use `flag`), `high_importance` (use `importance: "high"`).
+
+### Dates
+
+Every date parameter on every tool (list filters, `create_event`/`update_event` `start`/`end`, recurrence `until`, task `due_date`/`start_date`/`reminder_time`, `check_availability`) accepts the same forms, in local time:
+
+| Form | Examples | Meaning |
+|---|---|---|
+| ISO date or datetime | `2026-06-10`, `2026-06-10T14:30`, `2026-06-10 14:30:00` | Always year-month-day |
+| Keyword | `now`, `today`, `yesterday`, `tomorrow`, `start_of_week`, `end_of_week`, `start_of_month`, `end_of_month`, `start_of_year`, `end_of_year` | Day keywords and `start_of_*` are midnight; `end_of_*` is 23:59:59 on the last day. Weeks start on Monday |
+| Offset from now | `-14d`, `+3h`, `-2w`, `-30m`, `+1mo`, `-1y` | Units: `m` minutes, `h` hours, `d` days, `w` weeks, `mo` months, `y` years |
+| Keyword plus offsets | `today-1d`, `start_of_week-1w`, `tomorrow+9h` | Applied left to right |
+
+Known issue: on a day-first Windows locale, date *filters* can still return the wrong range (issue #1); the grammar above is not affected.
 
 ### Inline images
 

@@ -47,17 +47,28 @@ permanent delete. Never set `confirm: true` on your own initiative.
 
 ## Quick reference
 
-- **Dates:** ISO format, local time: `2026-06-10` or `2026-06-10T14:30`. A bare `end_date`
-  includes that whole day.
+- **Dates (every tool):** local time, as ISO (`2026-06-10`, `2026-06-10T14:30`), a keyword
+  (`today`, `yesterday`, `tomorrow`, `now`, `start_of_week`/`end_of_week`, `start_of_month`/`end_of_month`,
+  `start_of_year`/`end_of_year`; weeks start Monday), an offset from now (`-14d`, `+3h`, `-2w`;
+  units `m h d w mo y`), or a keyword plus offsets (`start_of_week-1w`). A bare date in a
+  `*_before` filter includes that whole day.
+- **All `list_*` tools:**
+  - Filters AND together. String filters take one value or a list (matching any): `from: ["A", "B"]`.
+  - `query`: terms must all match (any case, any language); `"quoted phrase"`; `*` wildcard;
+    `field:term` scopes (`subject:`, `from:`, `to:`, `body:` for email; `subject:`, `location:`,
+    `organizer:`, `attendees:` for events; `subject:`, `body:` for tasks and notes).
+  - Date ranges are `<field>_after`/`<field>_before`: `received_*`, `start_*`, `due_*`, `created_*`.
+  - Paging: `count` + `offset` everywhere (caps: emails 200, events 250, tasks/notes 500).
 - **`list_emails`:**
   - `folder` defaults to `inbox`. Accepts `inbox`, `sent`, `drafts`, `deleted`, `outbox`, or a path like `Inbox/Receipts` (see `list_folders`).
   - Results are newest first. `count` defaults to 10, max 200.
   - **To page:** call again with `offset += count` until fewer than `count` come back.
-  - `query` matches subject, sender and body. It works for Hebrew and other non-Latin text, but a non-ASCII query may be slower, because the server scans up to 2,000 items itself when Outlook's own search finds nothing.
-  - Filters combine with AND:
-    - `from` matches the sender;
-    - `to` matches any To/CC recipient name or address;
-    - also `category`, `unread_only`, `flagged`, `high_importance`, `has_attachments`, `since_days`, `received_after`/`received_before`.
+  - `query` searches subject, sender and body. It works for Hebrew and other non-Latin text, but a non-ASCII query may be slower, because the server scans up to 2,000 items itself when Outlook's own search finds nothing.
+  - Filters:
+    - `from` matches the sender; `to` matches any To/CC recipient name or address;
+    - `item_type: "email"` skips meeting invites, bounces and read receipts (values as `get_email` reports them);
+    - `importance` (`low`/`normal`/`high`), `flag` (`follow_up`/`complete`/`clear`), `category`, `unread_only`, `has_attachments`, `received_after`/`received_before` (e.g. `"-14d"`).
+    - `since_days`, `flagged` and `high_importance` still work but are deprecated.
 - **`get_email`:**
   - Returns the full body: plain text, or HTML with `prefer_html`.
   - Bodies are cut at `max_body_chars` (default 100,000, up to 5,000,000).
@@ -74,14 +85,15 @@ permanent delete. Never set `confirm: true` on your own initiative.
   - **Sending:** `send_email` and `create_draft` take `inline_images: [{content_id, path | data_base64}]`. They require `html: true`, and the body references each image as `<img src="cid:CONTENT_ID">`.
   - **Reading:** `get_inline_image(email_id, content_id)` returns the image as a `data:` URI (max 10 MB). Add `context_lines` (max 50) to also get the text just before the image.
 - **`list_events`:**
-  - The default window is today plus 7 days, with at most 250 results.
+  - `start_after`/`start_before` bound the event start; the default window is today plus 7 days. `count` default and max 250, page with `offset`.
   - Recurring events are expanded.
   - `calendar_of` opens someone's shared calendar.
 - **`check_availability`:**
   - Shows free/busy only, never event details, in `interval_minutes` slots (default 30).
   - `common_free` lists the windows where everyone resolved is free.
 - **Tasks and notes:**
-  - `list_tasks` hides completed tasks unless `include_completed` is set.
+  - `list_tasks` hides completed tasks unless `include_completed` is set; `due_after`/`due_before` filter by due date (tasks with no due date never match).
+  - `list_notes` filters by `created_after`/`created_before`.
   - `update_task` with `mark_complete` completes or reopens a task.
   - Deleting a task, note or event moves it to Deleted Items, where it can be recovered.
 

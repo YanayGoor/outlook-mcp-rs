@@ -116,6 +116,13 @@ real body text, not just a derived subject), `create_note`'s additions
 `update_note`/`delete_note` are covered by the live suite:
 `cargo test --test live_outlook -- --ignored list_notes_filters_and_create_note_additions_round_trip get_note_includes_modified_after_update update_note_manages_categories_and_color delete_note_removes_it`.
 
+The shared `list_*` conventions (date grammar on `received_*`, `item_type`,
+`flag`, scoped/phrase/wildcard `query`, and `count`/`offset` paging on events,
+tasks and notes) are covered by read-only live tests:
+`cargo test --test live_outlook -- --ignored list_emails_relative_dates_bound_received_time list_emails_item_type_filter_matches_get_email list_emails_flag_states_partition_the_folder list_emails_subject_scope_and_phrase_find_a_recent_subject list_events_tasks_notes_pages_tile_without_overlap`.
+On a day-first Windows locale the date test can still fail because of issue #1
+(`jet_datetime`), which is independent of the grammar.
+
 `check_availability`'s single-mailbox path (resolving your own address and
 reading its free/busy slots, plus the graceful-failure path for an address
 that can't provide free/busy data) is covered by the live suite:

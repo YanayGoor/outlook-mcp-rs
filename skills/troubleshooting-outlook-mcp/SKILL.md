@@ -21,7 +21,10 @@ may still have sent.
 | `Folder not found: "…" (no subfolder named …)` | Typo in the path | Run `list_folders` and copy the exact `path` |
 | `Could not resolve "…" to a person` | The name or email isn't in the address book | Ask the user for the full email address |
 | `Could not open "…"'s calendar` | That person hasn't shared their calendar | Use `check_availability` instead (free/busy needs no sharing) |
-| `Invalid … expected ISO format` | The date isn't in ISO format | Use `2026-06-10` or `2026-06-10T14:30` |
+| `Invalid <param> "…": … use an ISO local date/datetime like …` | The date isn't in a supported form | Use ISO (`2026-06-10`, `2026-06-10T14:30`), a keyword (`today`, `start_of_week`) or an offset (`-14d`) |
+| `… is later than …: nothing can match` | A `*_after` bound is after its `*_before` bound | Swap or fix the two dates |
+| `Invalid importance` / `Invalid flag` / `Invalid item_type` / `Invalid show_as` / `Invalid my_response` | Unknown filter value | Use one of the values the message lists |
+| ``pass either `received_after` or `since_days`, not both`` (also `flag`/`flagged`, `importance`/`high_importance`) | A deprecated filter contradicts its replacement | Drop the deprecated one |
 | `attachment not found: …` / `inline image not found: …` | The local path doesn't exist (nothing was sent) | Fix the absolute path and retry |
 | `only unsent drafts can be edited` | `update_draft` was called on received or sent mail | Use `reply_email`, or `create_draft` for a new message |
 | `pass either 'body' or 'html_body', not both` / `update_draft needs at least one of…` | Invalid `update_draft` arguments (nothing was changed) | Send exactly one body field, and at least one change |
@@ -44,13 +47,15 @@ may still have sent.
   - **Workaround:** until a locale-aware build ships, fetch without the date filter and filter by date yourself.
 - **Fewer emails than expected:**
   - `list_emails` returns one page: `count` defaults to 10, max 200. Page with `offset`.
+  - A multi-word `query` requires every word (in any order); quote it (`"weekly update"`) for an exact phrase, or drop words.
   - The mail may also have been filed into a subfolder by a rule; check `list_folders`.
 - **A Hebrew (or other non-Latin) search finds nothing:** the server falls back to
   scanning the 2,000 newest items that match the other filters. Older mail needs a date
   filter or a narrower folder.
 - **Email body ends with `[... truncated at N characters]`:** `body_truncated` is
   true. Call `get_email` again with `max_body_chars` ≥ `body_length`.
-- **Only 250 events:** that's the hard cap. Use a smaller date window.
+- **Only 250 events:** that's the page cap. Page with `offset`, or use a smaller date window.
+- **Only 500 tasks or notes:** that's the page cap. Page with `offset`.
 - **`list_tasks` misses a task:** completed tasks are hidden unless `include_completed` is set.
 - **Non-ASCII text shows as `????`:** the server's output is UTF-8. The console
   displaying it isn't (see the README's troubleshooting section).
