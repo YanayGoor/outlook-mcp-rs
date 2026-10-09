@@ -258,15 +258,11 @@ impl DateFilter {
     /// outside the `Restrict` window that the filter must have been misread.
     pub fn classify(&self, t: NaiveDateTime) -> Placement {
         let slack = chrono::Duration::days(WINDOW_SLACK_DAYS);
-        if let Some(ws) = self.window_start {
-            if t < ws.and_hms_opt(0, 0, 0).unwrap() - slack {
-                return Placement::OutsideWindow;
-            }
-        }
-        if let Some(we) = self.window_end {
-            if t >= we.and_hms_opt(0, 0, 0).unwrap() + slack {
-                return Placement::OutsideWindow;
-            }
+        let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0).unwrap();
+        if self.window_start.is_some_and(|ws| t < midnight(ws) - slack)
+            || self.window_end.is_some_and(|we| t >= midnight(we) + slack)
+        {
+            return Placement::OutsideWindow;
         }
         if self.after.is_some_and(|a| t < a) {
             Placement::Before
