@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 
@@ -15,12 +16,18 @@ pub const EVENT_ID: &str = "entry-2|store-1";
 pub const TASK_ID: &str = "entry-3|store-1";
 pub const NOTE_ID: &str = "entry-4|store-1";
 
+/// Appended to (or, for empty fields, used as) every canned text field once
+/// `set_hebrew_text` is on. Hebrew plus a non-BMP emoji, so tests see both
+/// right-to-left text and a UTF-16 surrogate pair survive to the wire.
+pub const HE_TEXT: &str = "טקסט בעברית 📧";
+
 /// In-memory stand-in for COM Outlook; records every call. Mirrors
 /// `tests/conftest.py::FakeOutlookClient` in the Python project.
 pub struct FakeOutlookClient {
     calls: Mutex<Vec<(String, Value)>>,
     fail_with: Mutex<Option<String>>,
     email_text: Mutex<Option<EmailText>>,
+    hebrew: AtomicBool,
 }
 
 /// Custom subject/sender/body returned by `list_emails` and `get_email`
@@ -39,6 +46,7 @@ impl FakeOutlookClient {
             calls: Mutex::new(Vec::new()),
             fail_with: Mutex::new(None),
             email_text: Mutex::new(None),
+            hebrew: AtomicBool::new(false),
         }
     }
 
@@ -54,8 +62,34 @@ impl FakeOutlookClient {
     /// The custom email text if one was set, else the given canned defaults.
     fn email_text(&self, subject: &str, sender: &str, body: &str) -> EmailText {
         self.email_text.lock().unwrap().clone().unwrap_or_else(|| EmailText {
-            subject: subject.into(), sender: sender.into(), body: body.into(),
+            subject: self.t(subject), sender: self.t(sender), body: self.t(body),
         })
+    }
+
+    /// Put `HE_TEXT` into every free-text field the fake returns (subjects,
+    /// names, addresses, bodies, folder names, categories, locations,
+    /// attendees, file names...), so tests can check that each one reaches
+    /// the client as UTF-8 (issue #31).
+    pub fn set_hebrew_text(&self) {
+        self.hebrew.store(true, Ordering::Relaxed);
+    }
+
+    /// A canned text field: unchanged, or tagged with `HE_TEXT` in Hebrew mode.
+    fn t(&self, canned: &str) -> String {
+        match (self.hebrew.load(Ordering::Relaxed), canned.is_empty()) {
+            (false, _) => canned.to_string(),
+            (true, true) => HE_TEXT.to_string(),
+            (true, false) => format!("{canned} {HE_TEXT}"),
+        }
+    }
+
+    /// A canned list of categories (or names), tagged like `t`; an empty list
+    /// gets one `HE_TEXT` entry in Hebrew mode.
+    fn tv(&self, canned: &[&str]) -> Vec<String> {
+        if canned.is_empty() {
+            return if self.hebrew.load(Ordering::Relaxed) { vec![HE_TEXT.to_string()] } else { vec![] };
+        }
+        canned.iter().map(|c| self.t(c)).collect()
     }
 
     pub fn calls(&self) -> Vec<(String, Value)> {
@@ -83,7 +117,7 @@ impl OutlookClient for FakeOutlookClient {
     fn list_folders(&self) -> Result<Vec<FolderInfo>, ToolError> {
         self.record("list_folders", json!({}))?;
         Ok(vec![FolderInfo {
-            name: "Inbox".into(), path: "Inbox".into(), items: 2, unread: 1,
+            name: self.t("Inbox"), path: self.t("Inbox"), items: 2, unread: 1,
         }])
     }
 
@@ -98,9 +132,9 @@ impl OutlookClient for FakeOutlookClient {
         let text = self.email_text("Hello", "Ada", "");
         Ok(vec![EmailSummary {
             id: EMAIL_ID.into(), subject: text.subject, sender: text.sender,
-            sender_email: "".into(), to: "".into(), received: None,
+            sender_email: self.t(""), to: self.t(""), received: None,
             unread: true, has_attachments: false,
-            categories: vec!["Work".to_string()],
+            categories: self.tv(&["Work"]),
         }])
     }
 
@@ -113,18 +147,24 @@ impl OutlookClient for FakeOutlookClient {
         Ok(EmailDetail {
             summary: EmailSummary {
                 id: email_id, subject: text.subject, sender: text.sender,
-                sender_email: "".into(), to: "".into(), received: None,
-                unread: false, has_attachments: false, categories: vec![],
+                sender_email: self.t(""), to: self.t(""), received: None,
+                unread: false, has_attachments: false, categories: self.tv(&[]),
             },
-            cc: "".into(), bcc: "".into(),
+            cc: self.t(""), bcc: self.t(""),
             body_length: text.body.chars().count(), body_truncated: false, body: text.body,
-            html_body: if prefer_html { Some("<p>Hi there</p>".into()) } else { None },
+            html_body: if prefer_html { Some(self.t("<p>Hi there</p>")) } else { None },
             html_truncated: if prefer_html { Some(false) } else { None },
             html_length: if prefer_html { Some(15) } else { None },
-            attachments: vec![],
+            attachments: self.tv(&[]),
             item_type: "email".to_string(),
             is_meeting: false,
-            meeting: None,
+            // Only in Hebrew mode, so the meeting fields are covered too.
+            meeting: self.hebrew.load(Ordering::Relaxed).then(|| MeetingInfo {
+                meeting_type: "request".into(), start: None, end: None,
+                location: self.t(""), organizer: self.t(""),
+                required_attendees: self.t(""), optional_attendees: self.t(""),
+                is_recurring: false,
+            }),
         })
     }
 
@@ -208,11 +248,11 @@ impl OutlookClient for FakeOutlookClient {
             "calendar_of": q.calendar_of,
         }))?;
         Ok(vec![EventSummary {
-            id: EVENT_ID.into(), subject: "Standup".into(), start: None, end: None,
-            location: "".into(), organizer: "".into(), all_day: false,
-            is_recurring: false, is_meeting: false, categories: vec![],
+            id: EVENT_ID.into(), subject: self.t("Standup"), start: None, end: None,
+            location: self.t(""), organizer: self.t(""), all_day: false,
+            is_recurring: false, is_meeting: false, categories: self.tv(&[]),
             show_as: "busy".into(), my_response: "accepted".into(),
-            required_attendees: "".into(), optional_attendees: "".into(),
+            required_attendees: self.t(""), optional_attendees: self.t(""),
         }])
     }
 
@@ -220,13 +260,13 @@ impl OutlookClient for FakeOutlookClient {
         self.record("get_event", json!({"event_id": event_id}))?;
         Ok(EventDetail {
             summary: EventSummary {
-                id: event_id, subject: "Standup".into(), start: None, end: None,
-                location: "".into(), organizer: "".into(), all_day: false,
-                is_recurring: false, is_meeting: false, categories: vec![],
+                id: event_id, subject: self.t("Standup"), start: None, end: None,
+                location: self.t(""), organizer: self.t(""), all_day: false,
+                is_recurring: false, is_meeting: false, categories: self.tv(&[]),
                 show_as: "busy".into(), my_response: "accepted".into(),
-                required_attendees: "".into(), optional_attendees: "".into(),
+                required_attendees: self.t(""), optional_attendees: self.t(""),
             },
-            body: "".into(),
+            body: self.t(""),
             body_truncated: false,
             recurrence: None,
         })
@@ -330,12 +370,12 @@ impl OutlookClient for FakeOutlookClient {
         self.record("list_attachments", json!({"email_id": email_id}))?;
         Ok(vec![
             AttachmentInfo {
-                index: 1, filename: "report.pdf".into(), size: 1234, att_type: "file".into(),
+                index: 1, filename: self.t("report.pdf"), size: 1234, att_type: "file".into(),
                 content_id: None, mime_type: Some("application/pdf".into()), hidden: false,
                 is_inline: false,
             },
             AttachmentInfo {
-                index: 2, filename: "logo.png".into(), size: 512, att_type: "file".into(),
+                index: 2, filename: self.t("logo.png"), size: 512, att_type: "file".into(),
                 content_id: Some("logo@example".into()), mime_type: Some("image/png".into()), hidden: true,
                 is_inline: true,
             },
@@ -347,7 +387,7 @@ impl OutlookClient for FakeOutlookClient {
         self.record("save_attachments",
             json!({"email_id": email_id, "save_dir": save_dir, "attachment_names": attachment_names}))?;
         Ok(vec![json!({
-            "index": 1, "filename": "report.pdf", "size": 1234, "type": "file",
+            "index": 1, "filename": self.t("report.pdf"), "size": 1234, "type": "file",
             "content_id": null, "mime_type": "application/pdf", "hidden": false, "is_inline": false,
             "saved_to": save_dir, "status": "saved",
         })])
@@ -359,10 +399,10 @@ impl OutlookClient for FakeOutlookClient {
             "email_id": email_id, "content_id": content_id, "context_lines": context_lines,
         }))?;
         Ok(InlineImageData {
-            content_id: "logo@example".into(), filename: "logo.png".into(),
+            content_id: "logo@example".into(), filename: self.t("logo.png"),
             mime_type: "image/png".into(), size: 4,
             data_uri: "data:image/png;base64,iVBORw==".into(),
-            context: context_lines.map(|_| "Here is our new logo:".to_string()),
+            context: context_lines.map(|_| self.t("Here is our new logo:")),
         })
     }
 
@@ -372,8 +412,8 @@ impl OutlookClient for FakeOutlookClient {
             "importance": q.importance, "query": q.query,
         }))?;
         Ok(vec![TaskSummary {
-            id: TASK_ID.into(), subject: "Buy milk".into(), due_date: None,
-            complete: false, status: "not_started".to_string(), importance: "normal".to_string(), categories: vec![],
+            id: TASK_ID.into(), subject: self.t("Buy milk"), due_date: None,
+            complete: false, status: "not_started".to_string(), importance: "normal".to_string(), categories: self.tv(&[]),
         }])
     }
 
@@ -416,14 +456,14 @@ impl OutlookClient for FakeOutlookClient {
 
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError> {
         self.record("list_notes", json!({"category": q.category, "query": q.query}))?;
-        Ok(vec![NoteSummary { id: NOTE_ID.into(), subject: "Ideas".into(), created: None, categories: vec![] }])
+        Ok(vec![NoteSummary { id: NOTE_ID.into(), subject: self.t("Ideas"), created: None, categories: self.tv(&[]) }])
     }
 
     fn get_note(&self, note_id: String) -> Result<NoteDetail, ToolError> {
         self.record("get_note", json!({"note_id": note_id}))?;
         Ok(NoteDetail {
-            summary: NoteSummary { id: note_id, subject: "Ideas".into(), created: None, categories: vec![] },
-            body: "Ideas\n- one".into(),
+            summary: NoteSummary { id: note_id, subject: self.t("Ideas"), created: None, categories: self.tv(&[]) },
+            body: self.t("Ideas\n- one"),
             body_truncated: false,
             modified: None,
         })

@@ -305,6 +305,232 @@ async fn hebrew_round_trips_as_raw_utf8_over_the_stdio_codec() {
     assert_eq!(args["query"], HE_SUBJECT);
 }
 
+// ---- Every text field of every tool, issue #31 ----------------------------
+
+/// A JSON-RPC client over the same newline-delimited codec rmcp's stdio
+/// transport uses (an in-memory duplex pipe stands in for stdin/stdout), so
+/// assertions run against the exact bytes a real client would read.
+struct WireClient {
+    reader: tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    next_id: u64,
+}
+
+impl WireClient {
+    async fn start(server: OutlookMcpServer) -> Self {
+        use rmcp::ServiceExt;
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let (read_half, writer) = tokio::io::split(client_io);
+        let mut client =
+            WireClient { reader: tokio::io::BufReader::new(read_half), writer, next_id: 1 };
+        client
+            .request("initialize", json!({
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "utf8-test", "version": "0"}}))
+            .await;
+        client.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+        client
+    }
+
+    async fn send(&mut self, msg: &Value) {
+        use tokio::io::AsyncWriteExt;
+        // serde_json writes non-ASCII as raw UTF-8, like a real client would.
+        let mut bytes = serde_json::to_vec(msg).unwrap();
+        bytes.push(b'\n');
+        self.writer.write_all(&bytes).await.unwrap();
+    }
+
+    /// Sends a request and returns its response as strictly decoded UTF-8
+    /// wire text plus the parsed message.
+    async fn request(&mut self, method: &str, params: Value) -> (String, Value) {
+        use tokio::io::AsyncBufReadExt;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await;
+        loop {
+            let mut line = Vec::new();
+            assert!(self.reader.read_until(b'\n', &mut line).await.unwrap() > 0, "server closed");
+            let wire = String::from_utf8(line).expect("server output must be valid UTF-8");
+            let msg: Value = serde_json::from_str(&wire).unwrap();
+            if msg["id"] == id {
+                return (wire, msg);
+            }
+        }
+    }
+}
+
+/// Hebrew passed as every free-text argument.
+const HE_ARG: &str = "שלום עולם";
+
+/// One tool call: the Hebrew arguments it takes, and the result fields
+/// (JSON pointers) that must contain the given text verbatim.
+struct Utf8Case {
+    tool: &'static str,
+    args: Value,
+    out: Vec<(&'static str, &'static str)>,
+}
+
+fn utf8_cases() -> Vec<Utf8Case> {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, HE_TEXT, NOTE_ID, TASK_ID};
+    let h = HE_ARG;
+    let case = |tool, args, out| Utf8Case { tool, args, out };
+    vec![
+        case("list_folders", json!({}), vec![("/0/name", HE_TEXT), ("/0/path", HE_TEXT)]),
+        case("list_emails",
+            json!({"query": h, "folder": h, "from": h, "to": h, "category": h}),
+            vec![("/0/subject", HE_TEXT), ("/0/sender", HE_TEXT), ("/0/sender_email", HE_TEXT),
+                 ("/0/to", HE_TEXT), ("/0/categories/0", HE_TEXT)]),
+        case("get_email", json!({"email_id": EMAIL_ID, "prefer_html": true}),
+            vec![("/subject", HE_TEXT), ("/sender", HE_TEXT), ("/sender_email", HE_TEXT),
+                 ("/to", HE_TEXT), ("/cc", HE_TEXT), ("/bcc", HE_TEXT), ("/body", HE_TEXT),
+                 ("/html_body", HE_TEXT), ("/attachments/0", HE_TEXT), ("/categories/0", HE_TEXT),
+                 ("/meeting/location", HE_TEXT), ("/meeting/organizer", HE_TEXT),
+                 ("/meeting/required_attendees", HE_TEXT),
+                 ("/meeting/optional_attendees", HE_TEXT)]),
+        case("send_email",
+            json!({"to": [h], "subject": h, "body": h, "cc": [h], "bcc": [h]}),
+            vec![("/to", h), ("/subject", h)]),
+        case("create_draft",
+            json!({"to": [h], "subject": h, "body": h, "cc": [h], "bcc": [h]}),
+            vec![("/subject", h)]),
+        case("reply_email", json!({"email_id": EMAIL_ID, "body": h, "send": false}), vec![]),
+        case("update_email",
+            json!({"email_id": EMAIL_ID, "move_to": h, "add_categories": [h],
+                   "remove_categories": [h]}),
+            vec![]),
+        case("update_draft",
+            json!({"draft_id": EMAIL_ID, "subject": h, "body": h, "to": [h], "cc": [h],
+                   "bcc": [h]}),
+            vec![]),
+        case("delete_email", json!({"email_id": EMAIL_ID}), vec![]),
+        case("empty_deleted_items", json!({"confirm": true}), vec![]),
+        case("list_events",
+            json!({"query": h, "category": h, "attendees": [h], "calendar_of": h}),
+            vec![("/0/subject", HE_TEXT), ("/0/location", HE_TEXT), ("/0/organizer", HE_TEXT),
+                 ("/0/categories/0", HE_TEXT), ("/0/required_attendees", HE_TEXT),
+                 ("/0/optional_attendees", HE_TEXT)]),
+        case("get_event", json!({"event_id": EVENT_ID}),
+            vec![("/subject", HE_TEXT), ("/location", HE_TEXT), ("/organizer", HE_TEXT),
+                 ("/categories/0", HE_TEXT), ("/required_attendees", HE_TEXT),
+                 ("/optional_attendees", HE_TEXT), ("/body", HE_TEXT)]),
+        case("create_event",
+            json!({"subject": h, "start": "2026-06-10T10:00:00", "end": "2026-06-10T11:00:00",
+                   "body": h, "location": h, "required_attendees": [h],
+                   "optional_attendees": [h], "categories": [h], "send": false}),
+            vec![("/subject", h)]),
+        case("respond_to_meeting",
+            json!({"event_id": EVENT_ID, "response": "accept", "comment": h, "send": false}),
+            vec![]),
+        case("update_event",
+            json!({"event_id": EVENT_ID, "subject": h, "location": h, "body": h,
+                   "add_categories": [h], "remove_categories": [h],
+                   "add_required_attendees": [h], "add_optional_attendees": [h],
+                   "remove_attendees": [h], "send_update": false}),
+            vec![]),
+        case("delete_event", json!({"event_id": EVENT_ID, "send_cancellation": false}), vec![]),
+        case("check_availability",
+            json!({"people": [h], "start": "2026-06-10T09:00:00", "end": "2026-06-10T17:00:00"}),
+            vec![("/people/0/person", h)]),
+        case("list_attachments", json!({"email_id": EMAIL_ID}),
+            vec![("/0/filename", HE_TEXT), ("/1/filename", HE_TEXT)]),
+        case("save_attachments",
+            json!({"email_id": EMAIL_ID, "save_dir": "C:\\תיקייה", "attachment_names": [h]}),
+            // Expect only the Hebrew part: the wire escapes the backslash twice.
+            vec![("/0/filename", HE_TEXT), ("/0/saved_to", "תיקייה")]),
+        case("get_inline_image",
+            json!({"email_id": EMAIL_ID, "content_id": "logo@example", "context_lines": 2}),
+            vec![("/filename", HE_TEXT), ("/context", HE_TEXT)]),
+        case("list_tasks", json!({"category": h, "query": h}),
+            vec![("/0/subject", HE_TEXT), ("/0/categories/0", HE_TEXT)]),
+        case("create_task", json!({"subject": h, "body": h, "categories": [h]}),
+            vec![("/subject", h)]),
+        case("update_task",
+            json!({"task_id": TASK_ID, "subject": h, "body": h, "add_categories": [h],
+                   "remove_categories": [h]}),
+            vec![]),
+        case("delete_task", json!({"task_id": TASK_ID}), vec![]),
+        case("list_notes", json!({"category": h, "query": h}),
+            vec![("/0/subject", HE_TEXT), ("/0/categories/0", HE_TEXT)]),
+        case("get_note", json!({"note_id": NOTE_ID}),
+            vec![("/subject", HE_TEXT), ("/body", HE_TEXT), ("/categories/0", HE_TEXT)]),
+        case("create_note", json!({"body": h, "categories": [h]}), vec![]),
+        case("update_note",
+            json!({"note_id": NOTE_ID, "body": h, "add_categories": [h], "remove_categories": [h]}),
+            vec![]),
+        case("delete_note", json!({"note_id": NOTE_ID}), vec![]),
+    ]
+}
+
+/// Issue #31: for every tool, Hebrew in each text argument reaches the
+/// Outlook client unchanged, and Hebrew in each text field of the result
+/// leaves the server as literal UTF-8 (never `\u` escaped, never re-encoded
+/// to a code page) over the stdio codec.
+#[tokio::test]
+async fn every_tool_round_trips_hebrew_in_every_text_field_over_the_wire() {
+    use outlook_mcp_rs::outlook::fake::HE_TEXT;
+
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_hebrew_text();
+    let mut wire = WireClient::start(OutlookMcpServer::new(fake.clone())).await;
+
+    // Every advertised tool has a case, so a new tool can't skip this check.
+    let (_, listed) = wire.request("tools/list", json!({})).await;
+    let mut advertised: Vec<String> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    advertised.sort();
+    let cases = utf8_cases();
+    let mut covered: Vec<String> = cases.iter().map(|c| c.tool.to_string()).collect();
+    covered.sort();
+    assert_eq!(covered, advertised, "add a utf8_cases() entry for each new tool");
+
+    for case in cases {
+        let (raw, msg) = wire
+            .request("tools/call", json!({"name": case.tool, "arguments": case.args}))
+            .await;
+        assert!(msg["error"].is_null(), "{}: JSON-RPC error {}", case.tool, msg["error"]);
+        let result = &msg["result"];
+        assert_ne!(result["isError"], true, "{}: tool error {result}", case.tool);
+
+        // The wire carries non-ASCII as raw UTF-8: no `\uXXXX` escape for
+        // Hebrew or for the emoji's surrogate pair.
+        assert!(
+            !raw.contains("\\u05") && !raw.to_ascii_lowercase().contains("\\ud83d"),
+            "{}: unexpected \\u escape in {raw}",
+            case.tool
+        );
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        let out: Value = serde_json::from_str(text).unwrap();
+        for (pointer, expected) in &case.out {
+            let field = out.pointer(pointer).and_then(Value::as_str).unwrap_or_else(|| {
+                panic!("{}: no string at {pointer} in {out}", case.tool)
+            });
+            assert!(field.contains(expected), "{}{pointer}: {field:?} lacks {expected:?}", case.tool);
+            assert!(raw.contains(expected), "{}{pointer}: {expected:?} not raw on the wire", case.tool);
+        }
+        if !case.out.is_empty() {
+            assert!(raw.contains(HE_TEXT) || raw.contains(HE_ARG), "{}: no Hebrew on the wire", case.tool);
+        }
+
+        // Each Hebrew argument reached the Outlook client unchanged.
+        let (name, recorded) = fake.calls().pop().expect("the tool reached the client");
+        assert_eq!(name, case.tool);
+        for (key, sent) in case.args.as_object().unwrap() {
+            if sent.to_string().contains(HE_ARG) || sent.to_string().contains("תיקייה") {
+                assert_eq!(&recorded[key], sent, "{}: argument {key} changed", case.tool);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn get_email_max_body_chars_defaults_to_none() {
     let fake = Arc::new(FakeOutlookClient::new());
