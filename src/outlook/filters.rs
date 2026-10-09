@@ -3,7 +3,7 @@
 //! ranges, the per-tool `query` field tables, and the client-side matchers
 //! for events, tasks and notes.
 
-use chrono::{Datelike, NaiveDateTime};
+use chrono::{Datelike, NaiveDateTime, Weekday};
 
 use super::dates::parse_date_param_at;
 use super::text_query::TextQuery;
@@ -109,18 +109,19 @@ pub struct DateRange {
 
 impl DateRange {
     /// Parses both bounds with the shared date grammar (empty strings count
-    /// as absent). A bare ISO date in `before` includes that whole day.
+    /// as absent), relative to `now` and with weeks starting on `week_start`.
+    /// A bare ISO date in `before` includes that whole day.
     /// Errors name the parameter, and an `after` later than `before` is
     /// rejected rather than silently matching nothing.
     pub fn parse(after: Option<&str>, before: Option<&str>, after_name: &str, before_name: &str,
-        now: NaiveDateTime) -> Result<DateRange, ToolError> {
+        now: NaiveDateTime, week_start: Weekday) -> Result<DateRange, ToolError> {
         let after = after
             .filter(|s| !s.trim().is_empty())
-            .map(|s| parse_date_param_at(s, after_name, now).map(|v| v.at))
+            .map(|s| parse_date_param_at(s, after_name, now, week_start).map(|v| v.at))
             .transpose()?;
         let before = before
             .filter(|s| !s.trim().is_empty())
-            .map(|s| parse_date_param_at(s, before_name, now).map(|v| v.upper_bound()))
+            .map(|s| parse_date_param_at(s, before_name, now, week_start).map(|v| v.upper_bound()))
             .transpose()?;
         if let (Some(a), Some(b)) = (after, before)
             && a > b
@@ -271,32 +272,42 @@ mod tests {
 
     #[test]
     fn date_range_parses_inclusive_bounds() {
-        let r = DateRange::parse(Some("2026-06-01"), Some("2026-06-30"), "a", "b", now()).unwrap();
+        let r = DateRange::parse(Some("2026-06-01"), Some("2026-06-30"), "a", "b", now(), Weekday::Mon).unwrap();
         assert_eq!(r.after, Some(dt("2026-06-01T00:00:00")));
         assert!(r.contains_iso(Some("2026-06-30T23:00:00")));
         assert!(r.contains_iso(Some("2026-06-01T00:00:00")));
         assert!(!r.contains_iso(Some("2026-07-01T00:00:00")));
         assert!(!r.contains_iso(None));
-        let r = DateRange::parse(Some("-14d"), None, "a", "b", now()).unwrap();
+        let r = DateRange::parse(Some("-14d"), None, "a", "b", now(), Weekday::Mon).unwrap();
         assert_eq!(r.after, Some(dt("2026-09-24T14:30:00")));
         assert_eq!(r.before, None);
-        let r = DateRange::parse(Some(""), Some("  "), "a", "b", now()).unwrap();
+        let r = DateRange::parse(Some(""), Some("  "), "a", "b", now(), Weekday::Mon).unwrap();
         assert!(!r.is_set());
         assert!(r.contains_iso(None));
     }
 
     #[test]
+    fn date_range_uses_the_given_week_start() {
+        // 2026-10-08 is a Thursday.
+        let r = DateRange::parse(Some("start_of_week"), Some("end_of_week"), "a", "b", now(), Weekday::Sun).unwrap();
+        assert_eq!(r.after, Some(dt("2026-10-04T00:00:00")));
+        assert_eq!(r.before, Some(dt("2026-10-10T23:59:59")));
+        let r = DateRange::parse(Some("start_of_week"), None, "a", "b", now(), Weekday::Mon).unwrap();
+        assert_eq!(r.after, Some(dt("2026-10-05T00:00:00")));
+    }
+
+    #[test]
     fn date_range_errors_name_the_parameter() {
-        let e = DateRange::parse(Some("soon"), None, "due_after", "due_before", now()).unwrap_err();
+        let e = DateRange::parse(Some("soon"), None, "due_after", "due_before", now(), Weekday::Mon).unwrap_err();
         assert!(e.to_string().starts_with("Invalid due_after \"soon\""));
-        let e = DateRange::parse(Some("today"), Some("yesterday"), "x_after", "x_before", now()).unwrap_err();
+        let e = DateRange::parse(Some("today"), Some("yesterday"), "x_after", "x_before", now(), Weekday::Mon).unwrap_err();
         assert!(e.to_string().contains("x_after"));
         assert!(e.to_string().contains("later than x_before"));
     }
 
     #[test]
     fn outlook_none_date_never_matches_a_range() {
-        let r = DateRange::parse(Some("2026-01-01"), None, "a", "b", now()).unwrap();
+        let r = DateRange::parse(Some("2026-01-01"), None, "a", "b", now(), Weekday::Mon).unwrap();
         assert!(!r.contains_iso(Some("4501-01-01T00:00:00")));
     }
 
@@ -369,9 +380,9 @@ mod tests {
         q.importance = s(&["low"]);
         assert!(!task_matches(&t, &q, &none, &TextQuery::default(), String::new));
         q.importance.clear();
-        let due = DateRange::parse(None, Some("2026-10-09"), "due_after", "due_before", now()).unwrap();
+        let due = DateRange::parse(None, Some("2026-10-09"), "due_after", "due_before", now(), Weekday::Mon).unwrap();
         assert!(!task_matches(&t, &q, &due, &TextQuery::default(), String::new));
-        let due = DateRange::parse(None, Some("end_of_week"), "due_after", "due_before", now()).unwrap();
+        let due = DateRange::parse(None, Some("end_of_week"), "due_after", "due_before", now(), Weekday::Mon).unwrap();
         assert!(task_matches(&t, &q, &due, &TextQuery::default(), String::new));
     }
 
@@ -386,9 +397,9 @@ mod tests {
         let body = || "Ideas\n- zephyrling".to_string();
         assert!(note_matches(&n, &q, &none, &TextQuery::parse("zephyr*", NOTE_QUERY_FIELDS), body));
         assert!(!note_matches(&n, &q, &none, &TextQuery::parse("subject:zephyrling", NOTE_QUERY_FIELDS), body));
-        let created = DateRange::parse(Some("start_of_month"), None, "a", "b", now()).unwrap();
+        let created = DateRange::parse(Some("start_of_month"), None, "a", "b", now(), Weekday::Mon).unwrap();
         assert!(note_matches(&n, &q, &created, &TextQuery::default(), body));
-        let created = DateRange::parse(Some("today"), None, "a", "b", now()).unwrap();
+        let created = DateRange::parse(Some("today"), None, "a", "b", now(), Weekday::Mon).unwrap();
         assert!(!note_matches(&n, &q, &created, &TextQuery::default(), body));
         let q = NoteQuery { category: s(&["x"]), ..Default::default() };
         assert!(!note_matches(&n, &q, &none, &TextQuery::default(), body));

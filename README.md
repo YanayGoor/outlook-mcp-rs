@@ -192,7 +192,7 @@ Every date parameter on every tool (list filters, `create_event`/`update_event` 
 | Form | Examples | Meaning |
 |---|---|---|
 | ISO date or datetime | `2026-06-10`, `2026-06-10T14:30`, `2026-06-10 14:30:00` | Always year-month-day |
-| Keyword | `now`, `today`, `yesterday`, `tomorrow`, `start_of_week`, `end_of_week`, `start_of_month`, `end_of_month`, `start_of_year`, `end_of_year` | Day keywords and `start_of_*` are midnight; `end_of_*` is 23:59:59 on the last day. Weeks start on Monday |
+| Keyword | `now`, `today`, `yesterday`, `tomorrow`, `start_of_week`, `end_of_week`, `start_of_month`, `end_of_month`, `start_of_year`, `end_of_year` | Day keywords and `start_of_*` are midnight; `end_of_*` is 23:59:59 on the last day. Weeks start on the first day of the week in the Windows user's regional settings (e.g. Monday, Sunday or Saturday; Monday only if it can't be read) |
 | Offset from now | `-14d`, `+3h`, `-2w`, `-30m`, `+1mo`, `-1y` | Units: `m` minutes, `h` hours, `d` days, `w` weeks, `mo` months, `y` years |
 | Keyword plus offsets | `today-1d`, `start_of_week-1w`, `tomorrow+9h` | Applied left to right |
 
