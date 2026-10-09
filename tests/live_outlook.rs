@@ -1246,3 +1246,66 @@ fn hebrew_subject_and_body_round_trip_through_com() {
     let found = found.expect("list_emails with a Hebrew query should succeed");
     assert!(found.iter().any(|e| e.id == id && e.subject == subject));
 }
+
+/// If `s` looks like Hebrew that was encoded as windows-1255 and then decoded
+/// as latin1 (the issue #31 symptom, e.g. `îééì` for `מייל`), the repaired
+/// Hebrew; else `None`. windows-1255 puts the 27 Hebrew letters at
+/// 0xE0..=0xFA, which latin1 reads as U+00E0..=U+00FA. To avoid flagging
+/// French or Spanish, at least one word of two or more letters must consist
+/// only of such characters, and there must be at least three of them.
+fn repair_cp1255_read_as_latin1(s: &str) -> Option<String> {
+    let suspect = |ch: char| ('\u{00E0}'..='\u{00FA}').contains(&ch);
+    if s.chars().any(|ch| ('\u{0590}'..='\u{05FF}').contains(&ch))
+        || s.chars().filter(|&ch| suspect(ch)).count() < 3
+        || !s.split_whitespace().any(|w| w.chars().count() >= 2 && w.chars().all(suspect))
+    {
+        return None;
+    }
+    Some(
+        s.chars()
+            .map(|ch| if suspect(ch) { char::from_u32(ch as u32 - 0xE0 + 0x05D0).unwrap() } else { ch })
+            .collect(),
+    )
+}
+
+/// Issue #31 diagnostic (read-only): does Outlook's COM API itself hand us
+/// windows-1255-read-as-latin1 mojibake? Scans the subject and sender of the
+/// 200 newest inbox emails. A failure means the text is already garbled in
+/// the mailbox (typically mail whose charset label was missing or wrong, so
+/// Outlook stored it with the wrong code page): the server passes it on
+/// faithfully, and Outlook itself shows the same garbage. A pass means COM
+/// returns proper Unicode, so any mojibake the user sees is added after the
+/// server: by the client, a wrapper script or the console (README,
+/// Troubleshooting).
+#[test]
+#[ignore]
+fn inbox_text_from_com_has_no_cp1255_mojibake() {
+    // The detector itself, on known samples.
+    assert_eq!(repair_cp1255_read_as_latin1("îééì ùé÷åó").as_deref(), Some("מייל שיקוף"));
+    assert_eq!(repair_cp1255_read_as_latin1("RE: òãä ìàáìééñ").as_deref(), Some("RE: עדה לאבלייס"));
+    assert_eq!(repair_cp1255_read_as_latin1("מייל שיקוף"), None);
+    assert_eq!(repair_cp1255_read_as_latin1("Réunion à côté de l'église"), None);
+
+    let emails = client().list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count: 200, offset: 0, unread_only: false,
+        from: None, to: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list_emails should succeed against a live Outlook");
+    let is_hebrew = |s: &str| s.chars().any(|ch| ('\u{05D0}'..='\u{05EA}').contains(&ch));
+    let hebrew = emails.iter().filter(|e| is_hebrew(&e.subject) || is_hebrew(&e.sender)).count();
+    let garbled: Vec<String> = emails
+        .iter()
+        .flat_map(|e| [("subject", &e.subject), ("sender", &e.sender)].map(|(f, v)| (e, f, v)))
+        .filter_map(|(e, field, value)| {
+            repair_cp1255_read_as_latin1(value)
+                .map(|fixed| format!("{} {field}: {value:?} (as Hebrew: {fixed:?})", e.id))
+        })
+        .collect();
+    eprintln!("{} emails scanned, {hebrew} with proper Hebrew text", emails.len());
+    assert!(
+        garbled.is_empty(),
+        "COM itself returned windows-1255-as-latin1 text, so it is garbled in the mailbox \
+         (not by the server). Check these in Outlook:\n{}",
+        garbled.join("\n")
+    );
+}
