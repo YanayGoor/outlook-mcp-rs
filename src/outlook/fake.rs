@@ -448,14 +448,37 @@ impl OutlookClient for FakeOutlookClient {
     }
 
     fn save_attachments(&self, email_id: String, save_dir: String,
-        attachment_names: Option<Vec<String>>) -> Result<Vec<Value>, ToolError> {
-        self.record("save_attachments",
-            json!({"email_id": email_id, "save_dir": save_dir, "attachment_names": attachment_names}))?;
-        Ok(vec![json!({
-            "index": 1, "filename": "report.pdf", "size": 1234, "type": "file",
-            "content_id": null, "mime_type": "application/pdf", "hidden": false, "is_inline": false,
-            "saved_to": save_dir, "status": "saved",
-        })])
+        attachment_names: Option<Vec<String>>, inline: Option<bool>) -> Result<Vec<Value>, ToolError> {
+        self.record("save_attachments", json!({
+            "email_id": email_id, "save_dir": save_dir, "attachment_names": attachment_names,
+            "inline": inline,
+        }))?;
+        // Same two attachments as list_attachments: a regular file and an
+        // inline image; filtered like the real client.
+        let all = vec![
+            json!({
+                "index": 1, "filename": "report.pdf", "size": 1234, "type": "file",
+                "content_id": null, "mime_type": "application/pdf", "hidden": false,
+                "is_inline": false, "saved_to": save_dir, "status": "saved",
+            }),
+            json!({
+                "index": 2, "filename": "logo.png", "size": 512, "type": "file",
+                "content_id": "logo@example", "mime_type": "image/png", "hidden": true,
+                "is_inline": true, "saved_to": save_dir, "status": "saved",
+            }),
+        ];
+        let wanted: Option<Vec<String>> =
+            attachment_names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
+        let results: Vec<Value> = all.into_iter()
+            .filter(|a| wanted.as_ref().is_none_or(|w| {
+                w.contains(&a["filename"].as_str().unwrap_or_default().to_lowercase())
+            }))
+            .filter(|a| inline.is_none_or(|want| a["is_inline"] == want))
+            .collect();
+        if results.is_empty() {
+            return Err(ToolError::new("No attachments matched attachment_names / inline."));
+        }
+        Ok(results)
     }
 
     fn get_inline_image(&self, email_id: String, content_ids: Vec<String>,

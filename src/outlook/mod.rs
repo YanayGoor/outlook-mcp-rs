@@ -331,8 +331,10 @@ pub trait OutlookClient: Send + Sync {
     fn check_availability(&self, input: CheckAvailabilityInput) -> Result<AvailabilityResult, ToolError>;
 
     fn list_attachments(&self, email_ids: Vec<String>) -> BatchResult<Vec<AttachmentInfo>>;
+    /// `inline`: `Some(b)` saves only attachments whose `is_inline == b`
+    /// (applied together with `attachment_names`); `None` saves all.
     fn save_attachments(&self, email_id: String, save_dir: String,
-        attachment_names: Option<Vec<String>>) -> Result<Vec<Value>, ToolError>;
+        attachment_names: Option<Vec<String>>, inline: Option<bool>) -> Result<Vec<Value>, ToolError>;
     /// One result per requested Content-ID, in order. With `output_dir`,
     /// each image's bytes are written there (`data_file`) instead of being
     /// returned as `data_uri`.

@@ -1530,6 +1530,29 @@ fn get_inline_image_content_ids_batch_and_output_dir() {
 
 #[test]
 #[ignore]
+fn save_attachments_inline_filter_splits_regular_from_inline() {
+    let c = WindowsOutlookClient::new();
+    let Some((email_id, _cid)) = email_with_referenced_inline_image(&c) else {
+        eprintln!("skipping: no referenced inline image in the newest 25 inbox items");
+        return;
+    };
+    let dir = live_out_dir("save-inline");
+    let dir_str: String = dir.to_string_lossy().into();
+    let inline = c.save_attachments(email_id.clone(), dir_str.clone(), None, Some(true))
+        .expect("save inline only");
+    assert!(!inline.is_empty());
+    assert!(inline.iter().all(|a| a["is_inline"] == true), "{inline:?}");
+    // The email may have no regular attachments: then the filter matches
+    // nothing and the call reports it instead of saving the images.
+    match c.save_attachments(email_id, dir_str, None, Some(false)) {
+        Ok(regular) => assert!(regular.iter().all(|a| a["is_inline"] == false), "{regular:?}"),
+        Err(e) => assert!(e.0.contains("No attachments matched"), "{e:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore]
 fn get_task_reads_an_existing_task() {
     let c = WindowsOutlookClient::new();
     let tasks = c.list_tasks(TaskQuery { include_completed: true, ..Default::default() })
