@@ -1,6 +1,7 @@
 pub mod client;
 pub mod com;
 pub mod fake;
+pub mod read;
 pub mod types;
 
 use crate::error::ToolError;
