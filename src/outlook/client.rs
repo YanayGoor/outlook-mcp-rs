@@ -2228,6 +2228,7 @@ impl OutlookClient for WindowsOutlookClient {
         email_id: String,
         save_dir: String,
         attachment_names: Option<Vec<String>>,
+        inline: Option<bool>,
     ) -> Result<Vec<Value>, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
@@ -2268,6 +2269,9 @@ impl OutlookClient for WindowsOutlookClient {
                         continue;
                     }
                 }
+                if inline.is_some_and(|want| info.is_inline != want) {
+                    continue;
+                }
                 let target = dir.join(safe_filename(&info.filename));
                 let target_str = target.to_string_lossy().into_owned();
                 // Each entry is the attachment's metadata (`index` stays its
@@ -2282,8 +2286,8 @@ impl OutlookClient for WindowsOutlookClient {
             }
             if results.is_empty() {
                 return Err(ToolError::new(
-                    "No attachments matched attachment_names; use list_attachments \
-                     to see the exact file names.",
+                    "No attachments matched attachment_names / inline; use \
+                     list_attachments to see the exact file names and `is_inline`.",
                 ));
             }
             Ok(results)

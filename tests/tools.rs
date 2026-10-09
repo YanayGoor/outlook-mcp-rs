@@ -1910,12 +1910,14 @@ async fn save_attachments_passes_dir_and_names() {
             email_id: EMAIL_ID.to_string(),
             save_dir: "/tmp/x".to_string(),
             attachment_names: Some(vec!["report.pdf".to_string()]),
+            inline: None,
         }))
         .await
         .unwrap();
     let (_, args) = &fake.calls()[0];
     assert_eq!(args["save_dir"], "/tmp/x");
     assert_eq!(args["attachment_names"], json!(["report.pdf"]));
+    assert_eq!(args["inline"], Value::Null);
     let v = result_json(&result);
     assert_eq!(v[0]["filename"], "report.pdf");
     assert_eq!(v[0]["status"], "saved");
@@ -1923,6 +1925,46 @@ async fn save_attachments_passes_dir_and_names() {
     for key in ["index", "size", "type", "content_id", "mime_type", "hidden", "is_inline"] {
         assert!(v[0].get(key).is_some(), "missing {key}");
     }
+}
+
+async fn save_attachments_with_inline(inline: Option<bool>) -> (Value, Value) {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let result = server
+        .save_attachments(Parameters(SaveAttachmentsParams {
+            email_id: EMAIL_ID.to_string(),
+            save_dir: "/tmp/x".to_string(),
+            attachment_names: None,
+            inline,
+        }))
+        .await
+        .unwrap();
+    let (_, args) = &fake.calls()[0];
+    (args["inline"].clone(), result_json(&result))
+}
+
+#[tokio::test]
+async fn save_attachments_inline_false_skips_inline_images() {
+    let (arg, v) = save_attachments_with_inline(Some(false)).await;
+    assert_eq!(arg, false);
+    let names: Vec<_> = v.as_array().unwrap().iter().map(|a| a["filename"].clone()).collect();
+    assert_eq!(names, vec![json!("report.pdf")]);
+}
+
+#[tokio::test]
+async fn save_attachments_inline_true_saves_only_inline_images() {
+    let (arg, v) = save_attachments_with_inline(Some(true)).await;
+    assert_eq!(arg, true);
+    let names: Vec<_> = v.as_array().unwrap().iter().map(|a| a["filename"].clone()).collect();
+    assert_eq!(names, vec![json!("logo.png")]);
+    assert_eq!(v[0]["is_inline"], true);
+}
+
+#[tokio::test]
+async fn save_attachments_without_inline_saves_all() {
+    let (arg, v) = save_attachments_with_inline(None).await;
+    assert_eq!(arg, Value::Null);
+    assert_eq!(v.as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]

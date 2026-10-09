@@ -629,6 +629,10 @@ pub struct SaveAttachmentsParams {
     pub save_dir: String,
     #[serde(default)]
     pub attachment_names: Option<Vec<String>>,
+    /// false = save only regular attachments (skip inline images an HTML
+    /// body shows via `cid:`); true = only inline images. Omit to save all.
+    #[serde(default)]
+    pub inline: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1205,13 +1209,13 @@ impl OutlookMcpServer {
         batch_content(&ids, many, results, |id, v| json!({"id": id, "attachments": v}))
     }
 
-    #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.")]
+    #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Pass `inline: false` to save only regular attachments and skip inline images (`is_inline`), e.g. when re-sending an email whose HTML already carries its images (get_email with resolve_inline_images) so they aren't attached twice; `inline: true` saves only the inline images. Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.")]
     pub async fn save_attachments(
         &self,
-        Parameters(SaveAttachmentsParams { email_id, save_dir, attachment_names }): Parameters<SaveAttachmentsParams>,
+        Parameters(SaveAttachmentsParams { email_id, save_dir, attachment_names, inline }): Parameters<SaveAttachmentsParams>,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client.clone();
-        let result = run_blocking(move || client.save_attachments(email_id, save_dir, attachment_names)).await?;
+        let result = run_blocking(move || client.save_attachments(email_id, save_dir, attachment_names, inline)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 

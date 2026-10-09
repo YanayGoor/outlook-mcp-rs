@@ -542,7 +542,7 @@ fn system_test_plans_1_to_9() {
                         match single(c.list_attachments(vec![found.id.clone()])) {
                             Ok(atts) if !atts.is_empty() => {
                                 let fname = atts[0].filename.clone();
-                                match c.save_attachments(found.id.clone(), save_dir.to_string_lossy().to_string(), None) {
+                                match c.save_attachments(found.id.clone(), save_dir.to_string_lossy().to_string(), None, None) {
                                     Ok(results) => {
                                         let saved_path = results.iter()
                                             .find(|v| v["filename"] == fname)
