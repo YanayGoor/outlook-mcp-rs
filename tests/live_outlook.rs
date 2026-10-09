@@ -1249,3 +1249,165 @@ fn hebrew_subject_and_body_round_trip_through_com() {
     let found = found.expect("list_emails with a Hebrew query should succeed");
     assert!(found.iter().any(|e| e.id == id && e.subject == subject));
 }
+
+// ---- Read tools: batch ids, include, output_dir, get_task and
+// ---- resolve_inline_images (#34/#35/#29). All read-only. ----
+
+/// The newest `count` inbox items (read-only).
+fn newest_inbox(c: &WindowsOutlookClient, count: i32) -> Vec<outlook_mcp_rs::outlook::types::EmailSummary> {
+    c.list_emails(EmailQuery {
+        query: None, folder: "inbox".into(), count, offset: 0, unread_only: false,
+        from: None, to: None, category: None, received_after: None, received_before: None,
+        since_days: None, has_attachments: None, flagged: false, high_importance: false,
+    }).expect("list_emails")
+}
+
+/// A fresh, empty temp directory for output_dir tests.
+fn live_out_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("outlook-mcp-rs-live-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// An inbox email (newest 25) with an attachment whose Content-ID its HTML
+/// body references and which fits the 10 MB inline limit.
+fn email_with_referenced_inline_image(c: &WindowsOutlookClient) -> Option<(String, String)> {
+    newest_inbox(c, 25).iter().find_map(|e| {
+        let atts = single(c.list_attachments(vec![e.id.clone()])).ok()?;
+        atts.into_iter()
+            .find(|a| a.is_inline && a.content_id.is_some() && a.size <= 10 * 1024 * 1024)
+            .map(|a| (e.id.clone(), a.content_id.unwrap()))
+    })
+}
+
+#[test]
+#[ignore]
+fn get_email_batch_keeps_order_and_isolates_a_bad_id() {
+    let c = WindowsOutlookClient::new();
+    let emails = newest_inbox(&c, 2);
+    if emails.len() < 2 {
+        eprintln!("skipping: needs two inbox items");
+        return;
+    }
+    let ids = vec![emails[0].id.clone(), "00DEADBEEF|00DEADBEEF".to_string(), emails[1].id.clone()];
+    let results = c.get_email(ids, &ReadOptions::default()).expect("batch call");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].as_ref().expect("first id").summary.id, emails[0].id);
+    assert!(results[1].is_err(), "bogus id should fail on its own");
+    assert_eq!(results[2].as_ref().expect("third id").summary.id, emails[1].id);
+
+    let lists = c.list_attachments(vec![emails[0].id.clone(), "00DEADBEEF|00DEADBEEF".into()])
+        .expect("list_attachments batch");
+    assert!(lists[0].is_ok() && lists[1].is_err());
+}
+
+#[test]
+#[ignore]
+fn get_email_include_and_output_dir_on_a_real_item() {
+    let c = WindowsOutlookClient::new();
+    let Some(first) = newest_inbox(&c, 1).into_iter().next() else {
+        eprintln!("skipping: empty inbox");
+        return;
+    };
+    // Metadata only: no body, no attachments, no meeting block.
+    let meta = single(c.get_email(vec![first.id.clone()], &ReadOptions {
+        body: false, attachments: false, meeting: false, ..ReadOptions::default()
+    })).expect("metadata-only get_email");
+    assert!(meta.body.is_none() && meta.body_length.is_none() && meta.attachments.is_none());
+    assert!(meta.meeting.is_none());
+    assert_eq!(meta.summary.id, first.id);
+
+    // Bodies to files: full text on disk, paths absolute, lengths reported.
+    let dir = live_out_dir("email");
+    let detail = single(c.get_email(vec![first.id.clone()], &ReadOptions {
+        html_body: true, max_body_chars: Some(1000), output_dir: Some(dir.to_string_lossy().into()),
+        ..ReadOptions::default()
+    })).expect("get_email with output_dir");
+    assert!(detail.body.is_none() && detail.html_body.is_none());
+    let body_file = std::path::PathBuf::from(detail.body_file.expect("body_file"));
+    let html_file = std::path::PathBuf::from(detail.html_body_file.expect("html_body_file"));
+    assert!(body_file.is_absolute() && html_file.is_absolute());
+    let body = std::fs::read_to_string(&body_file).expect("read body_file");
+    assert_eq!(Some(body.chars().count()), detail.body_length);
+    assert_eq!(detail.body_truncated, Some(false));
+    let html = std::fs::read_to_string(&html_file).expect("read html_body_file");
+    assert_eq!(Some(html.chars().count()), detail.html_length);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore]
+fn get_email_resolve_inline_images_inlines_a_real_cid() {
+    let c = WindowsOutlookClient::new();
+    let Some((email_id, cid)) = email_with_referenced_inline_image(&c) else {
+        eprintln!("skipping: no referenced inline image in the newest 25 inbox items");
+        return;
+    };
+    let html_only = ReadOptions {
+        body: false, attachments: false, meeting: false, html_body: true,
+        max_body_chars: Some(5_000_000), ..ReadOptions::default()
+    };
+    let raw = single(c.get_email(vec![email_id.clone()], &html_only)).expect("raw html");
+    if !raw.html_body.unwrap_or_default().to_lowercase().contains(&format!("cid:{}", cid.to_lowercase())) {
+        eprintln!("skipping: inline attachment {cid} is hidden but not referenced by the HTML");
+        return;
+    }
+    let detail = single(c.get_email(vec![email_id.clone()], &ReadOptions {
+        resolve_inline_images: true, ..html_only
+    })).expect("get_email resolve_inline_images");
+    let html = detail.html_body.expect("html_body");
+    assert!(detail.inline_images_resolved.expect("resolved count") >= 1);
+    assert!(html.contains("data:"), "resolved HTML has a data: URI");
+    let unresolved = detail.inline_images_unresolved.expect("unresolved list");
+    if !unresolved.iter().any(|u| u.eq_ignore_ascii_case(&cid)) {
+        assert!(
+            !html.to_lowercase().contains(&format!("cid:{}\"", cid.to_lowercase())),
+            "cid:{cid} should have been replaced"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn get_inline_image_content_ids_batch_and_output_dir() {
+    let c = WindowsOutlookClient::new();
+    let Some((email_id, cid)) = email_with_referenced_inline_image(&c) else {
+        eprintln!("skipping: no referenced inline image in the newest 25 inbox items");
+        return;
+    };
+    let dir = live_out_dir("image");
+    let results = c.get_inline_image(
+        email_id, vec![cid.clone(), "missing@nowhere.invalid".into()], None,
+        Some(dir.to_string_lossy().into()),
+    ).expect("batch get_inline_image");
+    let image = results[0].as_ref().expect("known cid");
+    assert!(image.data_uri.is_none());
+    let bytes = std::fs::read(image.data_file.as_deref().expect("data_file")).expect("read data_file");
+    assert_eq!(bytes.len(), image.size);
+    assert!(results[1].as_ref().unwrap_err().0.contains("not found"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore]
+fn get_task_reads_an_existing_task() {
+    let c = WindowsOutlookClient::new();
+    let tasks = c.list_tasks(TaskQuery { include_completed: true, ..Default::default() })
+        .expect("list_tasks");
+    let Some(first) = tasks.first() else {
+        eprintln!("skipping: no tasks");
+        return;
+    };
+    let detail = single(c.get_task(vec![first.id.clone()], &ReadOptions::default())).expect("get_task");
+    assert_eq!(detail.summary.id, first.id);
+    assert_eq!(detail.summary.subject, first.subject);
+    assert!(detail.body.is_some() && detail.body_length.is_some());
+    assert!((0..=100).contains(&detail.percent_complete));
+    // Outlook's "none" date never leaks through.
+    for date in [&detail.start_date, &detail.date_completed, &detail.reminder_time] {
+        assert!(!date.as_deref().unwrap_or("").starts_with("4501"), "{date:?}");
+    }
+    let meta = single(c.get_task(vec![first.id.clone()], &ReadOptions { body: false, ..ReadOptions::default() }))
+        .expect("get_task without body");
+    assert!(meta.body.is_none());
+}
