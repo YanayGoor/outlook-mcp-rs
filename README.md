@@ -233,14 +233,61 @@ covered by automated tests versus verified by hand precisely because they send r
 
 ## Troubleshooting
 
-### Hebrew or other non-ASCII text shows up as `????`
+### Hebrew or other non-ASCII text shows up as `????` or as gibberish
 
 The server's output is UTF-8 end to end. Outlook text stays UTF-16 until it is
 decoded to a Rust `String`, serialized as raw UTF-8 JSON (no `\uXXXX` escapes), and
-written unchanged to stdout or the HTTP response. The `????` comes from whatever
-displays the output, typically a Windows console or PowerShell using a non-UTF-8
-code page. Inspect the output in a UTF-8 viewer, or switch the console first with
-`chcp 65001` (cmd) or `[Console]::OutputEncoding = [Text.Encoding]::UTF8` (PowerShell).
+written unchanged to stdout or the HTTP response. In network mode every JSON and SSE
+response also says `charset=utf-8` in its `Content-Type`. The server never converts
+text to a Windows code page, so garbled text means something else re-decoded it.
+The shape of the garbage tells you what:
+
+| You see (for `מייל שיקוף`) | What happened | Where to look |
+|---|---|---|
+| `???? ?????` | Text was squeezed into a code page that has no Hebrew | A console or wrapper that isn't UTF-8 |
+| `×ž×™×™×œ ×©×™×§×•×£` | UTF-8 bytes were read as latin1 / windows-1252 | The client's decoding: an HTTP client guessing ISO-8859-1 for a response without a charset (versions before the `charset=utf-8` fix), or a script reading the server's output with the system code page |
+| `îééì ùé÷åó` | Hebrew was encoded as **windows-1255** and then read as latin1 | Something between Outlook and you converted the text to the Windows "ANSI" code page (see below) |
+
+The last row is the one where a `latin1 → windows-1255` re-decode "fixes" the
+text. The server cannot produce it, because it never emits windows-1255 bytes. Two
+things can:
+
+1. **A wrapper around the executable.** If the MCP client starts the server
+   through a script instead of running `outlook-mcp-rs.exe` directly, that
+   script may decode the server's UTF-8 output with the system code page and
+   re-encode it. Common culprits:
+   - a **PowerShell** pipeline or `powershell -Command "... outlook-mcp-rs.exe ..."`
+     launcher. PowerShell reads a native program's output using
+     `[Console]::OutputEncoding` and writes it out again using `$OutputEncoding` or
+     the console's code page, neither of which is UTF-8 by default on Windows
+     PowerShell 5.1;
+   - a **Python** wrapper or client using `subprocess` with `text=True` but no
+     `encoding="utf-8"` (it then uses the ANSI code page, windows-1255 on a Hebrew
+     system);
+   - saving results with Windows PowerShell 5.1's `Set-Content` / `Out-File`, which
+     do not write UTF-8 by default.
+
+   The same wrappers also break Hebrew *arguments*, so a Hebrew search finds nothing.
+2. **The message itself.** Mail sent with a missing or wrong charset label can be
+   stored by Outlook with the wrong code page. Then the mailbox already holds the
+   garbled text, Outlook shows the same garbage when you open the message, and the
+   server reports it faithfully. To check, run the read-only live diagnostic
+   `cargo test --test live_outlook -- --ignored inbox_text_from_com_has_no_cp1255_mojibake`
+   on the Outlook machine. It fails, naming the emails, if COM itself returns this
+   kind of text.
+
+To fix it:
+
+- Point the client's `command` straight at `outlook-mcp-rs.exe`, as in
+  [Configure your MCP client](#configure-your-mcp-client), with no `cmd`,
+  PowerShell or Python launcher in between.
+- If you need a wrapper, make it UTF-8 in both directions. In PowerShell:
+  `$OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)`.
+  In Python: `subprocess.Popen(..., encoding="utf-8")`, or set `PYTHONUTF8=1`.
+- To view output in a console, switch it to UTF-8 first: `chcp 65001` (cmd) or the
+  PowerShell line above. Or inspect it in a UTF-8 viewer.
+- On a remote (`--http`) setup, use a client that honours the `charset` in
+  `Content-Type`; any MCP SDK client does.
 
 ## Skills for AI assistants
 

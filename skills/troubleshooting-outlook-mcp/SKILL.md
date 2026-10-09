@@ -52,8 +52,12 @@ may still have sent.
   true. Call `get_email` again with `max_body_chars` ≥ `body_length`.
 - **Only 250 events:** that's the hard cap. Use a smaller date window.
 - **`list_tasks` misses a task:** completed tasks are hidden unless `include_completed` is set.
-- **Non-ASCII text shows as `????`:** the server's output is UTF-8. The console
-  displaying it isn't (see the README's troubleshooting section).
+- **Non-ASCII text shows as `????` or gibberish:** the server's output is always UTF-8
+  and never converted to a Windows code page. Gibberish like `îééì` (Hebrew as
+  windows-1255 read as latin1) or `×ž×™×™×œ` (UTF-8 read as latin1) comes from a
+  console, wrapper script or client decoding it with the wrong code page, or from a
+  mail stored with the wrong charset (then Outlook shows it garbled too). Don't try
+  to repair it yourself; point the user to the README's troubleshooting section.
 
 ## Don't
 
