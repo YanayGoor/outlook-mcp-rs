@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **29 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **30 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 29 tools below become available.
+already running, and the 30 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 29 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 30 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
@@ -130,12 +130,12 @@ The Outlook tools then appear in that client.
 
 ## Available tools
 
-29 MCP tools, grouped by category:
+30 MCP tools, grouped by category:
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
 - `list_emails` — find emails in a folder with an optional text query (matches subject, sender, and body; non-ASCII queries such as Hebrew fall back to a client-side scan when Outlook's search finds nothing) and filters (sender via `from`, recipient via `to` — any To/CC name or address, category, date range, attachments, flagged, importance); newest first, `count` up to 200, page with `offset`
-- `get_email` — get the full body and attachment list of one email by id; reports `body_truncated`/`body_length` (and `html_truncated`/`html_length` with `prefer_html`), and `max_body_chars` (default 100,000, up to 5,000,000) fetches a larger body
+- `get_email` — get one email by id, or several in one call; see [Reading items](#reading-items) for `include`, `body_format`, `max_body_chars`, `output_dir` and `resolve_inline_images`
 - `send_email` — send a new email immediately (to/cc/bcc, plain or HTML body, file attachments, inline images)
 - `create_draft` — create a draft email without sending it (same options as `send_email`)
 - `reply_email` — reply to an email, optionally to all recipients, optionally as a draft
@@ -146,7 +146,7 @@ The Outlook tools then appear in that client.
 
 **Calendar**
 - `list_events` — list/search calendar events by date range, text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`
-- `get_event` — get the full details of one calendar event by id
+- `get_event` — get the full details of one calendar event by id, or several in one call (same output options as `get_email`, plain-text body only)
 - `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out
 - `update_event` — change an existing event (subject, times, location, body, attendees, reminder, recurrence…); optionally notify attendees
 - `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative)
@@ -154,22 +154,53 @@ The Outlook tools then appear in that client.
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**
-- `list_attachments` — list an email's attachments with metadata: index, filename, size, type (file/link/item/ole), Content-ID (for `cid:` references in HTML bodies), MIME type, hidden flag, and `is_inline` (inline `cid:` content vs. a standalone attachment)
+- `list_attachments` — list an email's attachments with metadata: index, filename, size, type (file/link/item/ole), Content-ID (for `cid:` references in HTML bodies), MIME type, hidden flag, and `is_inline` (inline `cid:` content vs. a standalone attachment); accepts a list of email ids
 - `save_attachments` — save an email's attachments to a local directory (each result carries the same metadata plus `saved_to`/`status`)
-- `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB); optional `context_lines` (max 50) also returns `context`, the plain-text lines just before the image's first `cid:` reference in the HTML body (`""` if it isn't referenced)
+- `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB); optional `context_lines` (max 50) also returns `context`, the plain-text lines just before the image's first `cid:` reference in the HTML body (`""` if it isn't referenced); `content_ids` fetches several images of one email in one call, and `output_dir` writes the image files to disk (`data_file`) instead of returning base64
 
 **Tasks**
 - `list_tasks` — list Outlook tasks (filter by category, importance, or a text query matching subject or body)
+- `get_task` — get the full details of one task by id, or several in one call: body, start date, completion date, percent complete, reminder, created/modified (same output options as `get_event`)
 - `create_task` — create a new Outlook task
 - `update_task` — change an existing task: mark complete/reopen, subject, body, due_date, start_date, importance, add/remove categories, percent_complete, reminder_time
 - `delete_task` — delete a task (moves it to Deleted Items)
 
 **Notes**
 - `list_notes` — list Outlook notes (filter by category or a text query on the body)
-- `get_note` — get the full body of one note by id
+- `get_note` — get the full body of one note by id, or several in one call (same output options as `get_event`)
 - `create_note` — create a new Outlook note (optional categories, color)
 - `update_note` — change an existing note: body, add/remove categories, color
 - `delete_note` — delete a note (moves it to Deleted Items)
+
+### Reading items
+
+`get_email`, `get_event`, `get_note` and `get_task` share the same output controls:
+
+- **Several ids at once:** pass the id parameter (`email_id`, `event_id`, `note_id`, `task_id`;
+  plural aliases such as `email_ids` work too) as a list. The result is then a list in the
+  same order, and an id that fails becomes `{"id": ..., "error": ...}` instead of failing the
+  whole call. A single id (not a list) returns exactly the object it always did.
+  `list_attachments` (a list of email ids) and `get_inline_image` (`content_ids`) batch the
+  same way.
+- **`include`** picks the optional, heavy fields. `get_email`: `"body"`, `"html_body"`,
+  `"attachments"`, `"meeting"` (default `["body", "attachments", "meeting"]`, today's output).
+  The others: `"body"` (default `["body"]`). `[]` returns metadata only.
+- **`body_format`**: `"text"` (default) or `"html"`. On `get_email`, `"html"` also returns
+  `html_body`; `prefer_html: true` is the deprecated spelling of the same thing. Events,
+  notes and tasks only have plain-text bodies.
+- **`max_body_chars`** (default 100,000, 1,000–5,000,000) cuts each inline body. Every
+  returned body reports `*_truncated` and `*_length` (the full length in characters):
+  `body_truncated`/`body_length`, `html_truncated`/`html_length`.
+- **`output_dir`** writes each body in full (never truncated) to a file in that directory
+  (created if missing) and returns its absolute path as `body_file` / `html_body_file`
+  instead of the text. File names are derived from the item id, so reading the same item
+  again overwrites them.
+- **`resolve_inline_images`** (`get_email` only, implies `html_body`) replaces every
+  `cid:` reference in `html_body` with the image's base64 `data:` URI, so the HTML is
+  self-contained. Content-ID matching ignores case and `<>`; references to unknown
+  Content-IDs, to images over 10 MB, or to unreadable attachments stay as `cid:` and are
+  listed in `inline_images_unresolved` (`inline_images_resolved` counts the replaced ones).
+  The resolved HTML is usually large, so combine it with `output_dir`.
 
 ### Inline images
 

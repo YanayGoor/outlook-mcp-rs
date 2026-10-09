@@ -30,6 +30,12 @@ may still have sent.
 | `Content-ID '…' not found. Available Content-IDs: …` | Wrong `content_id` for `get_inline_image` | Use one of the listed ids. The `cid:` prefix and letter case don't matter |
 | `no attachments with a Content-ID` | The email has no inline images | `list_attachments` shows its regular attachments |
 | `exceeds the 10 MB limit for get_inline_image` | The attachment is too big to return inline | Use `save_attachments` to write it to disk |
+| `unknown include field "…"; valid fields are: …` | `include` names a field that tool doesn't have | Use one of the listed fields (`html_body`, `attachments` and `meeting` exist only on `get_email`) |
+| `this item only has a plain-text body; body_format must be "text"` | `body_format: "html"` on `get_event`/`get_note`/`get_task` | Drop `body_format` |
+| `` `prefer_html` (deprecated) is … but `body_format` is …`` | Both were passed and disagree | Pass only `body_format` |
+| ``pass either `content_id` or `content_ids`, not both`` | `get_inline_image` got both | Use `content_id` for one image, `content_ids` for several |
+| `output_dir "…" exists and is not a directory` / `Could not create output_dir` | Bad `output_dir` path | Give an absolute directory path the server can write to |
+| `{"id": …, "error": …}` inside a list result | That one id failed in a batch read; the others are fine | Handle it per item (often a stale id: find the item again) |
 | `empty_deleted_items permanently deletes EVERYTHING` | `confirm` was not true | Only pass `confirm: true` if the user explicitly asked to empty Deleted Items |
 | `HRESULT 0x80040154` (class not registered) | Classic Outlook isn't installed; the "new Outlook" app has no COM | Tell the user the tools need classic Outlook |
 | `HRESULT 0x80080005` (server execution failed) | Outlook isn't running or is hung, or only one of Outlook and the server runs as administrator | Ask the user to (re)start Outlook normally, with the same elevation as the MCP client |
@@ -49,7 +55,11 @@ may still have sent.
   scanning the 2,000 newest items that match the other filters. Older mail needs a date
   filter or a narrower folder.
 - **Email body ends with `[... truncated at N characters]`:** `body_truncated` is
-  true. Call `get_email` again with `max_body_chars` ≥ `body_length`.
+  true. Call `get_email` again with `max_body_chars` ≥ `body_length`, or pass
+  `output_dir` to get the full body as a file.
+- **`resolve_inline_images` left some `cid:` references:** they are listed in
+  `inline_images_unresolved`: no attachment has that Content-ID, the image is over 10 MB,
+  or it couldn't be read. Try `get_inline_image` on one to see the exact error.
 - **Only 250 events:** that's the hard cap. Use a smaller date window.
 - **`list_tasks` misses a task:** completed tasks are hidden unless `include_completed` is set.
 - **Non-ASCII text shows as `????`:** the server's output is UTF-8. The console
