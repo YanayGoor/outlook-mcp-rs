@@ -18,6 +18,11 @@ use super::read::{
     BatchResult, BodyOut, ReadOptions, ReadTool,
 };
 
+/// The first day of the week the fake's date parsing uses: always Monday,
+/// so tests are deterministic. The real client reads it from the Windows
+/// user's regional settings (`com::user_first_day_of_week`).
+pub const FAKE_WEEK_START: chrono::Weekday = chrono::Weekday::Mon;
+
 pub const EMAIL_ID: &str = "entry-1|store-1";
 pub const EVENT_ID: &str = "entry-2|store-1";
 pub const TASK_ID: &str = "entry-3|store-1";
@@ -180,7 +185,7 @@ impl OutlookClient for FakeOutlookClient {
     fn list_emails(&self, q: EmailQuery) -> Result<Vec<EmailSummary>, ToolError> {
         // Same up-front date validation as the real client.
         DateRange::parse(q.received_after.as_deref(), q.received_before.as_deref(),
-            "received_after", "received_before", chrono::Local::now().naive_local())?;
+            "received_after", "received_before", chrono::Local::now().naive_local(), FAKE_WEEK_START)?;
         self.record("list_emails", json!({
             "query": q.query, "folder": q.folder, "count": q.count, "offset": q.offset,
             "unread_only": q.unread_only, "from": q.from, "to": q.to, "category": q.category,
@@ -338,7 +343,7 @@ impl OutlookClient for FakeOutlookClient {
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError> {
         DateRange::parse(q.start_after.as_deref(), q.start_before.as_deref(),
-            "start_after", "start_before", chrono::Local::now().naive_local())?;
+            "start_after", "start_before", chrono::Local::now().naive_local(), FAKE_WEEK_START)?;
         self.record("list_events", json!({
             "start_after": q.start_after, "start_before": q.start_before, "query": q.query,
             "category": q.category, "show_as": q.show_as, "my_response": q.my_response,
@@ -563,7 +568,7 @@ impl OutlookClient for FakeOutlookClient {
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError> {
         DateRange::parse(q.due_after.as_deref(), q.due_before.as_deref(),
-            "due_after", "due_before", chrono::Local::now().naive_local())?;
+            "due_after", "due_before", chrono::Local::now().naive_local(), FAKE_WEEK_START)?;
         self.record("list_tasks", json!({
             "include_completed": q.include_completed, "category": q.category,
             "importance": q.importance, "query": q.query, "due_after": q.due_after,
@@ -639,7 +644,7 @@ impl OutlookClient for FakeOutlookClient {
 
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError> {
         DateRange::parse(q.created_after.as_deref(), q.created_before.as_deref(),
-            "created_after", "created_before", chrono::Local::now().naive_local())?;
+            "created_after", "created_before", chrono::Local::now().naive_local(), FAKE_WEEK_START)?;
         self.record("list_notes", json!({
             "category": q.category, "query": q.query, "created_after": q.created_after,
             "created_before": q.created_before, "count": q.count, "offset": q.offset,

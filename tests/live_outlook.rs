@@ -1634,6 +1634,39 @@ fn list_emails_relative_dates_bound_received_time() {
 
 #[test]
 #[ignore]
+fn start_of_week_follows_the_windows_first_day_of_week() {
+    use chrono::Datelike;
+    use outlook_mcp_rs::outlook::com::{first_day_of_week_from_locale_value, user_first_day_of_week};
+    use outlook_mcp_rs::outlook::dates::parse_date_param;
+    use windows::Win32::Globalization::{GetLocaleInfoW, LOCALE_IFIRSTDAYOFWEEK};
+    let first = user_first_day_of_week();
+    // Cross-check through the older LCID API (LOCALE_USER_DEFAULT = 0x400).
+    let mut buf = [0u16; 8];
+    let n = unsafe { GetLocaleInfoW(0x400, LOCALE_IFIRSTDAYOFWEEK, Some(&mut buf)) };
+    assert!(n > 0, "GetLocaleInfoW(LOCALE_IFIRSTDAYOFWEEK) failed");
+    let raw = String::from_utf16_lossy(&buf[..n as usize]);
+    assert_eq!(Some(first), first_day_of_week_from_locale_value(&raw), "locale value {raw:?}");
+    let today = chrono::Local::now().date_naive();
+    let start = parse_date_param("start_of_week", "x", first).unwrap().at;
+    let end = parse_date_param("end_of_week", "x", first).unwrap().at;
+    eprintln!("first day of week = {first}; this week = {start} .. {end}");
+    assert_eq!(start.weekday(), first);
+    assert!(start.date() <= today && today <= end.date(), "{today} is not in {start}..{end}");
+    assert_eq!(end.date() - start.date(), chrono::Duration::days(6));
+    // And the client accepts it end to end.
+    let c = client();
+    let events = c.list_events(EventQuery {
+        start_after: Some("start_of_week".into()), start_before: Some("end_of_week".into()), count: 20, ..Default::default()
+    }).expect("start_of_week..end_of_week should parse and run");
+    for e in &events {
+        let Some(at) = e.start.as_deref().and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+        else { continue };
+        assert!(at <= end, "{} starts at {at}, after {end}", e.subject);
+    }
+}
+
+#[test]
+#[ignore]
 fn list_emails_item_type_filter_matches_get_email() {
     let c = client();
     let emails = c.list_emails(EmailQuery { item_type: vec!["email".into()], count: 15, ..Default::default() })

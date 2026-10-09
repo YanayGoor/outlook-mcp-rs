@@ -17,20 +17,25 @@
 //! - `today`/`yesterday`/`tomorrow` and every `start_of_*` are midnight
 //!   (00:00:00); every `end_of_*` is the last second of that period
 //!   (23:59:59 on its last day).
-//! - Weeks start on **Monday** (ISO 8601), whatever the Windows locale says.
+//! - Weeks start on the first day of the week from the Windows user's
+//!   regional settings (`LOCALE_IFIRSTDAYOFWEEK`: Monday in most of Europe,
+//!   Sunday in the US, Saturday in some Middle-East locales). The parser
+//!   takes it as an input; the COM client reads it per call with
+//!   `com::user_first_day_of_week` (Monday only if that lookup fails), and
+//!   the in-memory fake always uses Monday so tests are deterministic.
 //! - `mo`/`y` move by calendar months/years, clamping the day to the target
 //!   month's length (`2026-03-31` + `1mo` = `2026-04-30`).
 //! - Timezone suffixes (`Z`, `+02:00`) are not accepted: every value is local
 //!   time, as Outlook shows it.
 //!
-//! Everything here is pure (the caller passes `now`) so it can be unit
-//! tested; [`parse_date_param`] is the wrapper the COM client uses.
+//! Everything here is pure (the caller passes `now` and the week start) so
+//! it can be unit tested; [`parse_date_param`] is the wrapper the COM client uses.
 //!
 //! The result is a `NaiveDateTime`; turning it into a `Restrict` filter
 //! string is `com::jet_datetime`'s job (and its day-first-locale bug is
 //! issue #1, not this module's).
 
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 
 use crate::error::ToolError;
 
@@ -91,9 +96,14 @@ fn parse_iso(s: &str) -> Option<DateValue> {
         .map(|d| DateValue { at: midnight(d), date_only: true })
 }
 
-fn anchor(keyword: &str, now: NaiveDateTime) -> NaiveDateTime {
+/// The first day (`week_start`) of the week containing `day`.
+fn start_of_week(day: NaiveDate, week_start: Weekday) -> NaiveDate {
+    day - Duration::days(day.weekday().days_since(week_start) as i64)
+}
+
+fn anchor(keyword: &str, now: NaiveDateTime, first_day: Weekday) -> NaiveDateTime {
     let today = now.date();
-    let week_start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
+    let week_start = start_of_week(today, first_day);
     let month_start = today.with_day(1).unwrap();
     let year_start = NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap();
     match keyword {
@@ -134,9 +144,10 @@ fn apply_offset(at: NaiveDateTime, negative: bool, amount: u32, unit: &str) -> O
     if negative { at.checked_sub_signed(delta) } else { at.checked_add_signed(delta) }
 }
 
-/// Parses one date expression (see the module docs) relative to `now`.
+/// Parses one date expression (see the module docs) relative to `now`, with
+/// weeks starting on `week_start` (for `start_of_week` / `end_of_week`).
 /// The error is a short reason, without the field name or the grammar help.
-pub fn parse_date_value(input: &str, now: NaiveDateTime) -> Result<DateValue, String> {
+pub fn parse_date_value(input: &str, now: NaiveDateTime, week_start: Weekday) -> Result<DateValue, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("empty value".to_string());
@@ -149,7 +160,7 @@ pub fn parse_date_value(input: &str, now: NaiveDateTime) -> Result<DateValue, St
         (now, s.as_str())
     } else {
         match KEYWORDS.iter().find(|k| s.starts_with(*k)) {
-            Some(k) => (anchor(k, now), &s[k.len()..]),
+            Some(k) => (anchor(k, now, week_start), &s[k.len()..]),
             None => return Err("not a recognized date".to_string()),
         }
     };
@@ -181,13 +192,14 @@ pub fn parse_date_value(input: &str, now: NaiveDateTime) -> Result<DateValue, St
 
 /// [`parse_date_value`] relative to the current local time, with a
 /// [`ToolError`] naming the parameter on failure.
-pub fn parse_date_param(value: &str, field: &str) -> Result<DateValue, ToolError> {
-    parse_date_param_at(value, field, chrono::Local::now().naive_local())
+pub fn parse_date_param(value: &str, field: &str, week_start: Weekday) -> Result<DateValue, ToolError> {
+    parse_date_param_at(value, field, chrono::Local::now().naive_local(), week_start)
 }
 
 /// [`parse_date_value`] with a [`ToolError`] naming the parameter on failure.
-pub fn parse_date_param_at(value: &str, field: &str, now: NaiveDateTime) -> Result<DateValue, ToolError> {
-    parse_date_value(value, now)
+pub fn parse_date_param_at(value: &str, field: &str, now: NaiveDateTime, week_start: Weekday)
+    -> Result<DateValue, ToolError> {
+    parse_date_value(value, now, week_start)
         .map_err(|reason| ToolError::new(format!("Invalid {field} {value:?}: {reason}; {DATE_GRAMMAR_HELP}")))
 }
 
@@ -205,30 +217,30 @@ mod tests {
     }
 
     fn at(s: &str) -> NaiveDateTime {
-        parse_date_value(s, now()).unwrap_or_else(|e| panic!("{s:?}: {e}")).at
+        parse_date_value(s, now(), Weekday::Mon).unwrap_or_else(|e| panic!("{s:?}: {e}")).at
     }
 
     fn err(s: &str) -> String {
-        parse_date_value(s, now()).unwrap_err()
+        parse_date_value(s, now(), Weekday::Mon).unwrap_err()
     }
 
     #[test]
     fn iso_dates_and_datetimes() {
-        let v = parse_date_value("2026-06-10", now()).unwrap();
+        let v = parse_date_value("2026-06-10", now(), Weekday::Mon).unwrap();
         assert_eq!(v, DateValue { at: dt("2026-06-10T00:00:00"), date_only: true });
         assert_eq!(at("2026-06-10T14:30"), dt("2026-06-10T14:30:00"));
         assert_eq!(at("2026-06-10 14:30"), dt("2026-06-10T14:30:00"));
         assert_eq!(at("2026-06-10T14:30:45"), dt("2026-06-10T14:30:45"));
         assert_eq!(at("  2026-06-10T14:30:45.250 "), dt("2026-06-10T14:30:45") + Duration::milliseconds(250));
-        assert!(!parse_date_value("2026-06-10T00:00", now()).unwrap().date_only);
+        assert!(!parse_date_value("2026-06-10T00:00", now(), Weekday::Mon).unwrap().date_only);
     }
 
     #[test]
     fn iso_is_year_month_day_never_day_first() {
         // 2026-11-09 is 9 November, not 11 September (issue #1's symptom).
         assert_eq!(at("2026-11-09"), dt("2026-11-09T00:00:00"));
-        assert!(parse_date_value("2026-13-01", now()).is_err());
-        assert!(parse_date_value("2026-02-30", now()).is_err());
+        assert!(parse_date_value("2026-13-01", now(), Weekday::Mon).is_err());
+        assert!(parse_date_value("2026-02-30", now(), Weekday::Mon).is_err());
     }
 
     #[test]
@@ -240,15 +252,58 @@ mod tests {
         assert_eq!(at("TODAY"), dt("2026-10-08T00:00:00"));
     }
 
+    /// `(start_of_week, end_of_week)` for `now` = `day` at 13:00.
+    fn week(day: &str, first: Weekday) -> (NaiveDateTime, NaiveDateTime) {
+        let now = dt(&format!("{day}T13:00:00"));
+        let get = |s: &str| parse_date_value(s, now, first).unwrap_or_else(|e| panic!("{s:?}: {e}")).at;
+        (get("start_of_week"), get("end_of_week"))
+    }
+
     #[test]
-    fn week_starts_on_monday() {
+    fn week_starting_monday() {
         // 2026-10-08 is a Thursday.
         assert_eq!(at("start_of_week"), dt("2026-10-05T00:00:00"));
         assert_eq!(at("end_of_week"), dt("2026-10-11T23:59:59"));
-        let monday = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap().and_hms_opt(9, 0, 0).unwrap();
-        assert_eq!(parse_date_value("start_of_week", monday).unwrap().at, dt("2026-10-05T00:00:00"));
-        let sunday = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap().and_hms_opt(23, 0, 0).unwrap();
-        assert_eq!(parse_date_value("start_of_week", sunday).unwrap().at, dt("2026-10-05T00:00:00"));
+        let this_week = (dt("2026-10-05T00:00:00"), dt("2026-10-11T23:59:59"));
+        assert_eq!(week("2026-10-05", Weekday::Mon), this_week); // on the start day
+        assert_eq!(week("2026-10-11", Weekday::Mon), this_week); // Sunday, the last day
+        // The Sunday before the Monday start belongs to the previous week.
+        assert_eq!(week("2026-10-04", Weekday::Mon), (dt("2026-09-28T00:00:00"), dt("2026-10-04T23:59:59")));
+    }
+
+    #[test]
+    fn week_starting_sunday() {
+        let this_week = (dt("2026-10-04T00:00:00"), dt("2026-10-10T23:59:59"));
+        assert_eq!(week("2026-10-08", Weekday::Sun), this_week); // Thursday
+        assert_eq!(week("2026-10-04", Weekday::Sun), this_week); // on the start day
+        assert_eq!(week("2026-10-10", Weekday::Sun), this_week); // Saturday, the day before the next start
+        assert_eq!(week("2026-10-11", Weekday::Sun), (dt("2026-10-11T00:00:00"), dt("2026-10-17T23:59:59")));
+    }
+
+    #[test]
+    fn week_starting_saturday() {
+        let this_week = (dt("2026-10-03T00:00:00"), dt("2026-10-09T23:59:59"));
+        assert_eq!(week("2026-10-08", Weekday::Sat), this_week); // Thursday
+        assert_eq!(week("2026-10-03", Weekday::Sat), this_week); // on the start day
+        assert_eq!(week("2026-10-09", Weekday::Sat), this_week); // Friday, the day before the next start
+        assert_eq!(week("2026-10-10", Weekday::Sat), (dt("2026-10-10T00:00:00"), dt("2026-10-16T23:59:59")));
+        // A week across a month and year boundary.
+        assert_eq!(week("2027-01-01", Weekday::Sat), (dt("2026-12-26T00:00:00"), dt("2027-01-01T23:59:59")));
+    }
+
+    #[test]
+    fn week_start_reaches_combined_forms() {
+        let now = now(); // Thursday 2026-10-08
+        let get = |s: &str, first| parse_date_value(s, now, first).unwrap().at;
+        assert_eq!(get("start_of_week-1w", Weekday::Mon), dt("2026-09-28T00:00:00"));
+        assert_eq!(get("start_of_week-1w", Weekday::Sun), dt("2026-09-27T00:00:00"));
+        assert_eq!(get("start_of_week-1w", Weekday::Sat), dt("2026-09-26T00:00:00"));
+        assert_eq!(get("end_of_week+1w", Weekday::Sun), dt("2026-10-17T23:59:59"));
+        assert_eq!(get("Start_Of_Week + 1d", Weekday::Sat), dt("2026-10-04T00:00:00"));
+        // Nothing else depends on the week start.
+        for s in ["today", "-14d", "start_of_month", "end_of_year", "2026-06-10"] {
+            assert_eq!(get(s, Weekday::Sun), get(s, Weekday::Mon), "{s}");
+        }
     }
 
     #[test]
@@ -258,9 +313,9 @@ mod tests {
         assert_eq!(at("start_of_year"), dt("2026-01-01T00:00:00"));
         assert_eq!(at("end_of_year"), dt("2026-12-31T23:59:59"));
         let feb = NaiveDate::from_ymd_opt(2028, 2, 10).unwrap().and_hms_opt(0, 0, 0).unwrap();
-        assert_eq!(parse_date_value("end_of_month", feb).unwrap().at, dt("2028-02-29T23:59:59"));
+        assert_eq!(parse_date_value("end_of_month", feb, Weekday::Mon).unwrap().at, dt("2028-02-29T23:59:59"));
         let dec = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap().and_hms_opt(0, 0, 0).unwrap();
-        assert_eq!(parse_date_value("end_of_month", dec).unwrap().at, dt("2026-12-31T23:59:59"));
+        assert_eq!(parse_date_value("end_of_month", dec, Weekday::Mon).unwrap().at, dt("2026-12-31T23:59:59"));
     }
 
     #[test]
@@ -288,23 +343,23 @@ mod tests {
     #[test]
     fn month_offsets_clamp_the_day() {
         let mar31 = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap().and_hms_opt(8, 0, 0).unwrap();
-        assert_eq!(parse_date_value("+1mo", mar31).unwrap().at, dt("2026-04-30T08:00:00"));
-        assert_eq!(parse_date_value("-1mo", mar31).unwrap().at, dt("2026-02-28T08:00:00"));
+        assert_eq!(parse_date_value("+1mo", mar31, Weekday::Mon).unwrap().at, dt("2026-04-30T08:00:00"));
+        assert_eq!(parse_date_value("-1mo", mar31, Weekday::Mon).unwrap().at, dt("2026-02-28T08:00:00"));
     }
 
     #[test]
     fn keyword_values_are_not_date_only() {
-        assert!(!parse_date_value("today", now()).unwrap().date_only);
-        assert!(!parse_date_value("-1d", now()).unwrap().date_only);
+        assert!(!parse_date_value("today", now(), Weekday::Mon).unwrap().date_only);
+        assert!(!parse_date_value("-1d", now(), Weekday::Mon).unwrap().date_only);
     }
 
     #[test]
     fn upper_bound_includes_a_whole_bare_date() {
-        let v = parse_date_value("2026-06-30", now()).unwrap();
+        let v = parse_date_value("2026-06-30", now(), Weekday::Mon).unwrap();
         assert_eq!(v.upper_bound(), dt("2026-06-30T23:59:59") + Duration::microseconds(999_999));
-        let v = parse_date_value("2026-06-30T12:00", now()).unwrap();
+        let v = parse_date_value("2026-06-30T12:00", now(), Weekday::Mon).unwrap();
         assert_eq!(v.upper_bound(), dt("2026-06-30T12:00:00"));
-        let v = parse_date_value("today", now()).unwrap();
+        let v = parse_date_value("today", now(), Weekday::Mon).unwrap();
         assert_eq!(v.upper_bound(), dt("2026-10-08T00:00:00"));
     }
 
@@ -335,8 +390,8 @@ mod tests {
 
     #[test]
     fn non_ascii_input_does_not_panic() {
-        assert!(parse_date_value("היום", now()).is_err());
-        assert!(parse_date_value("-1דקה", now()).is_err());
-        assert!(parse_date_value("today-1é", now()).is_err());
+        assert!(parse_date_value("היום", now(), Weekday::Mon).is_err());
+        assert!(parse_date_value("-1דקה", now(), Weekday::Mon).is_err());
+        assert!(parse_date_value("today-1é", now(), Weekday::Mon).is_err());
     }
 }
