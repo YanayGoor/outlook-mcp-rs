@@ -8,6 +8,8 @@ use crate::error::ToolError;
 use serde_json::Value;
 use types::*;
 
+pub use read::{BatchResult, ReadOptions, ReadRequest, ReadTool};
+
 /// All filters for `list_emails`. All optional except `folder`/`count`/`offset`
 /// (which the server fills with defaults). Supplying several ANDs them.
 #[derive(Debug, Clone)]
@@ -265,10 +267,10 @@ pub struct RecurrenceInput {
 pub trait OutlookClient: Send + Sync {
     fn list_folders(&self) -> Result<Vec<FolderInfo>, ToolError>;
     fn list_emails(&self, q: EmailQuery) -> Result<Vec<EmailSummary>, ToolError>;
-    /// `max_body_chars`: `None` = the 100,000-char default; other values are
-    /// clamped to 1,000..=5,000,000.
-    fn get_email(&self, email_id: String, prefer_html: bool, max_body_chars: Option<u32>)
-        -> Result<EmailDetail, ToolError>;
+    /// Batch read (one result per id, in order). `opts` picks the optional
+    /// fields, the body cut (`read::clamp_body_limit`), `output_dir` and
+    /// `resolve_inline_images`; see `read::read_options`.
+    fn get_email(&self, email_ids: Vec<String>, opts: &ReadOptions) -> BatchResult<EmailDetail>;
     fn send_email(&self, to: Vec<String>, subject: String, body: String,
         cc: Option<Vec<String>>, bcc: Option<Vec<String>>, html: bool,
         attachments: Option<Vec<String>>, inline_images: Option<Vec<InlineImage>>)
@@ -290,7 +292,7 @@ pub trait OutlookClient: Send + Sync {
     fn empty_deleted_items(&self, confirm: bool) -> Result<Value, ToolError>;
 
     fn list_events(&self, q: EventQuery) -> Result<Vec<EventSummary>, ToolError>;
-    fn get_event(&self, event_id: String) -> Result<EventDetail, ToolError>;
+    fn get_event(&self, event_ids: Vec<String>, opts: &ReadOptions) -> BatchResult<EventDetail>;
     fn create_event(&self, input: CreateEventInput) -> Result<Value, ToolError>;
     fn respond_to_meeting(&self, event_id: String, response: String,
         comment: Option<String>, send: bool) -> Result<Value, ToolError>;
@@ -298,22 +300,25 @@ pub trait OutlookClient: Send + Sync {
     fn delete_event(&self, event_id: String, send_cancellation: bool) -> Result<Value, ToolError>;
     fn check_availability(&self, input: CheckAvailabilityInput) -> Result<AvailabilityResult, ToolError>;
 
-    fn list_attachments(&self, email_id: String)
-        -> Result<Vec<AttachmentInfo>, ToolError>;
+    fn list_attachments(&self, email_ids: Vec<String>) -> BatchResult<Vec<AttachmentInfo>>;
     fn save_attachments(&self, email_id: String, save_dir: String,
         attachment_names: Option<Vec<String>>) -> Result<Vec<Value>, ToolError>;
-    fn get_inline_image(&self, email_id: String, content_id: String,
-        context_lines: Option<u32>) -> Result<InlineImageData, ToolError>;
+    /// One result per requested Content-ID, in order. With `output_dir`,
+    /// each image's bytes are written there (`data_file`) instead of being
+    /// returned as `data_uri`.
+    fn get_inline_image(&self, email_id: String, content_ids: Vec<String>,
+        context_lines: Option<u32>, output_dir: Option<String>) -> BatchResult<InlineImageData>;
 
     fn list_tasks(&self, q: TaskQuery) -> Result<Vec<TaskSummary>, ToolError>;
     fn create_task(&self, subject: String, body: Option<String>,
         due_date: Option<String>, importance: String, categories: Option<Vec<String>>,
         start_date: Option<String>, reminder_time: Option<String>) -> Result<Value, ToolError>;
+    fn get_task(&self, task_ids: Vec<String>, opts: &ReadOptions) -> BatchResult<TaskDetail>;
     fn update_task(&self, u: TaskUpdate) -> Result<Value, ToolError>;
     fn delete_task(&self, task_id: String) -> Result<Value, ToolError>;
 
     fn list_notes(&self, q: NoteQuery) -> Result<Vec<NoteSummary>, ToolError>;
-    fn get_note(&self, note_id: String) -> Result<NoteDetail, ToolError>;
+    fn get_note(&self, note_ids: Vec<String>, opts: &ReadOptions) -> BatchResult<NoteDetail>;
     fn create_note(&self, body: String, categories: Option<Vec<String>>, color: Option<String>) -> Result<Value, ToolError>;
     fn update_note(&self, u: NoteUpdate) -> Result<Value, ToolError>;
     fn delete_note(&self, note_id: String) -> Result<Value, ToolError>;

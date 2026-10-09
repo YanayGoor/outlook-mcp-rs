@@ -9,6 +9,8 @@
 
 use base64::Engine as _;
 use outlook_mcp_rs::outlook::client::WindowsOutlookClient;
+use outlook_mcp_rs::outlook::read::single;
+use outlook_mcp_rs::outlook::ReadOptions;
 use outlook_mcp_rs::outlook::types::EmailSummary;
 use outlook_mcp_rs::outlook::{DraftUpdate, EmailQuery, InlineImage, OutlookClient};
 use std::collections::HashSet;
@@ -272,7 +274,7 @@ fn system_test_open_prs_14_to_25() {
     match &att_draft {
         Ok(id) => {
             cleanup.push(("ATT".into(), id.clone()));
-            match c.list_attachments(id.clone()) {
+            match single(c.list_attachments(vec![id.clone()])) {
                 Ok(atts) => {
                     let txt = atts.iter().find(|a| a.filename == "notes.txt");
                     let logo = atts.iter().find(|a| a.content_id.as_deref() == Some("logo"));
@@ -329,7 +331,7 @@ fn system_test_open_prs_14_to_25() {
     match &img_draft {
         Ok(id) => {
             cleanup.push(("IMG".into(), id.clone()));
-            match c.list_attachments(id.clone()) {
+            match single(c.list_attachments(vec![id.clone()])) {
                 Ok(atts) => {
                     let ok = ["logo", "chart"].iter().all(|cid| atts.iter().any(|a|
                         a.content_id.as_deref() == Some(cid) && a.mime_type.as_deref() == Some("image/png") && a.hidden));
@@ -359,14 +361,14 @@ fn system_test_open_prs_14_to_25() {
     println!("\n--- PR #24 / #25 ---");
     if let Ok(id) = &img_draft {
         let want = png_bytes();
-        let a = c.get_inline_image(id.clone(), "cid:LOGO".into(), None);
-        let b = c.get_inline_image(id.clone(), "<chart>".into(), None);
+        let a = single(c.get_inline_image(id.clone(), vec!["cid:LOGO".into()], None, None));
+        let b = single(c.get_inline_image(id.clone(), vec!["<chart>".into()], None, None));
         match (&a, &b) {
             (Ok(a), Ok(b)) => {
-                let ok = a.content_id == "logo" && a.mime_type == "image/png" && decode_data_uri(&a.data_uri) == Some(want.clone())
-                    && a.size == want.len() && b.content_id == "chart" && decode_data_uri(&b.data_uri) == Some(want.clone());
+                let ok = a.content_id == "logo" && a.mime_type == "image/png" && decode_data_uri(a.data_uri.as_deref().unwrap_or_default()) == Some(want.clone())
+                    && a.size == want.len() && b.content_id == "chart" && decode_data_uri(b.data_uri.as_deref().unwrap_or_default()) == Some(want.clone());
                 r.record("P24-1", ok, format!("logo: cid={} mime={} size={} bytes equal {}; chart bytes equal {}",
-                    a.content_id, a.mime_type, a.size, decode_data_uri(&a.data_uri) == Some(want.clone()), decode_data_uri(&b.data_uri) == Some(want.clone())));
+                    a.content_id, a.mime_type, a.size, decode_data_uri(a.data_uri.as_deref().unwrap_or_default()) == Some(want.clone()), decode_data_uri(b.data_uri.as_deref().unwrap_or_default()) == Some(want.clone())));
                 r.record("P25-2", a.context.is_none(), format!("no context_lines -> context {:?}", a.context));
             }
             _ => {
@@ -374,15 +376,15 @@ fn system_test_open_prs_14_to_25() {
                 r.fail("P25-2", "get_inline_image failed");
             }
         }
-        match c.get_inline_image(id.clone(), "missing@nowhere".into(), None) {
+        match single(c.get_inline_image(id.clone(), vec!["missing@nowhere".into()], None, None)) {
             Err(e) => r.record("P24-2", e.0.contains("logo") && e.0.contains("chart"), format!("error: {}", e.0)),
             Ok(_) => r.fail("P24-2", "unknown cid unexpectedly succeeded"),
         }
-        match c.get_inline_image(id.clone(), "logo".into(), Some(2)) {
+        match single(c.get_inline_image(id.clone(), vec!["logo".into()], Some(2), None)) {
             Ok(img) => r.record("P25-1", img.context.as_deref() == Some("Line two\nLine three"), format!("context {:?}", img.context)),
             Err(e) => r.fail("P25-1", e.0),
         }
-        match c.get_inline_image(id.clone(), "unreferenced".into(), Some(3)) {
+        match single(c.get_inline_image(id.clone(), vec!["unreferenced".into()], Some(3), None)) {
             Ok(img) => r.record("P25-3", img.context.as_deref() == Some(""), format!("context {:?}", img.context)),
             Err(e) => r.fail("P25-3", e.0),
         }
@@ -392,7 +394,7 @@ fn system_test_open_prs_14_to_25() {
         }
     }
     match &to_a {
-        Some(id) => match c.get_inline_image(id.clone(), "logo".into(), None) {
+        Some(id) => match single(c.get_inline_image(id.clone(), vec!["logo".into()], None, None)) {
             Err(e) => r.record("P24-3", e.0.contains("list_attachments"), format!("error: {}", e.0)),
             Ok(_) => r.fail("P24-3", "draft without attachments unexpectedly returned an image"),
         },
@@ -405,15 +407,16 @@ fn system_test_open_prs_14_to_25() {
     match draft(&c, NOBODY, &subj("truncation plain"), &long_body, false, None, None) {
         Ok(id) => {
             cleanup.push(("TRUNC1".into(), id.clone()));
-            match (c.get_email(id.clone(), false, None), c.get_email(id.clone(), false, Some(1000))) {
+            match (single(c.get_email(vec![id.clone()], &ReadOptions::default())), single(c.get_email(vec![id.clone()], &ReadOptions { max_body_chars: Some(1000), ..ReadOptions::default() }))) {
                 (Ok(full), Ok(cut)) => {
                     // The cut body is the first 1000 chars plus the long-standing
                     // truncation marker.
-                    let head: String = full.body.chars().take(1000).collect();
-                    let marker_ok = cut.body.strip_prefix(head.as_str()) == Some(TRUNC_MARKER);
-                    let pass = !full.body_truncated && full.body_length >= 3000 && cut.body_truncated
+                    let head: String = full.body.as_deref().unwrap_or_default().chars().take(1000).collect();
+                    let marker_ok = cut.body.as_deref().unwrap_or_default().strip_prefix(head.as_str()) == Some(TRUNC_MARKER);
+                    let pass = full.body_truncated == Some(false) && full.body_length.unwrap_or(0) >= 3000
+                        && cut.body_truncated == Some(true)
                         && marker_ok && cut.body_length == full.body_length;
-                    r.record("P20-1", pass, format!("full: truncated={} len={}; cut: truncated={} first-1000+marker {marker_ok} len={}",
+                    r.record("P20-1", pass, format!("full: truncated={:?} len={:?}; cut: truncated={:?} first-1000+marker {marker_ok} len={:?}",
                         full.body_truncated, full.body_length, cut.body_truncated, cut.body_length));
                 }
                 (a, b) => r.fail("P20-1", format!("{:?} / {:?}", a.err(), b.err())),
@@ -425,7 +428,7 @@ fn system_test_open_prs_14_to_25() {
     match draft(&c, NOBODY, &subj("truncation html"), &long_html, true, None, None) {
         Ok(id) => {
             cleanup.push(("TRUNC2".into(), id.clone()));
-            match c.get_email(id.clone(), true, Some(1000)) {
+            match single(c.get_email(vec![id.clone()], &ReadOptions { html_body: true, max_body_chars: Some(1000), ..ReadOptions::default() })) {
                 Ok(d) => {
                     let marker_ok = d.html_body.as_deref().is_some_and(|h| {
                         h.chars().count() == 1000 + TRUNC_MARKER.chars().count() && h.ends_with(TRUNC_MARKER)
@@ -446,21 +449,21 @@ fn system_test_open_prs_14_to_25() {
     match draft(&c, NOBODY, &he_subject, &format!("{he_line}\nשורה שנייה"), false, None, None) {
         Ok(id) => {
             cleanup.push(("HE-RT".into(), id.clone()));
-            let detail = c.get_email(id.clone(), false, None);
+            let detail = single(c.get_email(vec![id.clone()], &ReadOptions::default()));
             let listed = c.list_emails(EmailQuery { query: Some(run.clone()), count: 200, ..q("drafts") })
                 .ok().and_then(|l| l.into_iter().find(|e| e.id == id));
             match detail {
                 Ok(d) => {
-                    let pass = d.summary.subject == he_subject && d.body.contains(he_line)
+                    let pass = d.summary.subject == he_subject && d.body.as_deref().unwrap_or_default().contains(he_line)
                         && listed.as_ref().is_some_and(|e| e.subject == he_subject);
                     r.record("P21-1", pass, format!("get_email subject exact {}, body has line {}, list subject exact {}",
-                        d.summary.subject == he_subject, d.body.contains(he_line), listed.as_ref().is_some_and(|e| e.subject == he_subject)));
+                        d.summary.subject == he_subject, d.body.as_deref().unwrap_or_default().contains(he_line), listed.as_ref().is_some_and(|e| e.subject == he_subject)));
                 }
                 Err(e) => r.fail("P21-1", e.0),
             }
             let new_subject = subj("עדכון כותרת בעברית ✓");
             let res = c.update_draft(DraftUpdate { draft_id: id.clone(), subject: Some(new_subject.clone()), ..Default::default() });
-            let back = c.get_email(id.clone(), false, None).map(|d| d.summary.subject);
+            let back = single(c.get_email(vec![id.clone()], &ReadOptions::default())).map(|d| d.summary.subject);
             r.record("P21-2", res.is_ok() && back.as_deref().ok() == Some(new_subject.as_str()),
                 format!("update_draft {:?}; read back {:?}", res.map(|v| v["status"].clone()).map_err(|e| e.0), back.map_err(|e| e.0)));
         }
@@ -487,7 +490,7 @@ fn system_test_open_prs_14_to_25() {
             match res {
                 Ok(v) => {
                     let changed_ok = v["status"] == "draft_updated" && v["changed"] == serde_json::json!(["subject", "html_body", "to", "cc"]);
-                    let d = c.get_email(id.clone(), true, None);
+                    let d = single(c.get_email(vec![id.clone()], &ReadOptions { html_body: true, ..ReadOptions::default() }));
                     match d {
                         Ok(d) => {
                             let html_ok = d.html_body.as_deref().is_some_and(|h| h.contains(&format!("marker-{run}")));
@@ -502,12 +505,12 @@ fn system_test_open_prs_14_to_25() {
                 Err(e) => r.fail("P19-1", e.0),
             }
             let res = c.update_draft(DraftUpdate { draft_id: id.clone(), cc: Some(vec![]), bcc: Some(vec![SOMEONE_ELSE.into()]), ..Default::default() });
-            match (res, c.get_email(id.clone(), false, None)) {
+            match (res, single(c.get_email(vec![id.clone()], &ReadOptions::default()))) {
                 (Ok(_), Ok(d)) => r.record("P19-2", d.cc.trim().is_empty() && d.bcc.contains("someone-else"), format!("cc {:?} bcc {:?}", d.cc, d.bcc)),
                 (a, b) => r.fail("P19-2", format!("{:?} / {:?}", a.err().map(|e| e.0), b.err().map(|e| e.0))),
             }
             let res = c.update_draft(DraftUpdate { draft_id: id.clone(), attachments: Some(vec![txt2_path_s.clone()]), ..Default::default() });
-            match (res, c.list_attachments(id.clone())) {
+            match (res, single(c.list_attachments(vec![id.clone()]))) {
                 (Ok(_), Ok(atts)) => {
                     let names: Vec<&str> = atts.iter().map(|a| a.filename.as_str()).collect();
                     r.record("P19-3", atts.len() == 2 && names.contains(&"notes.txt") && names.contains(&"extra.txt"), format!("attachments {names:?}"));
@@ -515,7 +518,7 @@ fn system_test_open_prs_14_to_25() {
                 (a, b) => r.fail("P19-3", format!("{:?} / {:?}", a.err().map(|e| e.0), b.err().map(|e| e.0))),
             }
             let res = c.update_draft(DraftUpdate { draft_id: id.clone(), body: Some("x".into()), html_body: Some("<p>x</p>".into()), subject: Some(subj("SHOULD NOT APPLY")), ..Default::default() });
-            let still = c.get_email(id.clone(), false, None).map(|d| d.summary.subject);
+            let still = single(c.get_email(vec![id.clone()], &ReadOptions::default())).map(|d| d.summary.subject);
             r.record("P19-4", res.is_err() && still.as_deref().ok() == Some(new_subject.as_str()),
                 format!("body+html_body -> {:?}; subject now {:?}", res.err().map(|e| e.0), still.map_err(|e| e.0)));
         }
@@ -537,7 +540,7 @@ fn system_test_open_prs_14_to_25() {
         Ok(id) => match c.delete_email(id.clone(), true) {
             Ok(v) => {
                 std::thread::sleep(Duration::from_secs(2));
-                let gone = c.get_email(id.clone(), false, None).is_err();
+                let gone = single(c.get_email(vec![id.clone()], &ReadOptions::default())).is_err();
                 let not_in_deleted = in_deleted(&perm_subject).is_none();
                 r.record("P16-1", v["status"] == "deleted" && v["permanent"] == true && gone && not_in_deleted,
                     format!("result {v}; id resolves no more {gone}; absent from Deleted Items {not_in_deleted}"));
@@ -605,7 +608,7 @@ fn system_test_open_prs_14_to_25() {
         Err(e) => r.fail("S1", e.0),
     }
     if let Some(recv) = &s1_inbox {
-        match c.list_attachments(recv.id.clone()) {
+        match single(c.list_attachments(vec![recv.id.clone()])) {
             Ok(atts) => {
                 let a = atts.iter().find(|a| a.content_id.as_deref() == Some("s1img"));
                 r.record("P22-4", a.is_some_and(|a| a.is_inline), format!("received attachments {:?}",
@@ -613,13 +616,13 @@ fn system_test_open_prs_14_to_25() {
             }
             Err(e) => r.fail("P22-4", e.0),
         }
-        match c.get_inline_image(recv.id.clone(), "s1img".into(), Some(1)) {
-            Ok(img) => r.record("P24-4", decode_data_uri(&img.data_uri) == Some(png_bytes()),
-                format!("received image bytes equal sent: {}; context {:?}", decode_data_uri(&img.data_uri) == Some(png_bytes()), img.context)),
+        match single(c.get_inline_image(recv.id.clone(), vec!["s1img".into()], Some(1), None)) {
+            Ok(img) => r.record("P24-4", decode_data_uri(img.data_uri.as_deref().unwrap_or_default()) == Some(png_bytes()),
+                format!("received image bytes equal sent: {}; context {:?}", decode_data_uri(img.data_uri.as_deref().unwrap_or_default()) == Some(png_bytes()), img.context)),
             Err(e) => r.fail("P24-4", e.0),
         }
         let res = c.update_draft(DraftUpdate { draft_id: recv.id.clone(), subject: Some(subj("MUST NOT CHANGE")), ..Default::default() });
-        let still = c.get_email(recv.id.clone(), false, None).map(|d| d.summary.subject);
+        let still = single(c.get_email(vec![recv.id.clone()], &ReadOptions::default())).map(|d| d.summary.subject);
         r.record("P19-5", res.as_ref().is_err_and(|e| e.0.contains("only unsent drafts")) && still.as_deref().ok() == Some(recv.subject.as_str()),
             format!("update_draft on received item -> {:?}; subject now {:?}", res.err().map(|e| e.0), still.map_err(|e| e.0)));
         match c.reply_email(recv.id.clone(), "systest reply draft".into(), false, false, false, None) {

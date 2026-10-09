@@ -9,6 +9,8 @@
 //! can't be undone — see TESTING.md for how to test those by hand.
 
 use outlook_mcp_rs::outlook::client::WindowsOutlookClient;
+use outlook_mcp_rs::outlook::read::single;
+use outlook_mcp_rs::outlook::ReadOptions;
 use outlook_mcp_rs::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 
 fn client() -> WindowsOutlookClient {
@@ -89,7 +91,7 @@ fn permanent_delete_of_draft_skips_deleted_items() {
     assert_eq!(result["permanent"], true);
 
     // The old id must no longer resolve...
-    assert!(c.get_email(id, false, None).is_err(), "deleted draft's id should no longer resolve");
+    assert!(single(c.get_email(vec![id], &ReadOptions::default())).is_err(), "deleted draft's id should no longer resolve");
     // ...and nothing with that subject may be sitting in Deleted Items.
     let leftovers = c.list_emails(EmailQuery {
         query: Some(subject.to_string()), folder: "deleted".into(), count: 50, offset: 0,
@@ -127,8 +129,8 @@ fn create_note_then_get_it_back() {
     let created = c.create_note("outlook-mcp-rs live test note".to_string(), None, None)
         .expect("create_note should succeed");
     let id = created["id"].as_str().unwrap().to_string();
-    let note = c.get_note(id).expect("get_note should succeed");
-    assert!(note.body.starts_with("outlook-mcp-rs live test note"));
+    let note = single(c.get_note(vec![id], &ReadOptions::default())).expect("get_note should succeed");
+    assert!(note.body.as_deref().unwrap_or_default().starts_with("outlook-mcp-rs live test note"));
 }
 
 #[test]
@@ -145,7 +147,7 @@ fn create_event_then_delete_it() {
         recurrence: None,
     }).expect("create_event should succeed");
     let id = created["id"].as_str().unwrap().to_string();
-    let _ = c.get_event(id.clone()).expect("get_event should round-trip before cleanup");
+    let _ = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should round-trip before cleanup");
     c.delete_event(id, true).expect("cleanup delete_event");
 }
 
@@ -172,7 +174,7 @@ fn create_event_with_tiers_categories_and_show_as() {
     assert_eq!(created["status"], "meeting_saved");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let detail = c.get_event(id.clone()).expect("get_event should succeed");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should succeed");
     assert!(detail.summary.required_attendees.contains("required-probe@example.com"));
     assert!(detail.summary.optional_attendees.contains("optional-probe@example.com"));
     assert!(detail.summary.categories.iter().any(|cat| cat == "Work"));
@@ -223,7 +225,7 @@ fn update_event_edits_fields_and_manages_attendees() {
         assert!(changed.iter().any(|v| v == field), "expected {field} in changed: {changed:?}");
     }
 
-    let detail = c.get_event(id.clone()).expect("get_event should succeed");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should succeed");
     assert_eq!(detail.summary.subject, "outlook-mcp-rs P8 update probe (renamed)");
     assert_eq!(detail.summary.location, "Room 42");
     assert_eq!(detail.summary.show_as, "tentative");
@@ -255,7 +257,7 @@ fn delete_event_removes_a_personal_appointment() {
 
     // Soft-deleted: get_event on the original id should now fail (moved to
     // Deleted Items changes its EntryID, same as delete_email's behavior).
-    assert!(c.get_event(id).is_err());
+    assert!(single(c.get_event(vec![id], &ReadOptions::default())).is_err());
 }
 
 #[test]
@@ -505,7 +507,7 @@ fn list_attachments_reports_metadata_for_a_draft_attachment() {
     let id = created["id"].as_str().expect("draft id").to_string();
 
     // Capture the result before cleanup so a failed assertion doesn't leak the draft.
-    let listed = c.list_attachments(id.clone());
+    let listed = single(c.list_attachments(vec![id.clone()]));
     c.delete_email(id, false).expect("cleanup: delete the draft");
     let _ = std::fs::remove_file(&path);
 
@@ -536,7 +538,7 @@ fn inline_flag_consistent_on_a_real_inbox_email() {
         eprintln!("skipping: none of the newest 25 inbox emails has attachments");
         return;
     };
-    let atts = c.list_attachments(email.id.clone()).expect("list_attachments");
+    let atts = single(c.list_attachments(vec![email.id.clone()])).expect("list_attachments");
     for att in &atts {
         let v = serde_json::to_value(att).unwrap();
         assert!(v["is_inline"].is_boolean(), "is_inline missing: {v}");
@@ -560,7 +562,7 @@ fn get_inline_image_round_trips_a_real_content_id() {
     }).expect("list_emails");
     let found = emails.iter().find_map(|e| {
         // Some item types don't support attachments; just skip those.
-        let atts = c.list_attachments(e.id.clone()).ok()?;
+        let atts = single(c.list_attachments(vec![e.id.clone()])).ok()?;
         atts.into_iter()
             .find(|a| a.content_id.is_some() && a.size <= 10 * 1024 * 1024)
             .map(|a| (e.id.clone(), a))
@@ -570,9 +572,9 @@ fn get_inline_image_round_trips_a_real_content_id() {
         return;
     };
     let cid = att.content_id.clone().unwrap();
-    let image = c.get_inline_image(email_id.clone(), format!("cid:{cid}"), None).expect("get_inline_image");
+    let image = single(c.get_inline_image(email_id.clone(), vec![format!("cid:{cid}")], None, None)).expect("get_inline_image");
     assert_eq!(image.content_id, cid);
-    let (header, payload) = image.data_uri.split_once(',').expect("data URI has a comma");
+    let (header, payload) = image.data_uri.as_deref().unwrap_or_default().split_once(',').expect("data URI has a comma");
     assert_eq!(header, format!("data:{};base64", image.mime_type));
     let data = base64::engine::general_purpose::STANDARD.decode(payload).expect("valid base64");
     assert_eq!(data.len(), image.size);
@@ -581,7 +583,7 @@ fn get_inline_image_round_trips_a_real_content_id() {
 
     // Same image with surrounding text requested: `context` is always present
     // (possibly "" if the HTML body never references this Content-ID).
-    let with_ctx = c.get_inline_image(email_id, cid.clone(), Some(3)).expect("get_inline_image with context");
+    let with_ctx = single(c.get_inline_image(email_id, vec![cid.clone()], Some(3), None)).expect("get_inline_image with context");
     assert_eq!(with_ctx.content_id, cid);
     let context = with_ctx.context.expect("context requested");
     assert!(context.lines().count() <= 3, "{context:?}");
@@ -597,7 +599,7 @@ fn get_email_reports_item_type_for_real_inbox_item() {
         since_days: None, has_attachments: None, flagged: false, high_importance: false,
     }).expect("list");
     if let Some(first) = list.first() {
-        let detail = c.get_email(first.id.clone(), false, None).expect("get_email");
+        let detail = single(c.get_email(vec![first.id.clone()], &ReadOptions::default())).expect("get_email");
         let v = serde_json::to_value(&detail).unwrap();
         let t = v["item_type"].as_str().unwrap();
         assert!(["email", "meeting", "bounce", "read_receipt", "other"].contains(&t));
@@ -628,24 +630,25 @@ fn get_email_reports_truncation_and_honours_max_body_chars() {
     let result = || {
         // Default limit: HTML is cut and the flags/lengths say so. Outlook
         // may normalise the stored HTML, so compare against what it reports.
-        let detail = c.get_email(id.clone(), true, None).expect("get_email default");
+        let detail = single(c.get_email(vec![id.clone()], &ReadOptions { html_body: true, ..ReadOptions::default() })).expect("get_email default");
         let html_length = detail.html_length.expect("html_length with prefer_html");
         assert!(html_length > 100_000, "html_length {html_length}");
         assert_eq!(detail.html_truncated, Some(true));
         assert!(detail.html_body.as_deref().unwrap().contains("[... truncated at 100000 characters]"));
-        assert_eq!(detail.body_truncated, detail.body_length > 100_000);
+        let body_length = detail.body_length.expect("body_length");
+        assert_eq!(detail.body_truncated, Some(body_length > 100_000));
 
         // Re-fetch with a limit of the reported length: the complete HTML.
-        let limit = html_length.max(detail.body_length) as u32;
-        let full = c.get_email(id.clone(), true, Some(limit)).expect("get_email larger limit");
+        let limit = html_length.max(body_length) as u32;
+        let full = single(c.get_email(vec![id.clone()], &ReadOptions { html_body: true, max_body_chars: Some(limit), ..ReadOptions::default() })).expect("get_email larger limit");
         assert_eq!(full.html_truncated, Some(false));
-        assert!(!full.body_truncated);
+        assert_eq!(full.body_truncated, Some(false));
         let full_html = full.html_body.expect("html_body");
         assert_eq!(full_html.chars().count(), html_length);
         assert!(full_html.contains("</body>"));
 
         // Without prefer_html the HTML fields are absent.
-        let plain = c.get_email(id.clone(), false, None).expect("get_email plain");
+        let plain = single(c.get_email(vec![id.clone()], &ReadOptions::default())).expect("get_email plain");
         assert!(plain.html_truncated.is_none() && plain.html_length.is_none());
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(result));
@@ -691,7 +694,7 @@ fn update_email_applies_state_then_moves() {
     assert!(changed.iter().any(|v| v == "add_categories"));
 
     // Verify importance + category landed.
-    let detail = c.get_email(id.clone(), false, None).expect("get_email");
+    let detail = single(c.get_email(vec![id.clone()], &ReadOptions::default())).expect("get_email");
     let dv = serde_json::to_value(&detail).unwrap();
     assert_eq!(dv["summary"]["importance"], "high");
     assert!(dv["summary"]["categories"].as_array().unwrap().iter().any(|v| v == "Work"));
@@ -706,7 +709,7 @@ fn update_email_applies_state_then_moves() {
         ..Default::default()
     }).expect("update_email mark unread");
     assert_eq!(unread["changed"], serde_json::json!(["mark_read"]));
-    let redetail = c.get_email(id.clone(), false, None).expect("get_email after unread");
+    let redetail = single(c.get_email(vec![id.clone()], &ReadOptions::default())).expect("get_email after unread");
     let rv = serde_json::to_value(&redetail).unwrap();
     assert_eq!(rv["summary"]["unread"], true);
 
@@ -742,7 +745,7 @@ fn update_draft_edits_subject_body_and_recipients() {
         ..Default::default()
     });
     // Read back before asserting so a failure still cleans up.
-    let detail = c.get_email(id.clone(), false, None);
+    let detail = single(c.get_email(vec![id.clone()], &ReadOptions::default()));
     c.delete_email(id.clone(), false).expect("cleanup: delete the draft");
 
     let res = res.expect("update_draft");
@@ -791,7 +794,7 @@ fn create_event_weekly_recurrence_round_trips() {
     }).expect("create_event with weekly recurrence should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let detail = c.get_event(id.clone()).expect("get_event should succeed");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should succeed");
     assert!(detail.summary.is_recurring);
     let recurrence = detail.recurrence.expect("recurring event should have a recurrence block");
     assert_eq!(recurrence.pattern, "weekly");
@@ -825,7 +828,7 @@ fn create_event_monthly_recurrence_with_until_round_trips() {
     }).expect("create_event with monthly recurrence should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let detail = c.get_event(id.clone()).expect("get_event should succeed");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should succeed");
     let recurrence = detail.recurrence.expect("recurring event should have a recurrence block");
     assert_eq!(recurrence.pattern, "monthly");
     assert_eq!(recurrence.interval, 2);
@@ -864,7 +867,7 @@ fn create_event_yearly_recurrence_with_no_end_round_trips() {
     }).expect("create_event with yearly recurrence should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let detail = c.get_event(id.clone()).expect("get_event should succeed");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should succeed");
     let recurrence = detail.recurrence.expect("recurring event should have a recurrence block");
     assert_eq!(recurrence.pattern, "yearly");
     assert_eq!(recurrence.interval, 1);
@@ -911,7 +914,7 @@ fn update_event_changes_then_clears_recurrence() {
     }).expect("update_event with recurrence should succeed");
     assert!(updated["changed"].as_array().unwrap().iter().any(|v| v == "recurrence"));
 
-    let detail = c.get_event(id.clone()).expect("get_event should succeed");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should succeed");
     let recurrence = detail.recurrence.expect("still recurring after the change");
     assert_eq!(recurrence.pattern, "weekly");
     assert_eq!(recurrence.days_of_week, vec!["tuesday".to_string()]);
@@ -929,7 +932,7 @@ fn update_event_changes_then_clears_recurrence() {
     }).expect("update_event with clear_recurrence should succeed");
     assert!(cleared["changed"].as_array().unwrap().iter().any(|v| v == "clear_recurrence"));
 
-    let detail = c.get_event(id.clone()).expect("get_event should succeed");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should succeed");
     assert!(!detail.summary.is_recurring);
     assert!(detail.recurrence.is_none());
 
@@ -1129,7 +1132,7 @@ fn get_note_includes_modified_after_update() {
     // baseline first and assert it's still populated and non-decreasing
     // after the edit — a strict "must be later" check would risk flaking on
     // same-second saves if Outlook's timestamp resolution is coarse.
-    let before = c.get_note(id.clone()).expect("get_note (baseline) should succeed");
+    let before = single(c.get_note(vec![id.clone()], &ReadOptions::default())).expect("get_note (baseline) should succeed");
     let before_modified = before.modified.expect("modified should be populated right after create_note's own Save()");
 
     c.update_note(NoteUpdate {
@@ -1138,11 +1141,11 @@ fn get_note_includes_modified_after_update() {
         ..Default::default()
     }).expect("update_note should succeed");
 
-    let note = c.get_note(id.clone()).expect("get_note (after update) should succeed");
+    let note = single(c.get_note(vec![id.clone()], &ReadOptions::default())).expect("get_note (after update) should succeed");
     let after_modified = note.modified.expect("modified should still be populated after an edit");
     assert!(after_modified >= before_modified,
         "modified ({after_modified}) should not go backwards after update_note ({before_modified})");
-    assert!(note.body.starts_with("outlook-mcp-rs P12 live modified probe (edited)"));
+    assert!(note.body.as_deref().unwrap_or_default().starts_with("outlook-mcp-rs P12 live modified probe (edited)"));
 
     c.delete_note(id).expect("cleanup delete_note");
 }
@@ -1165,7 +1168,7 @@ fn update_note_manages_categories_and_color() {
     assert!(updated["changed"].as_array().unwrap().iter().any(|v| v == "add_categories"));
     assert!(updated["changed"].as_array().unwrap().iter().any(|v| v == "color"));
 
-    let note = c.get_note(id.clone()).expect("get_note should succeed");
+    let note = single(c.get_note(vec![id.clone()], &ReadOptions::default())).expect("get_note should succeed");
     assert!(note.summary.categories.iter().any(|cat| cat == "Blue Category"));
 
     c.delete_note(id).expect("cleanup delete_note");
@@ -1227,7 +1230,7 @@ fn hebrew_subject_and_body_round_trip_through_com() {
     ).expect("create_draft should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let detail = c.get_email(id.clone(), false, None);
+    let detail = single(c.get_email(vec![id.clone()], &ReadOptions::default()));
     let found = c.list_emails(EmailQuery {
         query: Some("מייל שיקוף".to_string()), folder: "drafts".into(), count: 25, offset: 0,
         unread_only: false, from: None, to: None, category: None, received_after: None,
@@ -1240,7 +1243,7 @@ fn hebrew_subject_and_body_round_trip_through_com() {
     let detail = detail.expect("get_email should succeed");
     assert_eq!(detail.summary.subject.as_bytes(), subject.as_bytes());
     assert!(
-        detail.body.contains(&body),
+        detail.body.as_deref().unwrap_or_default().contains(&body),
         "body should contain the Hebrew text verbatim, got {:?}", detail.body
     );
     let found = found.expect("list_emails with a Hebrew query should succeed");

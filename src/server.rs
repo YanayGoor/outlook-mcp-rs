@@ -9,6 +9,9 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::error::ToolError;
+use crate::outlook::read::{read_options, ReadRequest, ReadTool};
+use crate::params::OneOrMany;
+use serde_json::{json, Value};
 use crate::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 
 /// Runs a blocking `OutlookClient` call on a dedicated blocking thread so the
@@ -26,6 +29,47 @@ where
 
 fn json_content<T: serde::Serialize>(value: &T) -> Result<ContentBlock, McpError> {
     ContentBlock::json(value)
+}
+
+/// A batch-read id parameter as `(ids, is_list)`; an empty list is an error.
+fn batch_ids(ids: OneOrMany<String>, param: &str) -> Result<(Vec<String>, bool), ToolError> {
+    let many = ids.is_many();
+    let ids = ids.into_vec();
+    if ids.is_empty() {
+        return Err(ToolError::new(format!("{param} must be an id or a non-empty list of ids.")));
+    }
+    Ok((ids, many))
+}
+
+/// The shared batch-read result shape. One id given (not a list): exactly
+/// that item's object, and its error fails the call (as before batching).
+/// A list given: a JSON array in input order, where a failed item is
+/// `{"id": <id>, "error": <message>}` and a successful one is
+/// `ok_item(id, value)`.
+fn batch_content<T: serde::Serialize>(
+    ids: &[String],
+    many: bool,
+    results: Vec<Result<T, ToolError>>,
+    ok_item: impl Fn(&str, Value) -> Value,
+) -> Result<CallToolResult, McpError> {
+    if !many {
+        let one = results
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(ToolError::new("no result returned for the requested id")))?;
+        return Ok(CallToolResult::success(vec![json_content(&one)?]));
+    }
+    let items = ids
+        .iter()
+        .zip(results)
+        .map(|(id, result)| match result {
+            Ok(item) => serde_json::to_value(item)
+                .map(|v| ok_item(id, v))
+                .map_err(|e| McpError::internal_error(e.to_string(), None)),
+            Err(e) => Ok(json!({"id": id, "error": e.0})),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CallToolResult::success(vec![json_content(&items)?]))
 }
 
 #[derive(Clone)]
@@ -77,13 +121,36 @@ fn default_count() -> i32 { 10 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetEmailParams {
-    pub email_id: String,
+    /// One email id, or a list of ids to read in one call (alias `email_ids`).
+    /// A list returns a list in the same order, where an id that fails
+    /// becomes {"id": ..., "error": ...}.
+    #[serde(alias = "email_ids")]
+    pub email_id: OneOrMany<String>,
+    /// Optional fields to return: any of "body", "html_body", "attachments",
+    /// "meeting". Omitted = ["body", "attachments", "meeting"]; [] = metadata
+    /// only (headers, item_type, is_meeting).
     #[serde(default)]
-    pub prefer_html: bool,
+    pub include: Option<Vec<String>>,
+    /// "text" (default) or "html". "html" also returns html_body (the same
+    /// as adding "html_body" to include).
+    #[serde(default)]
+    pub body_format: Option<String>,
+    /// Deprecated: use body_format instead. true = body_format "html".
+    #[serde(default)]
+    pub prefer_html: Option<bool>,
     /// Cut body/html_body at this many characters. Default 100,000;
-    /// clamped to 1,000..=5,000,000.
+    /// clamped to 1,000..=5,000,000. Does not apply to files (output_dir).
     #[serde(default)]
     pub max_body_chars: Option<u32>,
+    /// Local directory (created if missing). body / html_body are written
+    /// there in full and returned as body_file / html_body_file (absolute
+    /// paths) instead of inline text.
+    #[serde(default)]
+    pub output_dir: Option<String>,
+    /// Replace each cid: reference in html_body with that inline image's
+    /// data: URI so the HTML is self-contained (implies html_body).
+    #[serde(default)]
+    pub resolve_inline_images: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -245,7 +312,24 @@ pub struct ListEventsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetEventParams {
-    pub event_id: String,
+    /// One event id, or a list of ids (alias `event_ids`); a list returns a
+    /// list in the same order, where a failing id becomes {"id", "error"}.
+    #[serde(alias = "event_ids")]
+    pub event_id: OneOrMany<String>,
+    /// Optional fields to return: "body". Omitted = ["body"]; [] = no body.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// "text" (default). Event bodies are plain text only.
+    #[serde(default)]
+    pub body_format: Option<String>,
+    /// Cut the body at this many characters. Default 100,000; clamped to
+    /// 1,000..=5,000,000. Does not apply to files (output_dir).
+    #[serde(default)]
+    pub max_body_chars: Option<u32>,
+    /// Local directory (created if missing). The body is written there in
+    /// full and returned as body_file (absolute path) instead of body.
+    #[serde(default)]
+    pub output_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -386,7 +470,11 @@ fn default_treat_as_free() -> Vec<String> { vec!["free".to_string()] }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAttachmentsParams {
-    pub email_id: String,
+    /// One email id, or a list of ids (alias `email_ids`). A list returns a
+    /// list in the same order of {"id", "attachments": [...]}, or
+    /// {"id", "error"} for an id that fails.
+    #[serde(alias = "email_ids")]
+    pub email_id: OneOrMany<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -401,12 +489,23 @@ pub struct SaveAttachmentsParams {
 pub struct GetInlineImageParams {
     pub email_id: String,
     /// The attachment's Content-ID (`content_id` from list_attachments, or the
-    /// `cid:...` reference from the HTML body). A `cid:` prefix and `<>` are accepted.
-    pub content_id: String,
+    /// `cid:...` reference from the HTML body). A `cid:` prefix and `<>` are
+    /// accepted. Pass this or `content_ids`, not both.
+    #[serde(default)]
+    pub content_id: Option<String>,
+    /// Several Content-IDs of the same email; returns a list in the same
+    /// order, where a failing one becomes {"id": <content id>, "error"}.
+    #[serde(default)]
+    pub content_ids: Option<Vec<String>>,
     /// Also return `context`: up to this many lines (max 50) of plain text
     /// immediately before the image's first `cid:` reference in the HTML body.
     #[serde(default)]
     pub context_lines: Option<u32>,
+    /// Local directory (created if missing). Each image's decoded bytes are
+    /// written there and returned as data_file (absolute path) instead of
+    /// data_uri.
+    #[serde(default)]
+    pub output_dir: Option<String>,
 }
 
 // ---- Tasks ----
@@ -475,6 +574,28 @@ pub struct UpdateTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetTaskParams {
+    /// One task id, or a list of ids (alias `task_ids`); a list returns a
+    /// list in the same order, where a failing id becomes {"id", "error"}.
+    #[serde(alias = "task_ids")]
+    pub task_id: OneOrMany<String>,
+    /// Optional fields to return: "body". Omitted = ["body"]; [] = no body.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// "text" (default). Task bodies are plain text only.
+    #[serde(default)]
+    pub body_format: Option<String>,
+    /// Cut the body at this many characters. Default 100,000; clamped to
+    /// 1,000..=5,000,000. Does not apply to files (output_dir).
+    #[serde(default)]
+    pub max_body_chars: Option<u32>,
+    /// Local directory (created if missing). The body is written there in
+    /// full and returned as body_file (absolute path) instead of body.
+    #[serde(default)]
+    pub output_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteTaskParams {
     pub task_id: String,
 }
@@ -493,7 +614,24 @@ pub struct ListNotesParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetNoteParams {
-    pub note_id: String,
+    /// One note id, or a list of ids (alias `note_ids`); a list returns a
+    /// list in the same order, where a failing id becomes {"id", "error"}.
+    #[serde(alias = "note_ids")]
+    pub note_id: OneOrMany<String>,
+    /// Optional fields to return: "body". Omitted = ["body"]; [] = no body.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// "text" (default). Note bodies are plain text only.
+    #[serde(default)]
+    pub body_format: Option<String>,
+    /// Cut the body at this many characters. Default 100,000; clamped to
+    /// 1,000..=5,000,000. Does not apply to files (output_dir).
+    #[serde(default)]
+    pub max_body_chars: Option<u32>,
+    /// Local directory (created if missing). The body is written there in
+    /// full and returned as body_file (absolute path) instead of body.
+    #[serde(default)]
+    pub output_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -553,14 +691,21 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Get the full body and attachment list of one email by id. Set prefer_html to also get html_body. body (and html_body) are cut at max_body_chars characters (default 100,000; allowed 1,000-5,000,000). The result always reports body_truncated and body_length (the full original length in characters), plus html_truncated and html_length when prefer_html is set. If a *_truncated flag is true, the cut may fall mid-tag or mid-image-data: call again with max_body_chars of at least the reported length (max 5,000,000) to get the complete text.")]
+    #[tool(description = "Get one email by id, or several (email_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"} instead of failing the call). Returns the headers, item_type, is_meeting, plus the optional fields picked by `include` (any of \"body\", \"html_body\", \"attachments\" (file names), \"meeting\"; default [\"body\", \"attachments\", \"meeting\"]; [] = metadata only). body_format \"html\" (the deprecated prefer_html=true) also returns html_body. Each returned body reports *_truncated and *_length (full original length in characters): body_truncated/body_length, html_truncated/html_length. Inline bodies are cut at max_body_chars characters (default 100,000; allowed 1,000-5,000,000); if a *_truncated flag is true the cut may fall mid-tag or mid-image-data: call again with max_body_chars of at least the reported length, or use output_dir. output_dir writes each body in full to a file in that directory (created if missing) and returns body_file / html_body_file (absolute paths) instead of the text; re-reading the same email overwrites the same files. resolve_inline_images=true (implies html_body) replaces every cid: reference in html_body with the referenced attachment's base64 data: URI so the HTML is self-contained; Content-ID matching is case-insensitive, references with no matching attachment, or whose image is over 10 MB or unreadable, are left as cid: and listed in inline_images_unresolved (inline_images_resolved counts the replaced ones). Resolved HTML is usually large: combine it with output_dir.")]
     pub async fn get_email(
         &self,
-        Parameters(GetEmailParams { email_id, prefer_html, max_body_chars }): Parameters<GetEmailParams>,
+        Parameters(p): Parameters<GetEmailParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (ids, many) = batch_ids(p.email_id, "email_id")?;
+        let opts = read_options(ReadTool::Email, ReadRequest {
+            include: p.include, body_format: p.body_format, prefer_html: p.prefer_html,
+            resolve_inline_images: p.resolve_inline_images, max_body_chars: p.max_body_chars,
+            output_dir: p.output_dir,
+        })?;
         let client = self.client.clone();
-        let result = run_blocking(move || client.get_email(email_id, prefer_html, max_body_chars)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        let batch = ids.clone();
+        let results = run_blocking(move || client.get_email(batch, &opts)).await?;
+        batch_content(&ids, many, results, |_, v| v)
     }
 
     #[tool(description = "Send a new email immediately. `attachments` is a list of local file paths. `inline_images` embeds images (a local path or base64 data) as hidden Content-ID attachments and requires html=true: reference each in the HTML body as <img src=\"cid:CONTENT_ID\"> instead of inlining base64 in the HTML. All inline images are validated before anything is sent.")]
@@ -661,14 +806,20 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Get the full details of one calendar event by id.")]
+    #[tool(description = "Get the full details of one calendar event by id, or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
     pub async fn get_event(
         &self,
-        Parameters(GetEventParams { event_id }): Parameters<GetEventParams>,
+        Parameters(p): Parameters<GetEventParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (ids, many) = batch_ids(p.event_id, "event_id")?;
+        let opts = read_options(ReadTool::Event, ReadRequest {
+            include: p.include, body_format: p.body_format, max_body_chars: p.max_body_chars,
+            output_dir: p.output_dir, ..ReadRequest::default()
+        })?;
         let client = self.client.clone();
-        let result = run_blocking(move || client.get_event(event_id)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        let batch = ids.clone();
+        let results = run_blocking(move || client.get_event(batch, &opts)).await?;
+        batch_content(&ids, many, results, |_, v| v)
     }
 
     #[tool(description = "Create a calendar event. required_attendees/optional_attendees invite two tiers (attendees is a legacy alias merged into required_attendees); any attendee makes it a meeting. categories and show_as (busy status) can be set on creation. recurrence repeats the event (daily/weekly/monthly/yearly, with an interval and an until date or occurrence count). send (default true) controls whether a meeting is actually sent to attendees or just saved for review.")]
@@ -755,14 +906,16 @@ impl OutlookMcpServer {
 
     // ---- Attachments ----
 
-    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden).")]
+    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden). email_id may be a list: the result is then a list in the same order of {\"id\", \"attachments\": [...]}, or {\"id\", \"error\"} for an id that fails.")]
     pub async fn list_attachments(
         &self,
         Parameters(ListAttachmentsParams { email_id }): Parameters<ListAttachmentsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (ids, many) = batch_ids(email_id, "email_id")?;
         let client = self.client.clone();
-        let result = run_blocking(move || client.list_attachments(email_id)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        let batch = ids.clone();
+        let results = run_blocking(move || client.list_attachments(batch)).await?;
+        batch_content(&ids, many, results, |id, v| json!({"id": id, "attachments": v}))
     }
 
     #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.")]
@@ -775,14 +928,31 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files. Optional `context_lines` (max 50) also returns `context`: the last that-many non-empty lines of plain text immediately before the image's first `cid:` reference in the HTML body (tags stripped, entities decoded), useful for knowing what the image shows. `context` is \"\" when the HTML body never references the image, and is omitted when `context_lines` is not given.")]
+    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files. Pass `content_ids` (a list) instead of `content_id` to fetch several images of the same email in one call: the result is a list in the same order, where a Content-ID that fails becomes {\"id\": <content id>, \"error\"}. output_dir writes each image's decoded bytes to a file there (created if missing) and returns `data_file` (absolute path) instead of `data_uri`. Optional `context_lines` (max 50) also returns `context`: the last that-many non-empty lines of plain text immediately before the image's first `cid:` reference in the HTML body (tags stripped, entities decoded), useful for knowing what the image shows. `context` is \"\" when the HTML body never references the image, and is omitted when `context_lines` is not given. To get an email's HTML with every image already inlined, use get_email with resolve_inline_images.")]
     pub async fn get_inline_image(
         &self,
-        Parameters(GetInlineImageParams { email_id, content_id, context_lines }): Parameters<GetInlineImageParams>,
+        Parameters(GetInlineImageParams { email_id, content_id, content_ids, context_lines, output_dir }):
+            Parameters<GetInlineImageParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (ids, many) = match (content_id, content_ids) {
+            (Some(_), Some(_)) => {
+                return Err(ToolError::new("pass either `content_id` or `content_ids`, not both").into())
+            }
+            (Some(one), None) => (vec![one], false),
+            (None, Some(list)) if !list.is_empty() => (list, true),
+            (None, Some(_)) => return Err(ToolError::new("content_ids must not be empty.").into()),
+            (None, None) => {
+                return Err(ToolError::new(
+                    "pass `content_id` (one Content-ID) or `content_ids` (a list).",
+                ).into())
+            }
+        };
         let client = self.client.clone();
-        let result = run_blocking(move || client.get_inline_image(email_id, content_id, context_lines)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        let batch = ids.clone();
+        let results = run_blocking(move || {
+            client.get_inline_image(email_id, batch, context_lines, output_dir)
+        }).await?;
+        batch_content(&ids, many, results, |_, v| v)
     }
 
     // ---- Tasks ----
@@ -812,6 +982,22 @@ impl OutlookMcpServer {
             client.create_task(subject, body, due_date, importance, categories, start_date, reminder_time)
         ).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
+    }
+
+    #[tool(description = "Get the full details of one task by id, or several (task_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). Returns the list_tasks fields (subject, due_date, complete, status, importance, categories) plus start_date, date_completed, percent_complete, reminder_set, reminder_time, created, modified (unset dates are null) and the optional body. `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
+    pub async fn get_task(
+        &self,
+        Parameters(p): Parameters<GetTaskParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (ids, many) = batch_ids(p.task_id, "task_id")?;
+        let opts = read_options(ReadTool::Task, ReadRequest {
+            include: p.include, body_format: p.body_format, max_body_chars: p.max_body_chars,
+            output_dir: p.output_dir, ..ReadRequest::default()
+        })?;
+        let client = self.client.clone();
+        let batch = ids.clone();
+        let results = run_blocking(move || client.get_task(batch, &opts)).await?;
+        batch_content(&ids, many, results, |_, v| v)
     }
 
     #[tool(description = "Update an existing task: mark_complete (true=complete, false=reopen), subject, body, due_date, start_date, importance, add/remove categories, percent_complete, reminder_time. Combine any of these in one call. Note: mark_complete is applied last and both complete/reopen set percent_complete themselves, so mark_complete:false always resets percent_complete to 0 even if you also pass an explicit percent_complete in the same call — set it in a separate call afterward if you need it to stick.")]
@@ -854,14 +1040,20 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Get the full body of one note by id.")]
+    #[tool(description = "Get the full body of one note by id, or several (note_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = subject, dates and categories only). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
     pub async fn get_note(
         &self,
-        Parameters(GetNoteParams { note_id }): Parameters<GetNoteParams>,
+        Parameters(p): Parameters<GetNoteParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (ids, many) = batch_ids(p.note_id, "note_id")?;
+        let opts = read_options(ReadTool::Note, ReadRequest {
+            include: p.include, body_format: p.body_format, max_body_chars: p.max_body_chars,
+            output_dir: p.output_dir, ..ReadRequest::default()
+        })?;
         let client = self.client.clone();
-        let result = run_blocking(move || client.get_note(note_id)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        let batch = ids.clone();
+        let results = run_blocking(move || client.get_note(batch, &opts)).await?;
+        batch_content(&ids, many, results, |_, v| v)
     }
 
     #[tool(description = "Create a new note.")]
