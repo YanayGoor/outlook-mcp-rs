@@ -155,7 +155,7 @@ The Outlook tools then appear in that client.
 
 **Attachments**
 - `list_attachments` — list an email's attachments with metadata: index, filename, size, type (file/link/item/ole), Content-ID (for `cid:` references in HTML bodies), MIME type, hidden flag, and `is_inline` (inline `cid:` content vs. a standalone attachment); accepts a list of email ids
-- `save_attachments` — save an email's attachments to a local directory (each result carries the same metadata plus `saved_to`/`status`)
+- `save_attachments` — save an email's attachments to a local directory (each result carries the same metadata plus `saved_to`/`status`). `inline: false` saves only regular attachments and skips inline images (`inline: true` the reverse), so re-sending an email read with `resolve_inline_images` doesn't attach its images twice
 - `get_inline_image` — fetch an attachment by Content-ID (e.g. an inline `cid:` image) as a base64 data URI (up to 10 MB); optional `context_lines` (max 50) also returns `context`, the plain-text lines just before the image's first `cid:` reference in the HTML body (`""` if it isn't referenced); `content_ids` fetches several images of one email in one call, and `output_dir` writes the image files to disk (`data_file`) instead of returning base64
 
 **Tasks**

@@ -299,7 +299,7 @@ fn system_test_open_prs_14_to_25() {
             }
             let save_dir = scratch.join("saved");
             let _ = std::fs::create_dir_all(&save_dir);
-            match c.save_attachments(id.clone(), save_dir.to_string_lossy().to_string(), None) {
+            match c.save_attachments(id.clone(), save_dir.to_string_lossy().to_string(), None, None) {
                 Ok(entries) => {
                     let txt = entries.iter().find(|v| v["filename"] == "notes.txt");
                     let bytes_ok = txt.and_then(|v| v["saved_to"].as_str()).and_then(|p| std::fs::read(p).ok())
