@@ -1878,7 +1878,7 @@ async fn list_notes_forwards_filters() {
     let server = OutlookMcpServer::new(fake.clone());
     let params: ListNotesParams = serde_json::from_value(json!({
         "category": ["Green Category", "Blue Category"], "query": "\"renew passport\"",
-        "created_after": "-30d", "created_before": "2026-06-30", "count": 5, "offset": 10
+        "created_after": "2026-01-01", "created_before": "2026-06-30", "count": 5, "offset": 10
     }))
     .unwrap();
     server.list_notes(Parameters(params)).await.unwrap();
@@ -1886,7 +1886,7 @@ async fn list_notes_forwards_filters() {
     assert_eq!(name, "list_notes");
     assert_eq!(args["category"], json!(["Green Category", "Blue Category"]));
     assert_eq!(args["query"], "\"renew passport\"");
-    assert_eq!(args["created_after"], "-30d");
+    assert_eq!(args["created_after"], "2026-01-01");
     assert_eq!(args["created_before"], "2026-06-30");
     assert_eq!(args["count"], 5);
     assert_eq!(args["offset"], 10);
