@@ -114,7 +114,7 @@ permanent delete. Never set `confirm: true` on your own initiative.
   - `get_task` returns one task's body, start/completion dates, percent complete and reminder.
   - `update_task` with `mark_complete` completes or reopens a task.
   - Deleting a task, note or event moves it to Deleted Items, where it can be recovered, unless `permanent: true` (see above).
-  - Deleting any event of a recurring series (even via an occurrence id from `list_events`) deletes the whole series.
+  - A recurring event's `id` names the whole series: deleting, answering or editing it affects every occurrence. Use the row's `occurrence_id` to act on one date only. After moving an occurrence, use the new `occurrence_id` that `update_event` returns.
 
 ## Common mistakes
 

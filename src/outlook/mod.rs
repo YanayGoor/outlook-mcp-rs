@@ -3,6 +3,7 @@ pub mod client;
 pub mod com;
 pub mod dates;
 pub mod event_rows;
+pub mod occurrence;
 pub mod fake;
 pub mod filters;
 pub mod read;
@@ -499,6 +500,31 @@ pub fn delete_event_note(organized_meeting: bool, send_cancellation: bool, perma
         (true, true) => format!("Meeting canceled; attendees notified. {deleted}"),
         (true, false) => format!("Meeting canceled without notifying attendees. {deleted}"),
     }
+}
+
+/// `delete_event`'s `note` for a single occurrence of a recurring series:
+/// only that date is removed; occurrences never go to Deleted Items, so
+/// `permanent` has nothing to do.
+pub fn delete_occurrence_note(organized_meeting: bool, send_cancellation: bool) -> String {
+    let removed = "Only this occurrence was removed from its series (occurrences don't go to \
+                   Deleted Items, so permanent has no effect).";
+    match (organized_meeting, send_cancellation) {
+        (false, _) => removed.to_string(),
+        (true, true) => format!("Occurrence canceled; attendees notified. {removed}"),
+        (true, false) => format!("Occurrence canceled without notifying attendees. {removed}"),
+    }
+}
+
+/// Rejects `update_event` changes that only make sense for a whole series
+/// when `event_id` is a single occurrence.
+pub fn validate_occurrence_update(is_occurrence: bool, u: &EventUpdate) -> Result<(), ToolError> {
+    if is_occurrence && (u.recurrence.is_some() || u.clear_recurrence) {
+        return Err(ToolError::new(
+            "recurrence and clear_recurrence change the whole series: pass the series id \
+             (the event's id), not an occurrence_id.",
+        ));
+    }
+    Ok(())
 }
 
 /// The status string `create_event` returns: `"meeting_sent"` (attendees +
@@ -1405,10 +1431,31 @@ mod tests {
         com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
         parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
         EventUpdate, RecurrenceInput, permanent_delete_needs_move, require_empty_confirm,
-        deleted_note, delete_event_note,
+        deleted_note, delete_event_note, delete_occurrence_note, validate_occurrence_update,
         draft_update_changes, validate_draft_update, DraftUpdate, InlineImage, merge_categories,
         parse_importance,
     };
+
+    #[test]
+    fn occurrence_delete_note_says_only_that_date_went() {
+        assert!(delete_occurrence_note(false, true).starts_with("Only this occurrence"));
+        assert!(delete_occurrence_note(true, true).starts_with("Occurrence canceled; attendees notified."));
+        assert!(delete_occurrence_note(true, false).contains("without notifying"));
+    }
+
+    #[test]
+    fn occurrence_updates_cannot_touch_the_recurrence() {
+        let mut u = EventUpdate { event_id: "e|s|2026-10-14T09:00:00".into(), subject: None,
+            start: None, end: None, location: None, body: None, all_day: None,
+            reminder_minutes: None, show_as: None, add_categories: None, remove_categories: None,
+            add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
+            send_update: true, recurrence: None, clear_recurrence: false };
+        assert!(validate_occurrence_update(true, &u).is_ok());
+        u.clear_recurrence = true;
+        assert!(validate_occurrence_update(false, &u).is_ok());
+        let e = validate_occurrence_update(true, &u).unwrap_err().to_string();
+        assert!(e.contains("series id"), "{e}");
+    }
 
     #[test]
     fn canceled_meeting_statuses() {

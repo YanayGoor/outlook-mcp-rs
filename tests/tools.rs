@@ -1571,10 +1571,11 @@ async fn list_events_returns_every_field_by_default() {
     let params: ListEventsParams = serde_json::from_value(json!({})).unwrap();
     let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
     let row = v[0].as_object().unwrap();
+    // occurrence_id is only present on occurrences of a recurring series.
     for field in outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS {
-        assert!(row.contains_key(*field), "missing {field}");
+        assert_eq!(row.contains_key(*field), *field != "occurrence_id", "{field}");
     }
-    assert_eq!(row.len(), outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS.len());
+    assert_eq!(row.len(), outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS.len() - 1);
     assert_eq!(v[0]["user_is_required"], true);
     assert_eq!(v[0]["user_is_optional"], false);
     assert_eq!(v[0]["is_canceled"], false);
@@ -1591,6 +1592,7 @@ async fn list_events_compact_returns_the_preset_fields() {
     let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
     let mut keys: Vec<&str> = v[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
     let mut want = outlook_mcp_rs::outlook::event_rows::COMPACT_EVENT_FIELDS.to_vec();
+    want.retain(|f| *f != "occurrence_id"); // a one-off event has none
     keys.sort();
     want.sort();
     assert_eq!(keys, want);
@@ -1801,6 +1803,76 @@ async fn respond_to_meeting_defaults_send_true() {
     let (_, args) = &fake.calls()[0];
     assert_eq!(args["response"], "accept");
     assert_eq!(args["send"], true);
+}
+
+#[tokio::test]
+async fn get_event_on_an_occurrence_reports_series_and_occurrence_ids() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, OCCURRENCE_ID};
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: GetEventParams =
+        serde_json::from_value(json!({"event_id": OCCURRENCE_ID})).unwrap();
+    let v = result_json(&server.get_event(Parameters(params)).await.unwrap());
+    assert_eq!(v["id"], EVENT_ID);
+    assert_eq!(v["occurrence_id"], OCCURRENCE_ID);
+    assert_eq!(v["start"], "2026-06-10T09:00:00");
+    // A plain event has no occurrence_id key at all.
+    let params: GetEventParams = serde_json::from_value(json!({"event_id": EVENT_ID})).unwrap();
+    let v = result_json(&server.get_event(Parameters(params)).await.unwrap());
+    assert!(v.get("occurrence_id").is_none());
+}
+
+#[tokio::test]
+async fn calendar_tools_reject_malformed_event_ids() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: RespondToMeetingParams = serde_json::from_value(
+        json!({"event_id": "e|s|next tuesday", "response": "accept"})).unwrap();
+    let err = server.respond_to_meeting(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid event id"), "{}", err.message);
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn respond_to_meeting_forwards_an_occurrence_id() {
+    use outlook_mcp_rs::outlook::fake::OCCURRENCE_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: RespondToMeetingParams = serde_json::from_value(
+        json!({"event_id": OCCURRENCE_ID, "response": "accept", "send": false})).unwrap();
+    server.respond_to_meeting(Parameters(params)).await.unwrap();
+    assert_eq!(fake.calls()[0].1["event_id"], OCCURRENCE_ID);
+}
+
+#[tokio::test]
+async fn update_event_on_an_occurrence_returns_its_new_id() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, OCCURRENCE_ID};
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: UpdateEventParams = serde_json::from_value(json!({
+        "event_id": OCCURRENCE_ID, "start": "2026-06-10T11:00", "end": "2026-06-10T11:30",
+        "send_update": false
+    })).unwrap();
+    let v = result_json(&server.update_event(Parameters(params)).await.unwrap());
+    assert_eq!(v["id"], EVENT_ID);
+    assert_eq!(v["occurrence_id"], "entry-2|store-1|2026-06-10T11:00:00");
+
+    let params: UpdateEventParams = serde_json::from_value(
+        json!({"event_id": OCCURRENCE_ID, "clear_recurrence": true})).unwrap();
+    let err = server.update_event(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("series id"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn delete_event_on_an_occurrence_removes_only_that_date() {
+    use outlook_mcp_rs::outlook::fake::OCCURRENCE_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: DeleteEventParams =
+        serde_json::from_value(json!({"event_id": OCCURRENCE_ID, "permanent": true})).unwrap();
+    let v = result_json(&server.delete_event(Parameters(params)).await.unwrap());
+    assert_eq!(v["occurrence"], true);
+    assert!(v["note"].as_str().unwrap().starts_with("Only this occurrence"));
 }
 
 #[tokio::test]

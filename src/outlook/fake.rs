@@ -6,8 +6,9 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use super::types::*;
 use super::filters::DateRange;
+use super::occurrence;
 use super::{
-    require_empty_confirm, deleted_note, validate_recurrence_update, CheckAvailabilityInput,
+    require_empty_confirm, deleted_note, delete_occurrence_note, validate_occurrence_update, validate_recurrence_update, CheckAvailabilityInput,
     CreateEventInput,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate, NewEmail,
@@ -25,6 +26,8 @@ pub const FAKE_WEEK_START: chrono::Weekday = chrono::Weekday::Mon;
 
 pub const EMAIL_ID: &str = "entry-1|store-1";
 pub const EVENT_ID: &str = "entry-2|store-1";
+/// One occurrence of `EVENT_ID` (as if it were a recurring series).
+pub const OCCURRENCE_ID: &str = "entry-2|store-1|2026-06-10T09:00:00";
 pub const TASK_ID: &str = "entry-3|store-1";
 pub const NOTE_ID: &str = "entry-4|store-1";
 /// An id every batch read reports as not found (a per-item error).
@@ -38,6 +41,17 @@ pub const FAKE_IMAGE_BYTES: &[u8] = b"\x89PNG";
 
 fn not_found(id: &str) -> ToolError {
     ToolError::new(format!("Item not found: {id}"))
+}
+
+/// `parse_event_id`, except that the bare ids older tests use (no `|`)
+/// count as plain series ids.
+fn parse_event_id(id: &str) -> Result<occurrence::EventId, ToolError> {
+    if !id.contains('|') {
+        return Ok(occurrence::EventId {
+            entry_id: id.to_string(), store_id: String::new(), occurrence_start: None,
+        });
+    }
+    occurrence::parse_event_id(id)
 }
 
 /// What a batch read records: the ids plus the resolved options.
@@ -148,7 +162,7 @@ impl FakeOutlookClient {
     /// The canned event `list_events` and `get_event` return.
     fn event_summary(&self, id: String) -> EventSummary {
         EventSummary {
-            id, subject: self.t("Standup"), start: None, end: None,
+            id, occurrence_id: None, subject: self.t("Standup"), start: None, end: None,
             location: self.t(""), organizer: self.t(""), all_day: false,
             is_recurring: false, is_meeting: false, is_canceled: false, categories: self.tv(&[]),
             show_as: "busy".into(), my_response: "accepted".into(),
@@ -374,13 +388,22 @@ impl OutlookClient for FakeOutlookClient {
             if id == MISSING_ID {
                 return Err(not_found(&id));
             }
+            let parsed = parse_event_id(&id)?;
             let body = opts.body
                 .then(|| shape_field(&self.t(""), ReadTool::Event, &id, "body", ".txt", opts,
                     out_dir.as_deref()))
                 .transpose()?;
             let (body, body_file, body_truncated, body_length) = BodyOut::into_parts(body);
             Ok(EventDetail {
-                summary: self.event_summary(id),
+                summary: match parsed.occurrence_start {
+                    None => self.event_summary(id),
+                    Some(start) => EventSummary {
+                        occurrence_id: Some(id),
+                        start: Some(occurrence::format_start(&start)),
+                        is_recurring: true,
+                        ..self.event_summary(parsed.series_id())
+                    },
+                },
                 body, body_file, body_truncated, body_length,
                 recurrence: None,
             })
@@ -409,12 +432,15 @@ impl OutlookClient for FakeOutlookClient {
 
     fn respond_to_meeting(&self, event_id: String, response: String,
         comment: Option<String>, send: bool) -> Result<Value, ToolError> {
+        parse_event_id(&event_id)?;
         self.record("respond_to_meeting",
             json!({"event_id": event_id, "response": response, "comment": comment, "send": send}))?;
         Ok(json!({"status": format!("{response}_sent")}))
     }
 
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError> {
+        let parsed = parse_event_id(&u.event_id)?;
+        validate_occurrence_update(parsed.is_occurrence(), &u)?;
         validate_recurrence_update(&u)?;
         self.record("update_event", json!({
             "event_id": u.event_id, "subject": u.subject, "start": u.start, "end": u.end,
@@ -446,14 +472,28 @@ impl OutlookClient for FakeOutlookClient {
         if u.remove_attendees.is_some() { changed.push("remove_attendees"); }
         if u.recurrence.is_some() { changed.push("recurrence"); }
         if u.clear_recurrence { changed.push("clear_recurrence"); }
+        if let Some(old_start) = parsed.occurrence_start {
+            let start = match u.start.as_deref() {
+                Some(s) => super::dates::parse_date_param(s, "start", FAKE_WEEK_START)?.at,
+                None => old_start,
+            };
+            return Ok(json!({"status": "updated", "id": parsed.series_id(),
+                "occurrence_id": occurrence::occurrence_id_at(&parsed.series_id(), &start),
+                "changed": changed}));
+        }
         Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
     }
 
     fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
         -> Result<Value, ToolError> {
+        let parsed = parse_event_id(&event_id)?;
         self.record("delete_event", json!({
             "event_id": event_id, "send_cancellation": send_cancellation, "permanent": permanent,
         }))?;
+        if parsed.is_occurrence() {
+            return Ok(json!({"status": "deleted", "occurrence": true,
+                "note": delete_occurrence_note(false, send_cancellation)}));
+        }
         Ok(json!({"status": "deleted", "permanent": permanent, "note": deleted_note(permanent)}))
     }
 

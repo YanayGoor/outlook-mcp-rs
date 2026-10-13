@@ -7,7 +7,7 @@ use crate::error::ToolError;
 
 /// Every field a `list_events` row can carry, in output order.
 pub const EVENT_FIELDS: &[&str] = &[
-    "id", "subject", "start", "end", "location", "organizer", "all_day", "is_recurring",
+    "id", "occurrence_id", "subject", "start", "end", "location", "organizer", "all_day", "is_recurring",
     "is_meeting", "is_canceled", "categories", "show_as", "my_response", "user_is_required",
     "user_is_optional", "required_count", "optional_count", "required_attendees",
     "optional_attendees",
@@ -15,7 +15,7 @@ pub const EVENT_FIELDS: &[&str] = &[
 
 /// `compact: true`: enough to triage a calendar, without the attendee strings.
 pub const COMPACT_EVENT_FIELDS: &[&str] = &[
-    "id", "subject", "start", "end", "organizer", "is_recurring", "my_response", "show_as",
+    "id", "occurrence_id", "subject", "start", "end", "organizer", "is_recurring", "my_response", "show_as",
     "user_is_required", "user_is_optional", "required_count", "optional_count",
 ];
 

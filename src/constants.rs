@@ -32,6 +32,10 @@ pub const OL_MEETING_RECEIVED: i32 = 3;
 pub const OL_MEETING_CANCELED: i32 = 5;
 pub const OL_MEETING_RECEIVED_AND_CANCELED: i32 = 7;
 
+// OlRecurrenceState (AppointmentItem.RecurrenceState)
+pub const OL_APPT_OCCURRENCE: i32 = 2;
+pub const OL_APPT_EXCEPTION: i32 = 3;
+
 // OlAddressEntryUserType (AddressEntry.AddressEntryUserType): the two kinds
 // of distribution list whose `Members` can be expanded.
 pub const OL_EXCHANGE_DISTRIBUTION_LIST_ADDRESS_ENTRY: i32 = 1;

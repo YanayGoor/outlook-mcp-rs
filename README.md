@@ -145,12 +145,12 @@ The Outlook tools then appear in that client.
 - `empty_deleted_items` — **permanently** delete everything in Deleted Items (items and subfolders); **irreversible**, refuses unless `confirm=true`. On Exchange/Microsoft 365, retention policy may still keep items in Recoverable Items
 
 **Calendar**
-- `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `include_canceled=false` skips canceled meetings; `count` default and max 250, page with `offset`. Each row says whether you're a required or optional attendee (`user_is_required`/`user_is_optional`, see below) and how many attendees each tier has. `compact=true` or `fields=[...]` returns only the fields you need
-- `get_event` — get the full details of one calendar event by id, or several in one call (same output options as `get_email`, plain-text body only)
+- `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `include_canceled=false` skips canceled meetings; `count` default and max 250, page with `offset`. Recurring events are expanded; each occurrence has the series' `id` plus its own `occurrence_id` (see "Recurring meetings"). Each row says whether you're a required or optional attendee (`user_is_required`/`user_is_optional`, see below) and how many attendees each tier has. `compact=true` or `fields=[...]` returns only the fields you need
+- `get_event` — get the full details of one calendar event by id (or `occurrence_id`), or several in one call (same output options as `get_email`, plain-text body only)
 - `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out; `body` or `body_file`
-- `update_event` — change an existing event (subject, times, location, body or `body_file`, attendees, reminder, recurrence…); optionally notify attendees
-- `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative)
-- `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); for a meeting you organize, `send_cancellation` (default true) notifies attendees first, independent of `permanent`. A recurring event's id (including an occurrence's) names the whole series, so the whole series is deleted
+- `update_event` — change an existing event (subject, times, location, body or `body_file`, attendees, reminder, recurrence…); optionally notify attendees. With an `occurrence_id` it changes just that occurrence and returns its new `occurrence_id`
+- `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative): a whole series, or one occurrence with its `occurrence_id`
+- `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); for a meeting you organize, `send_cancellation` (default true) notifies attendees first, independent of `permanent`. A recurring event's `id` names the whole series, so the whole series is deleted; an `occurrence_id` deletes just that occurrence
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**
@@ -198,6 +198,21 @@ A week of a busy calendar is large. To cut tokens:
 - or `fields=[...]` picks exactly the fields you want.
 
 If neither `user_is_*` field is requested, the server also skips reading the recipients, which makes the call faster.
+
+### Recurring meetings
+
+`list_events` expands a recurring series into its occurrences. Every occurrence carries two ids:
+
+| Field | Names | Use it to |
+|---|---|---|
+| `id` | the whole series (the same on every occurrence) | change, answer or delete the whole series |
+| `occurrence_id` | this one occurrence: the series id plus its start, `"{id}\|2026-10-14T09:30:00"` | read, answer, move or delete just that date |
+
+`get_event`, `respond_to_meeting`, `update_event` and `delete_event` accept either. Notes:
+- An `occurrence_id` stays valid until that occurrence is moved. `update_event` returns the new `occurrence_id` after a move. If you get "Occurrence not found", the occurrence was moved or deleted elsewhere: call `list_events` for that day again and match on the series `id` and the start.
+- `recurrence` / `clear_recurrence` always need the series `id`.
+- Deleting an occurrence removes just that date from the series. It never goes to Deleted Items, so `permanent` has no effect.
+- Other tools (`get_email`, `update_email`, …) reject an `occurrence_id`.
 
 ### Dates
 

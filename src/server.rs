@@ -1105,7 +1105,7 @@ impl OutlookMcpServer {
 
     // ---- Calendar ----
 
-    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; include_canceled=false skips meetings the organizer canceled. calendar_of views another person's shared calendar. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists (a meeting you organize or a personal appointment counts as required; both false = not found among the attendees, use my_response); and required_count / optional_count. To save tokens, compact=true returns only id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields. Paging: count (default and max 250) and offset.")]
+    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; include_canceled=false skips meetings the organizer canceled. calendar_of views another person's shared calendar. Recurring events are expanded: each occurrence's id is the SERIES id (acting on it acts on the whole series) and occurrence_id names just that occurrence; pass occurrence_id to get_event / respond_to_meeting / update_event / delete_event to act on one date. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists (a meeting you organize or a personal appointment counts as required; both false = not found among the attendees, use my_response); and required_count / optional_count. To save tokens, compact=true returns only id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields. Paging: count (default and max 250) and offset.")]
     pub async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
@@ -1131,7 +1131,7 @@ impl OutlookMcpServer {
         ))?]))
     }
 
-    #[tool(description = "Get the full details of one calendar event by id, or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
+    #[tool(description = "Get the full details of one calendar event by id (a series id, or an occurrence_id from list_events for one occurrence), or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
     pub async fn get_event(
         &self,
         Parameters(p): Parameters<GetEventParams>,
@@ -1174,7 +1174,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Respond to a meeting invite: accept, decline, or tentative.")]
+    #[tool(description = "Respond to a meeting invite: accept, decline, or tentative. event_id is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. send=false records the response in your calendar without emailing the organizer.")]
     pub async fn respond_to_meeting(
         &self,
         Parameters(RespondToMeetingParams { event_id, response, comment, send }): Parameters<RespondToMeetingParams>,
@@ -1184,7 +1184,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Update an existing calendar event: subject, start/end, location, body (or body_file: a local UTF-8 text file path), show_as, add/remove categories, add/remove attendees, reminder, all_day, recurrence (set/replace) or clear_recurrence (remove it). Adding an attendee converts a personal appointment into a meeting. Recurrence edits apply to the whole series. send_update (default true) notifies attendees if the event is a meeting.")]
+    #[tool(description = "Update an existing calendar event: subject, start/end, location, body (or body_file: a local UTF-8 text file path), show_as, add/remove categories, add/remove attendees, reminder, all_day, recurrence (set/replace) or clear_recurrence (remove it). Adding an attendee converts a personal appointment into a meeting. A series id (an event's id) edits the whole series; an occurrence_id from list_events edits just that occurrence (recurrence / clear_recurrence need the series id) and the result carries the occurrence's new occurrence_id, since moving it changes its start. send_update (default true) notifies attendees if the event is a meeting.")]
     pub async fn update_event(
         &self,
         Parameters(p): Parameters<UpdateEventParams>,
@@ -1210,7 +1210,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Delete/cancel a calendar event. If you organize the meeting, send_cancellation (default true) notifies attendees; if false, it's canceled quietly; this is independent of permanent (the cancellation is sent first). For a recurring event, the id (including an occurrence's id from list_events) names the whole series, so the whole series is deleted. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
+    #[tool(description = "Delete/cancel a calendar event. If you organize the meeting, send_cancellation (default true) notifies attendees; if false, it's canceled quietly; this is independent of permanent (the cancellation is sent first). For a recurring event, a series id (an event's id from list_events) deletes the whole series; an occurrence_id deletes just that occurrence (it is removed from the series, never moved to Deleted Items, so permanent has no effect on it). By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
     pub async fn delete_event(
         &self,
         Parameters(DeleteEventParams { event_id, send_cancellation, permanent }):

@@ -25,6 +25,7 @@ use crate::outlook::com::{
 };
 use crate::outlook::types::*;
 use crate::outlook::attendance::{self, Attendee, Identity, ListCache, UserRole};
+use crate::outlook::occurrence::{self, EventId};
 use chrono::Datelike;
 use crate::outlook::filters::{self, DateRange};
 use crate::outlook::text_query::TextQuery;
@@ -33,7 +34,8 @@ use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
     CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
-    deleted_note, delete_event_note, meeting_is_canceled,
+    deleted_note, delete_event_note, delete_occurrence_note, meeting_is_canceled,
+    validate_occurrence_update,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
     validate_draft_update, DraftUpdate, InlineImageSource, ValidatedInlineImage, MailBody,
@@ -508,14 +510,24 @@ fn event_summary(item: &IDispatch, rows: &mut EventRows) -> Result<EventSummary,
     let organizer_is_owner =
         meeting_status == c::OL_MEETING || response_status == c::OL_RESPONSE_ORGANIZED;
     let role = event_user_role(item, is_meeting, organizer_is_owner, rows);
+    let start = variant_to_iso_string(&get_property(item, "Start").unwrap_or_default());
+    let recurrence_state =
+        variant_to_i32(&get_property(item, "RecurrenceState").unwrap_or_default()).unwrap_or(0);
+    let occurrence_id = match (&start, recurrence_state) {
+        (Some(start), c::OL_APPT_OCCURRENCE | c::OL_APPT_EXCEPTION) => {
+            Some(occurrence::make_occurrence_id(&id, start))
+        }
+        _ => None,
+    };
     let required_attendees =
         variant_to_string(&get_property(item, "RequiredAttendees").unwrap_or_default());
     let optional_attendees =
         variant_to_string(&get_property(item, "OptionalAttendees").unwrap_or_default());
     Ok(EventSummary {
         id,
+        occurrence_id,
         subject: variant_to_string(&get_property(item, "Subject").unwrap_or_default()),
-        start: variant_to_iso_string(&get_property(item, "Start").unwrap_or_default()),
+        start,
         end: variant_to_iso_string(&get_property(item, "End").unwrap_or_default()),
         location: variant_to_string(&get_property(item, "Location").unwrap_or_default()),
         organizer: variant_to_string(&get_property(item, "Organizer").unwrap_or_default()),
@@ -1099,10 +1111,63 @@ fn read_plain_body(item: &IDispatch, tool: ReadTool, id: &str, opts: &ReadOption
     Ok(Some(shape_field(&full, tool, id, "body", ".txt", opts, out_dir)?))
 }
 
+/// Opens the item a calendar tool's `event_id` names: the series (or
+/// one-off event, or an inbox meeting request) for a plain id, or a single
+/// occurrence for an occurrence id (see `outlook::occurrence`).
+fn open_event(ns: &IDispatch, event_id: &str) -> Result<(IDispatch, EventId), ToolError> {
+    let parsed = occurrence::parse_event_id(event_id)?;
+    let item = get_item(ns, &parsed.series_id())?;
+    match parsed.occurrence_start {
+        None => Ok((item, parsed)),
+        Some(start) => {
+            let occ = resolve_occurrence(&item, &start).ok_or_else(|| occurrence::occurrence_not_found(event_id))?;
+            Ok((occ, parsed))
+        }
+    }
+}
+
+/// The occurrence of the recurring `master` that starts at `start`.
+/// `GetOccurrence` finds an occurrence at its scheduled slot; one that was
+/// moved (an exception) is found by its new start among the pattern's
+/// `Exceptions`. `None` if neither matches (moved again, or deleted).
+fn resolve_occurrence(master: &IDispatch, start: &chrono::NaiveDateTime) -> Option<IDispatch> {
+    let recurring = variant_to_bool(&get_property(master, "IsRecurring").ok()?).unwrap_or(false);
+    if !recurring {
+        return None;
+    }
+    let pattern = to_disp(call_method(master, "GetRecurrencePattern", &mut []).ok()?).ok()?;
+    let want = occurrence::format_start(start);
+    let starts_at = |appt: &IDispatch| {
+        get_property(appt, "Start").ok().and_then(|v| variant_to_iso_string(&v)).as_deref()
+            == Some(want.as_str())
+    };
+    if let Ok(v) = variant_from_datetime(start)
+        .map_err(ToolError::from)
+        .and_then(|d| Ok(call_method(&pattern, "GetOccurrence", &mut [d])?))
+        && let Ok(occ) = to_disp(v)
+        && starts_at(&occ)
+    {
+        return Some(occ);
+    }
+    let exceptions = to_disp(get_property(&pattern, "Exceptions").ok()?).ok()?;
+    let n = variant_to_i32(&get_property(&exceptions, "Count").unwrap_or_default()).unwrap_or(0);
+    (1..=n).find_map(|i| {
+        let exc = to_disp(call_method(&exceptions, "Item", &mut [variant_from_i32(i)]).ok()?).ok()?;
+        if variant_to_bool(&get_property(&exc, "Deleted").unwrap_or_default()).unwrap_or(false) {
+            return None;
+        }
+        let appt = to_disp(get_property(&exc, "AppointmentItem").ok()?).ok()?;
+        starts_at(&appt).then_some(appt)
+    })
+}
+
 /// One `get_event` result.
 fn read_event(ns: &IDispatch, event_id: &str, opts: &ReadOptions,
     out_dir: Option<&std::path::Path>, rows: &mut EventRows) -> Result<EventDetail, ToolError> {
-    let item = get_item(ns, event_id)?;
+    let (item, parsed) = open_event(ns, event_id)?;
+    // An occurrence's Parent.StoreID is as unreliable as an enumerated
+    // item's (see `event_summary`): use the store from the id.
+    rows.calendar_store_id = parsed.is_occurrence().then(|| parsed.store_id.clone());
     let summary = event_summary(&item, rows)?;
     let recurrence = recurrence_info(&item)?;
     let body = read_plain_body(&item, ReadTool::Event, event_id, opts, out_dir)?;
@@ -2169,7 +2234,7 @@ impl OutlookClient for WindowsOutlookClient {
         })?;
         self.with_com(|| {
             let (_app, ns) = mapi()?;
-            let mut item = get_item(&ns, &event_id)?;
+            let (mut item, _) = open_event(&ns, &event_id)?;
             // A meeting request from the inbox resolves to a MeetingItem; get
             // its appointment. Calendar ids resolve straight to appointments.
             if has_member(&item, "GetAssociatedAppointment") {
@@ -2201,9 +2266,11 @@ impl OutlookClient for WindowsOutlookClient {
     }
 
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError> {
+        let parsed = occurrence::parse_event_id(&u.event_id)?;
+        validate_occurrence_update(parsed.is_occurrence(), &u)?;
         self.with_com(|| {
             let (_app, ns) = mapi()?;
-            let item = get_item(&ns, &u.event_id)?;
+            let (item, parsed) = open_event(&ns, &u.event_id)?;
             let mut changed: Vec<&str> = Vec::new();
 
             if let Some(subject) = &u.subject {
@@ -2310,6 +2377,16 @@ impl OutlookClient for WindowsOutlookClient {
                 call_method(&item, "Save", &mut [])?;
             }
 
+            if parsed.is_occurrence() {
+                // Moving an occurrence changes its id: return the new one.
+                let start = variant_to_iso_string(&get_property(&item, "Start")?)
+                    .ok_or_else(|| ToolError::new("could not read the occurrence's new start"))?;
+                return Ok(json!({
+                    "status": "updated", "id": parsed.series_id(),
+                    "occurrence_id": occurrence::make_occurrence_id(&parsed.series_id(), &start),
+                    "changed": changed,
+                }));
+            }
             Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
         })
     }
@@ -2318,10 +2395,9 @@ impl OutlookClient for WindowsOutlookClient {
         -> Result<Value, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
-            // An occurrence id from list_events carries the series master's
-            // EntryID, so this is always the whole series (or a single
-            // non-recurring event): soft or permanent, the series goes.
-            let item = get_item(&ns, &event_id)?;
+            // A series id (`id` from list_events) deletes the whole series,
+            // soft or permanent; an occurrence_id deletes that one date.
+            let (item, parsed) = open_event(&ns, &event_id)?;
             let subject = variant_to_string(&get_property(&item, "Subject")?);
             let meeting_status =
                 variant_to_i32(&get_property(&item, "MeetingStatus")?).unwrap_or(c::OL_NONMEETING);
@@ -2334,6 +2410,15 @@ impl OutlookClient for WindowsOutlookClient {
                 if send_cancellation {
                     call_method(&item, "Send", &mut [])?;
                 }
+            }
+            if parsed.is_occurrence() {
+                // An occurrence can't be moved to Deleted Items: Delete()
+                // removes just this date from the series.
+                call_method(&item, "Delete", &mut [])?;
+                return Ok(json!({
+                    "status": "deleted", "subject": subject, "occurrence": true,
+                    "note": delete_occurrence_note(organized_meeting, send_cancellation),
+                }));
             }
             delete_item(&ns, &item, permanent)?;
             Ok(json!({

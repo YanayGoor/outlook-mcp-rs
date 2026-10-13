@@ -18,6 +18,8 @@ may still have sent.
 | Error text contains | Cause | Fix |
 |---|---|---|
 | `Item not found — it may have been moved or deleted` | Stale id: the item moved (ids change on move and delete) or was deleted | Find it again with `list_emails`/`list_events` and use the fresh id |
+| `Occurrence not found for …` | The `occurrence_id` names an occurrence by its start, and that occurrence was moved or deleted | Call `list_events` for that day again and take the `occurrence_id` of the row with the same series `id` |
+| `… is a calendar occurrence id` | An `occurrence_id` was passed to a non-calendar tool | Use the event's `id`, or a calendar tool |
 | `Folder not found: "…" (no subfolder named …)` | Typo in the path | Run `list_folders` and copy the exact `path` |
 | `Could not resolve "…" to a person` | The name or email isn't in the address book | Ask the user for the full email address |
 | `Could not open "…"'s calendar` | That person hasn't shared their calendar | Use `check_availability` instead (free/busy needs no sharing) |

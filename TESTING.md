@@ -152,6 +152,11 @@ covered by a read-only live test over this week's real calendar:
 It prints how many invites the user was found on; check that number against
 Outlook, especially for meetings sent to a distribution list.
 
+Occurrence ids (issue #45) are covered by a live test that creates a
+far-future daily series of personal appointments (nothing is sent), reads,
+moves and deletes single occurrences, and deletes the series:
+`cargo test --test live_outlook -- --ignored occurrence_ids_act_on_one_occurrence_only`.
+
 `check_availability`'s single-mailbox path (resolving your own address and
 reading its free/busy slots, plus the graceful-failure path for an address
 that can't provide free/busy data) is covered by the live suite:

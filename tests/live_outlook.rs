@@ -1138,6 +1138,83 @@ fn create_event_weekly_recurrence_round_trips() {
     c.delete_event(id, false, false).expect("cleanup delete_event");
 }
 
+/// An `EventUpdate` for `event_id` that changes nothing and notifies nobody.
+fn no_op_event_update(event_id: &str) -> EventUpdate {
+    EventUpdate {
+        event_id: event_id.to_string(), subject: None, start: None, end: None, location: None,
+        body: None, all_day: None, reminder_minutes: None, show_as: None, add_categories: None,
+        remove_categories: None, add_required_attendees: None, add_optional_attendees: None,
+        remove_attendees: None, send_update: false, recurrence: None, clear_recurrence: false,
+    }
+}
+
+#[test]
+#[ignore]
+fn occurrence_ids_act_on_one_occurrence_only() {
+    // A far-future daily series of 5 personal appointments (nothing is sent).
+    let c = client();
+    let created = c.create_event(CreateEventInput {
+        subject: "outlook-mcp-rs occurrence id probe".to_string(),
+        start: "2099-03-02T09:00".to_string(),
+        end: "2099-03-02T09:30".to_string(),
+        body: None, location: None, required_attendees: None, optional_attendees: None,
+        all_day: false, reminder_minutes: None, categories: None, show_as: None,
+        send: false,
+        recurrence: Some(RecurrenceInput {
+            pattern: "daily".to_string(), interval: Some(1), days_of_week: None,
+            day_of_month: None, until: None, occurrences: Some(5),
+        }),
+    }).expect("create_event daily series");
+    let series = created["id"].as_str().unwrap().to_string();
+    let list = |c: &WindowsOutlookClient| c.list_events(EventQuery {
+        start_after: Some("2099-03-02".to_string()),
+        start_before: Some("2099-03-08".to_string()),
+        query: Some("\"occurrence id probe\"".to_string()),
+        ..Default::default()
+    }).expect("list_events");
+    let occurrences = list(&c);
+    assert_eq!(occurrences.len(), 5);
+    assert!(occurrences.iter().all(|e| e.id == series && e.occurrence_id.is_some()));
+    let third = occurrences[2].occurrence_id.clone().unwrap();
+    assert_eq!(third, format!("{series}|2099-03-04T09:00:00"));
+
+    // get_event on the occurrence id reads that occurrence.
+    let detail = single(c.get_event(vec![third.clone()], &ReadOptions::default())).expect("get_event occurrence");
+    assert_eq!(detail.summary.start.as_deref(), Some("2099-03-04T09:00:00"));
+    assert_eq!(detail.summary.occurrence_id.as_deref(), Some(third.as_str()));
+
+    // Moving it touches only that occurrence and returns its new id.
+    let mut u = no_op_event_update(&third);
+    u.start = Some("2099-03-04T14:00".to_string());
+    u.end = Some("2099-03-04T14:30".to_string());
+    let moved = c.update_event(u).expect("move one occurrence");
+    let moved_id = moved["occurrence_id"].as_str().expect("new occurrence_id").to_string();
+    assert_eq!(moved_id, format!("{series}|2099-03-04T14:00:00"));
+    let after = list(&c);
+    let starts: Vec<_> = after.iter().map(|e| e.start.clone().unwrap()).collect();
+    assert_eq!(starts, vec!["2099-03-02T09:00:00", "2099-03-03T09:00:00", "2099-03-04T14:00:00",
+        "2099-03-05T09:00:00", "2099-03-06T09:00:00"]);
+    // The moved occurrence (an exception now) still resolves; the old id doesn't.
+    let detail = single(c.get_event(vec![moved_id.clone()], &ReadOptions::default())).expect("get moved");
+    assert_eq!(detail.summary.start.as_deref(), Some("2099-03-04T14:00:00"));
+    let err = single(c.get_event(vec![third], &ReadOptions::default())).unwrap_err();
+    assert!(err.to_string().contains("Occurrence not found"), "{err}");
+
+    // Recurrence edits need the series id.
+    let mut u = no_op_event_update(&moved_id);
+    u.clear_recurrence = true;
+    assert!(c.update_event(u).is_err());
+
+    // Deleting one occurrence leaves the other four.
+    let second = after[1].occurrence_id.clone().unwrap();
+    let deleted = c.delete_event(second, false, false).expect("delete one occurrence");
+    assert_eq!(deleted["occurrence"], true);
+    assert_eq!(list(&c).len(), 4);
+
+    c.delete_event(series, false, false).expect("cleanup: delete the series");
+    assert!(list(&c).is_empty());
+}
+
 #[test]
 #[ignore]
 fn create_event_monthly_recurrence_with_until_round_trips() {

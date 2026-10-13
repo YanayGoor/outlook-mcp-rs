@@ -316,7 +316,7 @@ mod tests {
 
     fn event() -> EventSummary {
         EventSummary {
-            id: "e".into(), subject: "Quarterly planning".into(), start: None, end: None,
+            id: "e".into(), occurrence_id: None, subject: "Quarterly planning".into(), start: None, end: None,
             location: "Room 4".into(), organizer: "Ada Lovelace".into(), all_day: false,
             is_recurring: false, is_meeting: true, is_canceled: false, categories: s(&["Work"]),
             show_as: "busy".into(), my_response: "accepted".into(),
@@ -434,6 +434,7 @@ mod event_filter_tests {
     fn base() -> EventSummary {
         EventSummary {
             id: "test-id|store-id".to_string(),
+            occurrence_id: None,
             subject: "Weekly Review".to_string(),
             start: Some("2026-06-10T14:00:00".to_string()),
             end: Some("2026-06-10T15:00:00".to_string()),

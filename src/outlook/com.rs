@@ -6,6 +6,12 @@ pub fn make_item_id(entry_id: &str, store_id: &str) -> String {
 }
 
 pub fn parse_item_id(item_id: &str) -> Result<(String, String), ToolError> {
+    if item_id.matches('|').count() == 2 {
+        return Err(ToolError::new(format!(
+            "{item_id:?} is a calendar occurrence id: only get_event, respond_to_meeting, \
+             update_event, move_events and delete_event accept it."
+        )));
+    }
     match item_id.split_once('|') {
         Some((entry, store)) if !entry.is_empty() && !store.is_empty() => {
             Ok((entry.to_string(), store.to_string()))

@@ -84,7 +84,13 @@ pub struct MeetingInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EventSummary {
+    /// The event's id; for an occurrence of a recurring series, the
+    /// series' id (acting on it acts on the whole series).
     pub id: String,
+    /// Set on each occurrence of a recurring series: names just that
+    /// occurrence (`"{id}|{start}"`). See `outlook::occurrence`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_id: Option<String>,
     pub subject: String,
     pub start: Option<String>,
     pub end: Option<String>,
