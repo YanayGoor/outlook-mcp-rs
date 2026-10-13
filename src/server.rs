@@ -9,6 +9,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::error::ToolError;
+use crate::outlook::event_rows;
 use crate::outlook::filters::{self, normalize_choices};
 use crate::outlook::read::{read_options, ReadRequest, ReadTool};
 use crate::outlook::{DEFAULT_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
@@ -436,6 +437,22 @@ pub struct ListEventsParams {
     /// Email/name of another person whose shared calendar to view (default: your own).
     #[serde(default)]
     pub calendar_of: Option<String>,
+    /// false = skip meetings the organizer canceled (default true: list them,
+    /// with is_canceled: true).
+    #[serde(default = "default_true")]
+    pub include_canceled: bool,
+    /// Return only these fields per event (default: all). Valid: id, subject,
+    /// start, end, location, organizer, all_day, is_recurring, is_meeting,
+    /// is_canceled, categories, show_as, my_response, user_is_required,
+    /// user_is_optional, required_count, optional_count, required_attendees,
+    /// optional_attendees.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Shorthand for fields = id, subject, start, end, organizer,
+    /// is_recurring, my_response, show_as, user_is_required,
+    /// user_is_optional, required_count, optional_count. Not with fields.
+    #[serde(default)]
+    pub compact: bool,
     /// Page size: default and max 250.
     #[serde(default = "default_event_count")]
     pub count: i32,
@@ -1088,11 +1105,12 @@ impl OutlookMcpServer {
 
     // ---- Calendar ----
 
-    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day. calendar_of views another person's shared calendar. Paging: count (default and max 250) and offset.")]
+    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; include_canceled=false skips meetings the organizer canceled. calendar_of views another person's shared calendar. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists (a meeting you organize or a personal appointment counts as required; both false = not found among the attendees, use my_response); and required_count / optional_count. To save tokens, compact=true returns only id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields. Paging: count (default and max 250) and offset.")]
     pub async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let fields = event_rows::event_fields(p.fields, p.compact)?;
         let client = self.client.clone();
         let q = EventQuery {
             start_after: p.start_after, start_before: p.start_before, query: p.query,
@@ -1101,10 +1119,16 @@ impl OutlookMcpServer {
             my_response: normalize_choices(list(p.my_response), "my_response", filters::MY_RESPONSES)?,
             attendees: list_values(p.attendees), attendee_role: p.attendee_role,
             meetings_only: p.meetings_only, all_day: p.all_day,
-            calendar_of: p.calendar_of, count: p.count, offset: p.offset,
+            calendar_of: p.calendar_of, include_canceled: p.include_canceled,
+            user_role: event_rows::wants_user_role(fields.as_deref()),
+            count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_events(q)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        let rows = serde_json::to_value(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![json_content(&event_rows::select_fields(
+            rows, fields.as_deref(),
+        ))?]))
     }
 
     #[tool(description = "Get the full details of one calendar event by id, or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]

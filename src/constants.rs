@@ -28,7 +28,14 @@ pub const OL_MEETING_DECLINED: i32 = 4;
 // OlMeetingStatus
 pub const OL_NONMEETING: i32 = 0;
 pub const OL_MEETING: i32 = 1;
+pub const OL_MEETING_RECEIVED: i32 = 3;
 pub const OL_MEETING_CANCELED: i32 = 5;
+pub const OL_MEETING_RECEIVED_AND_CANCELED: i32 = 7;
+
+// OlAddressEntryUserType (AddressEntry.AddressEntryUserType): the two kinds
+// of distribution list whose `Members` can be expanded.
+pub const OL_EXCHANGE_DISTRIBUTION_LIST_ADDRESS_ENTRY: i32 = 1;
+pub const OL_OUTLOOK_DISTRIBUTION_LIST_ADDRESS_ENTRY: i32 = 11;
 
 // OlMeetingRecipientType (Recipient.Type on an AppointmentItem)
 pub const OL_RECIPIENT_REQUIRED: i32 = 1;

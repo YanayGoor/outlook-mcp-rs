@@ -585,6 +585,8 @@ fn utf8_cases() -> Vec<Utf8Case> {
                  ("/0/optional_attendees", HE_TEXT)]),
         case("list_events", json!({"category": h, "attendees": h}),
             vec![("/0/subject", HE_TEXT)]),
+        case("list_events", json!({"query": h, "compact": true}),
+            vec![("/0/subject", HE_TEXT), ("/0/organizer", HE_TEXT)]),
         case("get_event", json!({"event_id": EVENT_ID}),
             vec![("/subject", HE_TEXT), ("/location", HE_TEXT), ("/organizer", HE_TEXT),
                  ("/categories/0", HE_TEXT), ("/required_attendees", HE_TEXT),
@@ -1560,6 +1562,70 @@ async fn list_events_filters_accept_lists_and_single_values() {
     let params: ListEventsParams = serde_json::from_value(json!({"show_as": "away"})).unwrap();
     let err = server.list_events(Parameters(params)).await.unwrap_err();
     assert!(err.message.contains("Invalid show_as \"away\""), "{}", err.message);
+}
+
+#[tokio::test]
+async fn list_events_returns_every_field_by_default() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams = serde_json::from_value(json!({})).unwrap();
+    let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
+    let row = v[0].as_object().unwrap();
+    for field in outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS {
+        assert!(row.contains_key(*field), "missing {field}");
+    }
+    assert_eq!(row.len(), outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS.len());
+    assert_eq!(v[0]["user_is_required"], true);
+    assert_eq!(v[0]["user_is_optional"], false);
+    assert_eq!(v[0]["is_canceled"], false);
+    let (_, args) = fake.calls().pop().unwrap();
+    assert_eq!(args["include_canceled"], true);
+    assert_eq!(args["user_role"], true);
+}
+
+#[tokio::test]
+async fn list_events_compact_returns_the_preset_fields() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams = serde_json::from_value(json!({"compact": true})).unwrap();
+    let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
+    let mut keys: Vec<&str> = v[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    let mut want = outlook_mcp_rs::outlook::event_rows::COMPACT_EVENT_FIELDS.to_vec();
+    keys.sort();
+    want.sort();
+    assert_eq!(keys, want);
+    assert_eq!(fake.calls().pop().unwrap().1["user_role"], true);
+}
+
+#[tokio::test]
+async fn list_events_fields_pick_exact_fields_and_skip_unneeded_work() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams =
+        serde_json::from_value(json!({"fields": ["subject", "ID"]})).unwrap();
+    let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
+    assert_eq!(v, json!([{"id": "entry-2|store-1", "subject": "Standup"}]));
+    // No user_is_* field asked for: the Recipients walk is skipped.
+    assert_eq!(fake.calls().pop().unwrap().1["user_role"], false);
+
+    let params: ListEventsParams =
+        serde_json::from_value(json!({"fields": ["subject", "body"]})).unwrap();
+    let err = server.list_events(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Unknown field \"body\""), "{}", err.message);
+    let params: ListEventsParams =
+        serde_json::from_value(json!({"fields": ["subject"], "compact": true})).unwrap();
+    let err = server.list_events(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("either fields or compact"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn list_events_forwards_include_canceled() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: ListEventsParams =
+        serde_json::from_value(json!({"include_canceled": false})).unwrap();
+    server.list_events(Parameters(params)).await.unwrap();
+    assert_eq!(fake.calls().pop().unwrap().1["include_canceled"], false);
 }
 
 #[tokio::test]

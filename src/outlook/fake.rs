@@ -145,6 +145,18 @@ impl FakeOutlookClient {
         *self.fail_with.lock().unwrap() = None;
     }
 
+    /// The canned event `list_events` and `get_event` return.
+    fn event_summary(&self, id: String) -> EventSummary {
+        EventSummary {
+            id, subject: self.t("Standup"), start: None, end: None,
+            location: self.t(""), organizer: self.t(""), all_day: false,
+            is_recurring: false, is_meeting: false, is_canceled: false, categories: self.tv(&[]),
+            show_as: "busy".into(), my_response: "accepted".into(),
+            user_is_required: true, user_is_optional: false, required_count: 0, optional_count: 0,
+            required_attendees: self.t(""), optional_attendees: self.t(""),
+        }
+    }
+
     fn record(&self, name: &str, args: Value) -> Result<(), ToolError> {
         if let Some(msg) = self.fail_with.lock().unwrap().clone() {
             return Err(ToolError::new(msg));
@@ -349,15 +361,10 @@ impl OutlookClient for FakeOutlookClient {
             "category": q.category, "show_as": q.show_as, "my_response": q.my_response,
             "attendees": q.attendees, "attendee_role": q.attendee_role,
             "meetings_only": q.meetings_only, "all_day": q.all_day,
-            "calendar_of": q.calendar_of, "count": q.count, "offset": q.offset,
+            "calendar_of": q.calendar_of, "include_canceled": q.include_canceled,
+            "user_role": q.user_role, "count": q.count, "offset": q.offset,
         }))?;
-        Ok(vec![EventSummary {
-            id: EVENT_ID.into(), subject: self.t("Standup"), start: None, end: None,
-            location: self.t(""), organizer: self.t(""), all_day: false,
-            is_recurring: false, is_meeting: false, categories: self.tv(&[]),
-            show_as: "busy".into(), my_response: "accepted".into(),
-            required_attendees: self.t(""), optional_attendees: self.t(""),
-        }])
+        Ok(vec![self.event_summary(EVENT_ID.into())])
     }
 
     fn get_event(&self, event_ids: Vec<String>, opts: &ReadOptions) -> BatchResult<EventDetail> {
@@ -373,13 +380,7 @@ impl OutlookClient for FakeOutlookClient {
                 .transpose()?;
             let (body, body_file, body_truncated, body_length) = BodyOut::into_parts(body);
             Ok(EventDetail {
-                summary: EventSummary {
-                    id, subject: self.t("Standup"), start: None, end: None,
-                    location: self.t(""), organizer: self.t(""), all_day: false,
-                    is_recurring: false, is_meeting: false, categories: self.tv(&[]),
-                    show_as: "busy".into(), my_response: "accepted".into(),
-                    required_attendees: self.t(""), optional_attendees: self.t(""),
-                },
+                summary: self.event_summary(id),
                 body, body_file, body_truncated, body_length,
                 recurrence: None,
             })

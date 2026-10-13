@@ -103,6 +103,8 @@ permanent delete. Never set `confirm: true` on your own initiative.
   - `start_after`/`start_before` bound the event start; the default window is today plus 7 days. `count` default and max 250, page with `offset`.
   - Recurring events are expanded.
   - `calendar_of` opens someone's shared calendar.
+  - To scan a week or more, pass `compact: true` (or `fields: [...]`): full rows carry long attendee strings and can overflow the context. `include_canceled: false` drops canceled meetings.
+  - Use `user_is_required` / `user_is_optional` to tell whether the user must attend. They are computed on the server, including through distribution lists; don't guess from the attendee strings. Both false means the user isn't listed (fall back to `my_response`).
 - **`check_availability`:**
   - Shows free/busy only, never event details, in `interval_minutes` slots (default 30).
   - `common_free` lists the windows where everyone resolved is free.

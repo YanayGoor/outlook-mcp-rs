@@ -449,6 +449,55 @@ fn list_events_filters_by_query_and_category() {
 
 #[test]
 #[ignore]
+fn list_events_user_role_and_compact_fields_on_a_real_week() {
+    // Read-only: this week's real events. A personal appointment or a
+    // meeting you organize must count as required; the two flags are never
+    // both true; the counts match the attendee strings.
+    use outlook_mcp_rs::outlook::attendance::attendee_count;
+    let c = client();
+    let events = c.list_events(EventQuery {
+        start_after: Some("start_of_week".to_string()),
+        start_before: Some("end_of_week".to_string()),
+        ..Default::default()
+    }).expect("list_events");
+    for e in &events {
+        assert!(!(e.user_is_required && e.user_is_optional), "{}: both flags set", e.subject);
+        if !e.is_meeting || e.my_response == "organizer" {
+            assert!(e.user_is_required, "{}: own event must be required", e.subject);
+        }
+        assert_eq!(e.required_count, attendee_count(&e.required_attendees));
+        assert_eq!(e.optional_count, attendee_count(&e.optional_attendees));
+    }
+    let invited = events.iter().filter(|e| e.is_meeting && e.my_response != "organizer").count();
+    let found = events.iter()
+        .filter(|e| e.is_meeting && e.my_response != "organizer")
+        .filter(|e| e.user_is_required || e.user_is_optional)
+        .count();
+    eprintln!("{invited} invites this week, the user was found on {found}");
+
+    // Without the role fields, nothing is computed and both are false.
+    let lean = c.list_events(EventQuery {
+        start_after: Some("start_of_week".to_string()),
+        start_before: Some("end_of_week".to_string()),
+        user_role: false,
+        ..Default::default()
+    }).expect("list_events without user_role");
+    assert_eq!(lean.len(), events.len());
+    assert!(lean.iter().all(|e| !e.user_is_required && !e.user_is_optional));
+
+    // include_canceled=false drops exactly the canceled ones.
+    let kept = c.list_events(EventQuery {
+        start_after: Some("start_of_week".to_string()),
+        start_before: Some("end_of_week".to_string()),
+        include_canceled: false,
+        user_role: false,
+        ..Default::default()
+    }).expect("list_events without canceled");
+    assert_eq!(kept.len(), events.iter().filter(|e| !e.is_canceled).count());
+}
+
+#[test]
+#[ignore]
 fn list_events_calendar_of_self_opens_own_calendar() {
     // Opening your OWN calendar via calendar_of exercises the recipient-resolve
     // + GetSharedDefaultFolder path without needing a second user's sharing grant.

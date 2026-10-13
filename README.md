@@ -145,7 +145,7 @@ The Outlook tools then appear in that client.
 - `empty_deleted_items` — **permanently** delete everything in Deleted Items (items and subfolders); **irreversible**, refuses unless `confirm=true`. On Exchange/Microsoft 365, retention policy may still keep items in Recoverable Items
 
 **Calendar**
-- `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `count` default and max 250, page with `offset`
+- `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `include_canceled=false` skips canceled meetings; `count` default and max 250, page with `offset`. Each row says whether you're a required or optional attendee (`user_is_required`/`user_is_optional`, see below) and how many attendees each tier has. `compact=true` or `fields=[...]` returns only the fields you need
 - `get_event` — get the full details of one calendar event by id, or several in one call (same output options as `get_email`, plain-text body only)
 - `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out; `body` or `body_file`
 - `update_event` — change an existing event (subject, times, location, body or `body_file`, attendees, reminder, recurrence…); optionally notify attendees
@@ -184,6 +184,20 @@ The Outlook tools then appear in that client.
 - **Date ranges** are `<field>_after` / `<field>_before`, both inclusive: `received_*` (emails), `start_*` (events; `start_date`/`end_date` still work), `due_*` (tasks), `created_*` (notes). A bare date in `*_before` includes that whole day.
 - **Paging:** `count` and `offset` on every list tool. Caps: emails 200 (default 10), events 250, tasks 500, notes 500 (default = cap). Call again with `offset += count` until a page comes back short.
 - **Deprecated** (still accepted): `since_days` (use `received_after: "-14d"`), `flagged` (use `flag`), `high_importance` (use `importance: "high"`).
+
+### Calendar rows
+
+`list_events` rows (and `get_event`) carry these fields alongside the subject, times and attendee strings:
+
+- **`user_is_required` / `user_is_optional`:** whether the calendar's owner (you, or the `calendar_of` person) is a required or an optional attendee. Computed on the server from the meeting's recipients, matched by address (never by display name) and through distribution lists, including nested ones (up to 3 levels). A meeting you organize, or a personal appointment, counts as required. If both are `false`, you weren't found among the attendees (e.g. a forwarded invite, or a list that can't be expanded): use `my_response`.
+- **`required_count` / `optional_count`:** how many attendees each tier names.
+- **`is_canceled`:** the organizer canceled the meeting. `include_canceled=false` leaves those out (before paging).
+
+A week of a busy calendar is large. To cut tokens:
+- `compact=true` returns only `id`, `subject`, `start`, `end`, `organizer`, `is_recurring`, `my_response`, `show_as`, `user_is_required`, `user_is_optional`, `required_count`, `optional_count`;
+- or `fields=[...]` picks exactly the fields you want.
+
+If neither `user_is_*` field is requested, the server also skips reading the recipients, which makes the call faster.
 
 ### Dates
 

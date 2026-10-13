@@ -145,6 +145,13 @@ tasks and notes) are covered by read-only live tests:
 On a day-first Windows locale the date test can still fail because of issue #1
 (`jet_datetime`), which is independent of the grammar.
 
+`list_events`' `user_is_required` / `user_is_optional`, attendee counts,
+`include_canceled` and the skipped role computation (issues #43, #44) are
+covered by a read-only live test over this week's real calendar:
+`cargo test --test live_outlook -- --ignored list_events_user_role_and_compact_fields_on_a_real_week`.
+It prints how many invites the user was found on; check that number against
+Outlook, especially for meetings sent to a distribution list.
+
 `check_availability`'s single-mailbox path (resolving your own address and
 reading its free/busy slots, plus the graceful-failure path for an address
 that can't provide free/busy data) is covered by the live suite:

@@ -8,6 +8,8 @@
 //! All 20 `OutlookClient` trait methods are implemented (email, calendar,
 //! attachments, tasks, and notes; Tasks 12-16) — no `todo!()` stubs remain.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::Variant::VARIANT;
@@ -22,6 +24,7 @@ use crate::outlook::com::{
     variant_to_bool, variant_to_i32, variant_to_iso_string, variant_to_string, ComGuard,
 };
 use crate::outlook::types::*;
+use crate::outlook::attendance::{self, Attendee, Identity, ListCache, UserRole};
 use chrono::Datelike;
 use crate::outlook::filters::{self, DateRange};
 use crate::outlook::text_query::TextQuery;
@@ -30,7 +33,7 @@ use crate::outlook::{
     com_recurrence_interval, common_free, create_event_status, friendly_recurrence_interval,
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
     CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
-    deleted_note, delete_event_note,
+    deleted_note, delete_event_note, meeting_is_canceled,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
     validate_draft_update, DraftUpdate, InlineImageSource, ValidatedInlineImage, MailBody,
@@ -55,6 +58,9 @@ const MAX_INLINE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Upper bound on items scanned client-side when the DASL text search for a
 /// non-ASCII query comes back empty (see `list_emails`).
 const MAX_SCAN_ITEMS: i32 = 2000;
+/// Upper bound on the recipients of one event read for `user_is_required` /
+/// `user_is_optional`; a meeting with more is judged on the first ones.
+const ROLE_RECIPIENT_LIMIT: i32 = 1000;
 
 /// Lets `?` turn a `windows::core::Error` into a [`ToolError`] anywhere in
 /// this module, so COM-plumbing calls (`call_method`, `get_property`, …) and
@@ -317,10 +323,160 @@ fn remove_meeting_recipients(recipients: &IDispatch, addresses: &[String]) -> Re
     Ok(())
 }
 
+/// Per-call state for building event rows: where ids come from (see
+/// [`event_summary`]), whose role `user_is_required` / `user_is_optional`
+/// describe, and the distribution lists already expanded, so a week of
+/// meetings sent to the same list expands it once.
+struct EventRows {
+    /// When `Some`, build each id from `EntryID` + this store id instead of
+    /// `make_id` (see [`event_summary`]).
+    calendar_store_id: Option<String>,
+    /// The calendar owner's addresses; `None` skips the role computation
+    /// (both fields reported false).
+    owner: Option<Identity>,
+    lists: ListCache,
+    /// Distribution-list address entries seen so far, by lowercased address,
+    /// so `attendance::user_role` can ask for a list's members by address.
+    list_entries: HashMap<String, IDispatch>,
+}
+
+impl EventRows {
+    fn new(calendar_store_id: Option<String>, owner: Option<Identity>) -> Self {
+        Self { calendar_store_id, owner, lists: ListCache::default(), list_entries: HashMap::new() }
+    }
+}
+
+/// The addresses that identify a calendar's owner, from their `Recipient`
+/// (`Namespace.CurrentUser`, or the resolved `calendar_of` person): the
+/// recipient's `Address` (the legacy DN for Exchange), its address entry's
+/// address, and an Exchange user's primary SMTP address. Best-effort: an
+/// unreadable property just contributes nothing.
+fn owner_identity(recipient: &IDispatch) -> Identity {
+    let mut addresses = vec![variant_to_string(&get_property(recipient, "Address").unwrap_or_default())];
+    if let Some(entry) = get_property(recipient, "AddressEntry").ok().and_then(|v| to_disp(v).ok()) {
+        addresses.push(variant_to_string(&get_property(&entry, "Address").unwrap_or_default()));
+        if let Some(user) =
+            call_method(&entry, "GetExchangeUser", &mut []).ok().and_then(|v| to_disp(v).ok())
+        {
+            addresses.push(variant_to_string(
+                &get_property(&user, "PrimarySmtpAddress").unwrap_or_default(),
+            ));
+        }
+    }
+    Identity::new(addresses)
+}
+
+/// The current user's identity, or `None` if it can't be read (then roles
+/// are computed against nobody, so only the organizer/appointment rules apply).
+fn current_user_identity(ns: &IDispatch) -> Option<Identity> {
+    let me = get_property(ns, "CurrentUser").ok().and_then(|v| to_disp(v).ok())?;
+    Some(owner_identity(&me))
+}
+
+/// Whether an `AddressEntry` is a distribution list whose `Members` can be
+/// expanded (an Exchange list or a personal contact group).
+fn is_list_entry(entry: &IDispatch) -> bool {
+    let kind = variant_to_i32(&get_property(entry, "AddressEntryUserType").unwrap_or_default())
+        .unwrap_or(-1);
+    kind == c::OL_EXCHANGE_DISTRIBUTION_LIST_ADDRESS_ENTRY
+        || kind == c::OL_OUTLOOK_DISTRIBUTION_LIST_ADDRESS_ENTRY
+}
+
+/// The members of a distribution list's address entry, registering nested
+/// lists in `list_entries`. `AddressEntry.Members` covers both kinds of
+/// list; an Exchange list that doesn't expose it falls back to
+/// `GetExchangeDistributionList().GetExchangeDistributionListMembers()`.
+/// `None` if neither works (a dynamic list, or no permission).
+fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>)
+    -> Option<Vec<Attendee>> {
+    let members = get_property(entry, "Members")
+        .ok()
+        .and_then(|v| to_disp(v).ok())
+        .or_else(|| {
+            let dl = call_method(entry, "GetExchangeDistributionList", &mut [])
+                .ok()
+                .and_then(|v| to_disp(v).ok())?;
+            call_method(&dl, "GetExchangeDistributionListMembers", &mut [])
+                .ok()
+                .and_then(|v| to_disp(v).ok())
+        })?;
+    let n = variant_to_i32(&get_property(&members, "Count").unwrap_or_default()).unwrap_or(0);
+    let mut out = Vec::new();
+    for i in 1..=n.min(attendance::MAX_LIST_MEMBERS as i32) {
+        let Some(m) = call_method(&members, "Item", &mut [variant_from_i32(i)])
+            .ok()
+            .and_then(|v| to_disp(v).ok())
+        else {
+            continue;
+        };
+        let address = variant_to_string(&get_property(&m, "Address").unwrap_or_default());
+        let is_list = is_list_entry(&m);
+        if is_list {
+            list_entries.insert(address.trim().to_lowercase(), m);
+        }
+        // A member's kind is irrelevant: it takes its list's type.
+        out.push(Attendee { kind: 0, address, is_list });
+    }
+    Some(out)
+}
+
+/// `user_is_required` / `user_is_optional` for one event. Reads each
+/// required/optional recipient's type and address; only if no recipient
+/// matches the owner directly does it look at which recipients are
+/// distribution lists, and expand those (see `attendance::user_role`).
+fn event_user_role(item: &IDispatch, is_meeting: bool, organizer_is_owner: bool,
+    rows: &mut EventRows) -> UserRole {
+    let Some(owner) = rows.owner.as_ref() else { return UserRole::default() };
+    if !is_meeting || organizer_is_owner {
+        return attendance::user_role(is_meeting, organizer_is_owner, &[], owner,
+            &mut rows.lists, |_| None);
+    }
+    let Some(recipients) = get_property(item, "Recipients").ok().and_then(|v| to_disp(v).ok())
+    else {
+        return UserRole::default();
+    };
+    let n = variant_to_i32(&get_property(&recipients, "Count").unwrap_or_default()).unwrap_or(0);
+    let mut attendees = Vec::new();
+    let mut entries = Vec::new();
+    for i in 1..=n.min(ROLE_RECIPIENT_LIMIT) {
+        let Some(r) = call_method(&recipients, "Item", &mut [variant_from_i32(i)])
+            .ok()
+            .and_then(|v| to_disp(v).ok())
+        else {
+            continue;
+        };
+        let kind = variant_to_i32(&get_property(&r, "Type").unwrap_or_default()).unwrap_or(0);
+        if kind != c::OL_RECIPIENT_REQUIRED && kind != c::OL_RECIPIENT_OPTIONAL {
+            continue;
+        }
+        let address = variant_to_string(&get_property(&r, "Address").unwrap_or_default());
+        attendees.push(Attendee { kind, address, is_list: false });
+        entries.push(r);
+    }
+    let direct = attendance::user_role(true, false, &attendees, owner, &mut rows.lists, |_| None);
+    if direct.user_is_required {
+        return direct;
+    }
+    // No direct required match: find the lists among the recipients.
+    let EventRows { lists, list_entries, .. } = rows;
+    for (attendee, r) in attendees.iter_mut().zip(&entries) {
+        if let Some(entry) = get_property(r, "AddressEntry").ok().and_then(|v| to_disp(v).ok())
+            && is_list_entry(&entry)
+        {
+            attendee.is_list = true;
+            list_entries.insert(attendee.address.trim().to_lowercase(), entry);
+        }
+    }
+    attendance::user_role(true, false, &attendees, owner, lists, |address| {
+        let entry = list_entries.get(&address.trim().to_lowercase())?.clone();
+        list_members(&entry, list_entries)
+    })
+}
+
 /// `client.py::_event_summary`, enriched for v2 with show_as/my_response and the
 /// attendee strings so every calendar filter can operate on the built summary.
 ///
-/// `calendar_store_id`: when `Some`, build the id from `EntryID` + this
+/// `rows.calendar_store_id`: when `Some`, build the id from `EntryID` + this
 /// caller-supplied store id instead of calling `make_id` (which reads
 /// `item.Parent.StoreID`). `list_events`' enumeration passes this: items
 /// returned by `Items.GetFirst()`/`GetNext()` after `Restrict()` with
@@ -336,16 +492,26 @@ fn remove_meeting_recipients(recipients: &IDispatch, addresses: &[String]) -> Re
 /// that same folder — so its `StoreID` is reused instead. `get_event`
 /// (items fetched via `GetItemFromID`, unaffected by this) still passes
 /// `None` and uses the normal `make_id` path.
-fn event_summary(item: &IDispatch, calendar_store_id: Option<&str>) -> Result<EventSummary, ToolError> {
+fn event_summary(item: &IDispatch, rows: &mut EventRows) -> Result<EventSummary, ToolError> {
     let meeting_status = variant_to_i32(&get_property(item, "MeetingStatus").unwrap_or_default())
         .unwrap_or(c::OL_NONMEETING);
-    let id = match calendar_store_id {
+    let id = match rows.calendar_store_id.as_deref() {
         Some(store_id) => {
             let entry_id = variant_to_string(&get_property(item, "EntryID")?);
             make_item_id(&entry_id, store_id)
         }
         None => make_id(item)?,
     };
+    let response_status = variant_to_i32(&get_property(item, "ResponseStatus").unwrap_or_default())
+        .unwrap_or(c::OL_RESPONSE_NONE);
+    let is_meeting = meeting_status != c::OL_NONMEETING;
+    let organizer_is_owner =
+        meeting_status == c::OL_MEETING || response_status == c::OL_RESPONSE_ORGANIZED;
+    let role = event_user_role(item, is_meeting, organizer_is_owner, rows);
+    let required_attendees =
+        variant_to_string(&get_property(item, "RequiredAttendees").unwrap_or_default());
+    let optional_attendees =
+        variant_to_string(&get_property(item, "OptionalAttendees").unwrap_or_default());
     Ok(EventSummary {
         id,
         subject: variant_to_string(&get_property(item, "Subject").unwrap_or_default()),
@@ -357,24 +523,21 @@ fn event_summary(item: &IDispatch, calendar_store_id: Option<&str>) -> Result<Ev
             .unwrap_or(false),
         is_recurring: variant_to_bool(&get_property(item, "IsRecurring").unwrap_or_default())
             .unwrap_or(false),
-        is_meeting: meeting_status != c::OL_NONMEETING,
+        is_meeting,
+        is_canceled: meeting_is_canceled(meeting_status),
         categories: get_item_categories(item),
         show_as: crate::friendly::busy_status_word(
             variant_to_i32(&get_property(item, "BusyStatus").unwrap_or_default())
                 .unwrap_or(c::OL_BUSY),
         )
         .to_string(),
-        my_response: crate::friendly::response_word(
-            variant_to_i32(&get_property(item, "ResponseStatus").unwrap_or_default())
-                .unwrap_or(c::OL_RESPONSE_NONE),
-        )
-        .to_string(),
-        required_attendees: variant_to_string(
-            &get_property(item, "RequiredAttendees").unwrap_or_default(),
-        ),
-        optional_attendees: variant_to_string(
-            &get_property(item, "OptionalAttendees").unwrap_or_default(),
-        ),
+        my_response: crate::friendly::response_word(response_status).to_string(),
+        user_is_required: role.user_is_required,
+        user_is_optional: role.user_is_optional,
+        required_count: attendance::attendee_count(&required_attendees),
+        optional_count: attendance::attendee_count(&optional_attendees),
+        required_attendees,
+        optional_attendees,
     })
 }
 
@@ -510,7 +673,7 @@ fn is_transient_unknown_name(err: &ToolError) -> bool {
 /// returning the page `offset..offset + count` of them (`count` already
 /// clamped to `MAX_EVENT_COUNT`).
 ///
-/// `calendar_store_id` is threaded through to `event_summary` to sidestep a
+/// `rows` carries the calendar's store id through to `event_summary` to sidestep a
 /// confirmed-live, deterministic bug (see `event_summary`'s doc comment):
 /// every item this enumeration yields has a `Parent` whose `StoreID` never
 /// resolves, so ids are built from the calendar folder's own (reliable)
@@ -527,7 +690,7 @@ fn enumerate_events_with_retry(
     flt: &str,
     q: &EventQuery,
     text: &TextQuery,
-    calendar_store_id: &str,
+    rows: &mut EventRows,
     count: usize,
 ) -> Result<Vec<EventSummary>, ToolError> {
     const MAX_ATTEMPTS: u32 = 3;
@@ -543,7 +706,7 @@ fn enumerate_events_with_retry(
             let mut results = Vec::new();
             let mut current = call_method(&restricted, "GetFirst", &mut [])?;
             while let Ok(item) = IDispatch::try_from(&current) {
-                let summary = event_summary(&item, Some(calendar_store_id))?;
+                let summary = event_summary(&item, rows)?;
                 if filters::event_matches(&summary, q, text) {
                     if skipped < offset {
                         skipped += 1;
@@ -938,9 +1101,9 @@ fn read_plain_body(item: &IDispatch, tool: ReadTool, id: &str, opts: &ReadOption
 
 /// One `get_event` result.
 fn read_event(ns: &IDispatch, event_id: &str, opts: &ReadOptions,
-    out_dir: Option<&std::path::Path>) -> Result<EventDetail, ToolError> {
+    out_dir: Option<&std::path::Path>, rows: &mut EventRows) -> Result<EventDetail, ToolError> {
     let item = get_item(ns, event_id)?;
-    let summary = event_summary(&item, None)?;
+    let summary = event_summary(&item, rows)?;
     let recurrence = recurrence_info(&item)?;
     let body = read_plain_body(&item, ReadTool::Event, event_id, opts, out_dir)?;
     let (body, body_file, body_truncated, body_length) = BodyOut::into_parts(body);
@@ -1854,6 +2017,7 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             // `calendar_of`: open another person's shared calendar; otherwise
             // our own default calendar (current behavior).
+            let mut owner = None;
             let calendar = match q.calendar_of.as_deref().filter(|s| !s.is_empty()) {
                 Some(person) => {
                     let recipient = to_disp(call_method(
@@ -1866,6 +2030,7 @@ impl OutlookClient for WindowsOutlookClient {
                             "Could not resolve {person:?} to a person — check the name/email."
                         )));
                     }
+                    owner = Some(owner_identity(&recipient));
                     // olFolderCalendar = 9. Requires that person to have shared
                     // their calendar with you; otherwise COM errors with a
                     // permission message, surfaced as-is.
@@ -1901,7 +2066,15 @@ impl OutlookClient for WindowsOutlookClient {
                 jet_datetime(&start),
                 jet_datetime(&end)
             );
-            enumerate_events_with_retry(&items, &flt, &q, &text, &calendar_store_id, count)
+            // user_is_required / user_is_optional describe the calendar's
+            // owner: you, or the calendar_of person.
+            let owner = match (q.user_role, owner) {
+                (false, _) => None,
+                (true, Some(person)) => Some(person),
+                (true, None) => current_user_identity(&ns),
+            };
+            let mut rows = EventRows::new(Some(calendar_store_id), owner);
+            enumerate_events_with_retry(&items, &flt, &q, &text, &mut rows, count)
         })
     }
 
@@ -1909,7 +2082,11 @@ impl OutlookClient for WindowsOutlookClient {
         let out_dir = opts.output_dir.as_deref().map(prepare_output_dir).transpose()?;
         self.with_com(|| {
             let (_app, ns) = mapi()?;
-            Ok(event_ids.iter().map(|id| read_event(&ns, id, opts, out_dir.as_deref())).collect())
+            let mut rows = EventRows::new(None, current_user_identity(&ns));
+            Ok(event_ids
+                .iter()
+                .map(|id| read_event(&ns, id, opts, out_dir.as_deref(), &mut rows))
+                .collect())
         })
     }
 

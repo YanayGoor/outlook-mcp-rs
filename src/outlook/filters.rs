@@ -173,6 +173,9 @@ pub fn event_matches(summary: &EventSummary, q: &EventQuery, text: &TextQuery) -
     if q.meetings_only && !summary.is_meeting {
         return false;
     }
+    if !q.include_canceled && summary.is_canceled {
+        return false;
+    }
     if q.all_day.is_some_and(|want| summary.all_day != want) {
         return false;
     }
@@ -315,8 +318,9 @@ mod tests {
         EventSummary {
             id: "e".into(), subject: "Quarterly planning".into(), start: None, end: None,
             location: "Room 4".into(), organizer: "Ada Lovelace".into(), all_day: false,
-            is_recurring: false, is_meeting: true, categories: s(&["Work"]),
+            is_recurring: false, is_meeting: true, is_canceled: false, categories: s(&["Work"]),
             show_as: "busy".into(), my_response: "accepted".into(),
+            user_is_required: true, user_is_optional: false, required_count: 2, optional_count: 1,
             required_attendees: "Ada Lovelace; Bob Smith".into(), optional_attendees: "Carol".into(),
         }
     }
@@ -343,6 +347,16 @@ mod tests {
         assert!(check(|q| { q.attendees = s(&["bob"]); q.attendee_role = Some("required".into()) }));
         assert!(!check(|q| q.all_day = Some(true)));
         assert!(check(|q| q.meetings_only = true));
+    }
+
+    #[test]
+    fn include_canceled_false_skips_canceled_meetings() {
+        let mut e = event();
+        let check = |e: &EventSummary, f: fn(&mut EventQuery)| { let (q, t) = eq(f); event_matches(e, &q, &t) };
+        assert!(check(&e, |q| q.include_canceled = false));
+        e.is_canceled = true;
+        assert!(check(&e, |_| {}), "canceled meetings are listed by default");
+        assert!(!check(&e, |q| q.include_canceled = false));
     }
 
     #[test]
@@ -428,9 +442,14 @@ mod event_filter_tests {
             all_day: false,
             is_recurring: false,
             is_meeting: true,
+            is_canceled: false,
             categories: vec!["Work".to_string()],
             show_as: "busy".to_string(),
             my_response: "accepted".to_string(),
+            user_is_required: true,
+            user_is_optional: false,
+            required_count: 2,
+            optional_count: 2,
             required_attendees: "Alice Smith; alice@example.com".to_string(),
             optional_attendees: "Bob Jones; bob@example.com".to_string(),
         }

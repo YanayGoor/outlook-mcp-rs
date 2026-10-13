@@ -1,6 +1,8 @@
+pub mod attendance;
 pub mod client;
 pub mod com;
 pub mod dates;
+pub mod event_rows;
 pub mod fake;
 pub mod filters;
 pub mod read;
@@ -243,6 +245,11 @@ pub struct EventQuery {
     pub meetings_only: bool,
     pub all_day: Option<bool>,
     pub calendar_of: Option<String>,
+    /// false = skip meetings the organizer canceled (before paging).
+    pub include_canceled: bool,
+    /// Compute `user_is_required` / `user_is_optional` (a `Recipients` walk
+    /// per event). When false both are reported false.
+    pub user_role: bool,
     pub count: i32,
     pub offset: i32,
 }
@@ -253,7 +260,7 @@ impl Default for EventQuery {
             start_after: None, start_before: None, query: None, category: Vec::new(),
             show_as: Vec::new(), my_response: Vec::new(), attendees: Vec::new(),
             attendee_role: None, meetings_only: false, all_day: None, calendar_of: None,
-            count: MAX_EVENT_COUNT, offset: 0,
+            include_canceled: true, user_role: true, count: MAX_EVENT_COUNT, offset: 0,
         }
     }
 }
@@ -471,6 +478,14 @@ pub fn deleted_note(permanent: bool) -> &'static str {
     } else {
         "Moved to Deleted Items."
     }
+}
+
+/// Whether an `AppointmentItem.MeetingStatus` means the organizer canceled
+/// the meeting (`olMeetingCanceled`, or `olMeetingReceivedAndCanceled` on
+/// an attendee's copy).
+pub fn meeting_is_canceled(meeting_status: i32) -> bool {
+    meeting_status == crate::constants::OL_MEETING_CANCELED
+        || meeting_status == crate::constants::OL_MEETING_RECEIVED_AND_CANCELED
 }
 
 /// `delete_event`'s `note`: whether a meeting you organize was canceled (and
@@ -1394,6 +1409,16 @@ mod tests {
         draft_update_changes, validate_draft_update, DraftUpdate, InlineImage, merge_categories,
         parse_importance,
     };
+
+    #[test]
+    fn canceled_meeting_statuses() {
+        use crate::constants::*;
+        assert!(super::meeting_is_canceled(OL_MEETING_CANCELED));
+        assert!(super::meeting_is_canceled(OL_MEETING_RECEIVED_AND_CANCELED));
+        for status in [OL_NONMEETING, OL_MEETING, OL_MEETING_RECEIVED] {
+            assert!(!super::meeting_is_canceled(status));
+        }
+    }
     use std::cell::Cell;
 
     fn ok_items(n: i32) -> impl Iterator<Item = Result<i32, String>> {

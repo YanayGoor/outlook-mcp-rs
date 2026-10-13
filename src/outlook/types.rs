@@ -93,11 +93,22 @@ pub struct EventSummary {
     pub all_day: bool,
     pub is_recurring: bool,
     pub is_meeting: bool,
+    /// The organizer canceled this meeting (`MeetingStatus` canceled).
+    pub is_canceled: bool,
     pub categories: Vec<String>,
     /// Busy status as a friendly word: "free"/"tentative"/"busy"/"out_of_office"/"working_elsewhere".
     pub show_as: String,
     /// This mailbox's response as a friendly word: "organizer"/"accepted"/"declined"/"tentative"/"not_responded"/"none".
     pub my_response: String,
+    /// The calendar's owner is a required attendee: directly, through a
+    /// distribution list, as the organizer, or because it's a personal
+    /// appointment. See `attendance::user_role`.
+    pub user_is_required: bool,
+    /// The calendar's owner is an optional (and not a required) attendee.
+    pub user_is_optional: bool,
+    /// How many people `required_attendees` / `optional_attendees` name.
+    pub required_count: usize,
+    pub optional_count: usize,
     pub required_attendees: String,
     pub optional_attendees: String,
 }
