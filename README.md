@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **31 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **32 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 31 tools below become available.
+already running, and the 32 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 31 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 32 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
@@ -130,7 +130,7 @@ The Outlook tools then appear in that client.
 
 ## Available tools
 
-31 MCP tools, grouped by category:
+32 MCP tools, grouped by category:
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
@@ -152,6 +152,7 @@ The Outlook tools then appear in that client.
 - `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative): a whole series, or one occurrence with its `occurrence_id`; pass a list of ids to answer several invites in one call (per-item results; one failure doesn't stop the rest). `send=false` records the answer without emailing the organizer
 - `move_events` — move several events in one call: `moves: [{event_id, start, end?}]` (up to 100; `end` omitted keeps the duration; series, one-off or occurrence ids). Each result has `previous_start`/`previous_end`, and `undo.moves` is ready to pass back to `move_events` to roll everything back. `send_update` (default true) notifies a meeting's attendees
 - `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); for a meeting you organize, `send_cancellation` (default true) notifies attendees first, independent of `permanent`. A recurring event's `id` names the whole series, so the whole series is deleted; an `occurrence_id` deletes just that occurrence
+- `find_conflicts` — the groups of your events that overlap in a range (default today plus 7 days), as compact rows, so you don't have to fetch the whole calendar and compare times yourself; free (`treat_as_free`), canceled, declined and all-day events are left out by default; read-only
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**

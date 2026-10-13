@@ -4,7 +4,7 @@ use outlook_mcp_rs::outlook::fake::{FakeOutlookClient, EMAIL_ID};
 use outlook_mcp_rs::server::{
     CheckAvailabilityParams, CreateDraftParams, CreateEventParams, CreateNoteParams, CreateTaskParams,
     DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams,
-    GetEventParams, GetInlineImageParams, MoveEventsParams, GetNoteParams, GetTaskParams, ListAttachmentsParams,
+    GetEventParams, GetInlineImageParams, MoveEventsParams, FindConflictsParams, GetNoteParams, GetTaskParams, ListAttachmentsParams,
     EmptyDeletedItemsParams,
     ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
@@ -625,6 +625,7 @@ fn utf8_cases() -> Vec<Utf8Case> {
         case("delete_event", json!({"event_id": EVENT_ID, "send_cancellation": false}), vec![]),
         case("delete_event",
             json!({"event_id": EVENT_ID, "send_cancellation": false, "permanent": true}), vec![]),
+        case("find_conflicts", json!({"calendar_of": h, "start_after": "today"}), vec![]),
         case("check_availability",
             json!({"people": [h], "start": "2026-06-10T09:00:00", "end": "2026-06-10T17:00:00"}),
             vec![("/people/0/person", h)]),
@@ -1958,6 +1959,56 @@ async fn move_events_rejects_empty_and_oversized_batches_and_bad_ends() {
     let v = result_json(&server.move_events(Parameters(params)).await.unwrap());
     assert!(v["results"][0]["error"].as_str().unwrap().contains("before start"));
     assert_eq!(v["undo"]["moves"], json!([]));
+}
+
+fn timed_event(id: &str, start: &str, end: &str, show_as: &str)
+    -> outlook_mcp_rs::outlook::types::EventSummary {
+    outlook_mcp_rs::outlook::types::EventSummary {
+        id: id.into(), occurrence_id: None, subject: id.into(),
+        start: Some(format!("2026-10-14T{start}:00")), end: Some(format!("2026-10-14T{end}:00")),
+        location: "Room".into(), organizer: "Ada".into(), all_day: false, is_recurring: false,
+        is_meeting: true, is_canceled: false, categories: vec![], show_as: show_as.into(),
+        my_response: "accepted".into(), user_is_required: true, user_is_optional: false,
+        required_count: 3, optional_count: 0, required_attendees: "Ada; Bob; Me".into(),
+        optional_attendees: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn find_conflicts_returns_compact_overlap_groups() {
+    let fake = Arc::new(FakeOutlookClient::new());
+    fake.set_events(vec![
+        timed_event("a", "09:00", "10:00", "busy"),
+        timed_event("b", "09:30", "10:30", "tentative"),
+        timed_event("c", "09:15", "09:45", "free"),
+        timed_event("d", "11:00", "12:00", "busy"),
+    ]);
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: FindConflictsParams =
+        serde_json::from_value(json!({"start_after": "2026-10-14", "start_before": "2026-10-14"})).unwrap();
+    let v = result_json(&server.find_conflicts(Parameters(params)).await.unwrap());
+    assert_eq!(v["events_checked"], 4);
+    let groups = v["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["start"], "2026-10-14T09:00:00");
+    assert_eq!(groups[0]["end"], "2026-10-14T10:30:00");
+    let rows = groups[0]["events"].as_array().unwrap();
+    assert_eq!(rows.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["a", "b"]);
+    assert!(rows[0].get("required_attendees").is_none(), "rows are compact");
+    assert_eq!(rows[0]["user_is_required"], true);
+    let (name, args) = fake.calls().pop().unwrap();
+    assert_eq!(name, "find_conflicts");
+    assert_eq!(args["treat_as_free"], json!(["free"]));
+
+    // An empty treat_as_free makes the free event conflict too.
+    let params: FindConflictsParams = serde_json::from_value(json!({"treat_as_free": []})).unwrap();
+    let v = result_json(&server.find_conflicts(Parameters(params)).await.unwrap());
+    assert_eq!(v["groups"][0]["events"].as_array().unwrap().len(), 3);
+
+    let params: FindConflictsParams =
+        serde_json::from_value(json!({"treat_as_free": ["away"]})).unwrap();
+    let err = server.find_conflicts(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("treat_as_free"), "{}", err.message);
 }
 
 #[tokio::test]

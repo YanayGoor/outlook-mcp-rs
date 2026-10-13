@@ -1252,6 +1252,41 @@ fn move_event_keeps_duration_and_undo_restores_it() {
 
 #[test]
 #[ignore]
+fn find_conflicts_groups_two_overlapping_probes() {
+    // Two overlapping far-future personal appointments and one after them.
+    let c = client();
+    let make = |subject: &str, start: &str, end: &str| {
+        c.create_event(CreateEventInput {
+            subject: subject.to_string(), start: start.to_string(), end: end.to_string(),
+            body: None, location: None, required_attendees: None, optional_attendees: None,
+            all_day: false, reminder_minutes: None, categories: None, show_as: None,
+            send: false, recurrence: None,
+        }).expect("create_event")["id"].as_str().unwrap().to_string()
+    };
+    let a = make("outlook-mcp-rs conflict probe A", "2099-05-04T09:00", "2099-05-04T10:00");
+    let b = make("outlook-mcp-rs conflict probe B", "2099-05-04T09:30", "2099-05-04T10:30");
+    let lone = make("outlook-mcp-rs conflict probe C", "2099-05-04T10:30", "2099-05-04T11:00");
+    let result = c.find_conflicts(outlook_mcp_rs::outlook::conflicts::ConflictQuery {
+        start_after: Some("2099-05-04".to_string()), start_before: Some("2099-05-04".to_string()),
+        calendar_of: None, treat_as_free: vec!["free".to_string()],
+        include_declined: false, include_all_day: false,
+    });
+    for id in [a.clone(), b.clone(), lone.clone()] {
+        c.delete_event(id, false, false).expect("cleanup");
+    }
+    let result = result.expect("find_conflicts");
+    let group = result.groups.iter()
+        .find(|g| g.events.iter().any(|e| e.id == a))
+        .expect("a group with probe A");
+    let ids: Vec<_> = group.events.iter().map(|e| e.id.as_str()).collect();
+    assert!(ids.contains(&b.as_str()), "B overlaps A");
+    assert!(!ids.contains(&lone.as_str()), "C only touches B");
+    assert_eq!(group.start, "2099-05-04T09:00:00");
+    assert_eq!(group.end, "2099-05-04T10:30:00");
+}
+
+#[test]
+#[ignore]
 fn create_event_monthly_recurrence_with_until_round_trips() {
     let c = client();
     let created = c.create_event(CreateEventInput {

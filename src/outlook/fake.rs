@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use super::types::*;
 use super::filters::DateRange;
+use super::conflicts::{ConflictQuery, ConflictResult};
 use super::occurrence;
 use super::{
     require_empty_confirm, deleted_note, delete_occurrence_note, validate_occurrence_update, validate_recurrence_update, CheckAvailabilityInput,
@@ -76,6 +77,7 @@ pub struct FakeOutlookClient {
     fail_with: Mutex<Option<String>>,
     email_text: Mutex<Option<EmailText>>,
     email_html: Mutex<Option<String>>,
+    events: Mutex<Option<Vec<EventSummary>>>,
     hebrew: AtomicBool,
 }
 
@@ -96,6 +98,7 @@ impl FakeOutlookClient {
             fail_with: Mutex::new(None),
             email_text: Mutex::new(None),
             email_html: Mutex::new(None),
+            events: Mutex::new(None),
             hebrew: AtomicBool::new(false),
         }
     }
@@ -157,6 +160,24 @@ impl FakeOutlookClient {
 
     pub fn clear_fail_with(&self) {
         *self.fail_with.lock().unwrap() = None;
+    }
+
+    /// Make `list_events` (and `find_conflicts`) return these events, paged
+    /// by `count` / `offset`, instead of the one canned event.
+    pub fn set_events(&self, events: Vec<EventSummary>) {
+        *self.events.lock().unwrap() = Some(events);
+    }
+
+    /// One `list_events` page, without recording a call.
+    fn events_page(&self, q: &EventQuery) -> Vec<EventSummary> {
+        match self.events.lock().unwrap().as_ref() {
+            None => vec![self.event_summary(EVENT_ID.into())],
+            Some(all) => {
+                let from = (q.offset.max(0) as usize).min(all.len());
+                let to = (from + q.count.max(0) as usize).min(all.len());
+                all[from..to].to_vec()
+            }
+        }
     }
 
     /// The canned event `list_events` and `get_event` return.
@@ -378,7 +399,18 @@ impl OutlookClient for FakeOutlookClient {
             "calendar_of": q.calendar_of, "include_canceled": q.include_canceled,
             "user_role": q.user_role, "count": q.count, "offset": q.offset,
         }))?;
-        Ok(vec![self.event_summary(EVENT_ID.into())])
+        Ok(self.events_page(&q))
+    }
+
+    fn find_conflicts(&self, q: ConflictQuery) -> Result<ConflictResult, ToolError> {
+        DateRange::parse(q.start_after.as_deref(), q.start_before.as_deref(),
+            "start_after", "start_before", chrono::Local::now().naive_local(), FAKE_WEEK_START)?;
+        self.record("find_conflicts", json!({
+            "start_after": q.start_after, "start_before": q.start_before,
+            "calendar_of": q.calendar_of, "treat_as_free": q.treat_as_free,
+            "include_declined": q.include_declined, "include_all_day": q.include_all_day,
+        }))?;
+        super::conflicts::find_conflicts(&q, |eq| Ok(self.events_page(&eq)))
     }
 
     fn get_event(&self, event_ids: Vec<String>, opts: &ReadOptions) -> BatchResult<EventDetail> {

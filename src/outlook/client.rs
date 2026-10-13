@@ -25,6 +25,7 @@ use crate::outlook::com::{
 };
 use crate::outlook::types::*;
 use crate::outlook::attendance::{self, Attendee, Identity, ListCache, UserRole};
+use crate::outlook::conflicts::{ConflictQuery, ConflictResult};
 use crate::outlook::occurrence::{self, EventId};
 use chrono::Datelike;
 use crate::outlook::filters::{self, DateRange};
@@ -2396,6 +2397,10 @@ impl OutlookClient for WindowsOutlookClient {
             }
             Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
         })
+    }
+
+    fn find_conflicts(&self, q: ConflictQuery) -> Result<ConflictResult, ToolError> {
+        crate::outlook::conflicts::find_conflicts(&q, |eq| self.list_events(eq))
     }
 
     fn move_event(&self, m: EventMove) -> Result<Value, ToolError> {

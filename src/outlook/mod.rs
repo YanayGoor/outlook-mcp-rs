@@ -1,5 +1,6 @@
 pub mod attendance;
 pub mod client;
+pub mod conflicts;
 pub mod com;
 pub mod dates;
 pub mod event_rows;
@@ -449,6 +450,9 @@ pub trait OutlookClient: Send + Sync {
     /// `previous_end`, `start` and `end` (ISO), and whether attendees were
     /// `notified`.
     fn move_event(&self, m: EventMove) -> Result<Value, ToolError>;
+    /// The overlapping groups of events in a range (see `conflicts`).
+    fn find_conflicts(&self, q: conflicts::ConflictQuery)
+        -> Result<conflicts::ConflictResult, ToolError>;
     /// `permanent` as in [`OutlookClient::delete_email`]. For a meeting you
     /// organize, `send_cancellation` (independent of `permanent`) decides
     /// whether attendees are notified before your copy is deleted.

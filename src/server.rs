@@ -13,6 +13,7 @@ use crate::outlook::event_rows;
 use crate::outlook::filters::{self, normalize_choices};
 use crate::outlook::read::{read_options, ReadRequest, ReadTool};
 use crate::outlook::{EventMove, MAX_EVENT_MOVES};
+use crate::outlook::conflicts::ConflictQuery;
 use crate::outlook::{DEFAULT_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
 use crate::params::OneOrMany;
 use serde_json::{json, Value};
@@ -673,6 +674,28 @@ pub struct DeleteEventParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindConflictsParams {
+    /// Range start (default today 00:00), any date form, e.g. 'start_of_week'.
+    #[serde(default)]
+    pub start_after: Option<String>,
+    /// Range end (default 7 days after start_after); a bare date includes that whole day.
+    #[serde(default)]
+    pub start_before: Option<String>,
+    /// show_as values that never conflict (default ["free"]).
+    #[serde(default = "default_treat_as_free")]
+    pub treat_as_free: Vec<String>,
+    /// Count events you declined (default false).
+    #[serde(default)]
+    pub include_declined: bool,
+    /// Count all-day events (default false).
+    #[serde(default)]
+    pub include_all_day: bool,
+    /// Email/name of another person whose shared calendar to check (default: your own).
+    #[serde(default)]
+    pub calendar_of: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckAvailabilityParams {
     pub people: Vec<String>,
     /// Window start (any date form, e.g. '2026-06-10T09:00' or 'tomorrow+9h').
@@ -1313,6 +1336,30 @@ impl OutlookMcpServer {
         let result =
             run_blocking(move || client.delete_event(event_id, send_cancellation, permanent)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
+    }
+
+    #[tool(description = "Find calendar conflicts: the groups of events that overlap in a range, so you don't have to fetch the calendar and compare times yourself. start_after / start_before bound the event start (default today 00:00 to 7 days later; any date form). Events whose show_as is in treat_as_free (default [\"free\"]), canceled meetings, events you declined (unless include_declined) and all-day events (unless include_all_day) never conflict; touching events (one ends as the next starts) don't overlap. Returns {groups: [{start, end, events}], events_checked}: each group is a maximal set of transitively overlapping events, with compact rows (id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count); events that overlap nothing are left out. calendar_of checks another person's shared calendar. Read-only.")]
+    pub async fn find_conflicts(
+        &self,
+        Parameters(p): Parameters<FindConflictsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let q = ConflictQuery {
+            start_after: p.start_after, start_before: p.start_before, calendar_of: p.calendar_of,
+            treat_as_free: normalize_choices(p.treat_as_free, "treat_as_free", filters::SHOW_AS)?,
+            include_declined: p.include_declined, include_all_day: p.include_all_day,
+        };
+        let client = self.client.clone();
+        let result = run_blocking(move || client.find_conflicts(q)).await?;
+        let compact: Vec<String> =
+            event_rows::COMPACT_EVENT_FIELDS.iter().map(|f| f.to_string()).collect();
+        let mut out = serde_json::to_value(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let Some(groups) = out["groups"].as_array_mut() {
+            for g in groups {
+                g["events"] = event_rows::select_fields(g["events"].take(), Some(&compact));
+            }
+        }
+        Ok(CallToolResult::success(vec![json_content(&out)?]))
     }
 
     #[tool(description = "Check free/busy availability for one or more people over a time window. Returns each person's raw status per time slot (never event details) plus common_free: the windows where everyone is available. treat_as_free (default [\"free\"]) controls which statuses count as available when computing common_free; a person whose address can't be resolved, or who resolves but has no loadable free/busy data, is marked resolved:false with empty slots and doesn't fail the call.")]

@@ -106,6 +106,9 @@ permanent delete. Never set `confirm: true` on your own initiative.
   - `calendar_of` opens someone's shared calendar.
   - To scan a week or more, pass `compact: true` (or `fields: [...]`): full rows carry long attendee strings and can overflow the context. `include_canceled: false` drops canceled meetings.
   - Use `user_is_required` / `user_is_optional` to tell whether the user must attend. They are computed on the server, including through distribution lists; don't guess from the attendee strings. Both false means the user isn't listed (fall back to `my_response`).
+- **`find_conflicts`:**
+  - To find double bookings, call `find_conflicts` instead of listing the calendar and comparing times yourself. It returns only the overlapping groups, with compact rows that include `user_is_required` / `user_is_optional` and `occurrence_id`.
+  - Free, canceled, declined and all-day events don't count by default (`treat_as_free`, `include_declined`, `include_all_day`).
 - **`check_availability`:**
   - Shows free/busy only, never event details, in `interval_minutes` slots (default 30).
   - `common_free` lists the windows where everyone resolved is free.

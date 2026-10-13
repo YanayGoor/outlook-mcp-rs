@@ -160,6 +160,11 @@ moves and deletes single occurrences, and deletes the series:
 `move_events` (issue #46) is covered by a live test that moves a far-future
 personal appointment, checks the kept duration, and moves it back:
 `cargo test --test live_outlook -- --ignored move_event_keeps_duration_and_undo_restores_it`.
+`find_conflicts` (issue #47) is covered by a live test that creates three
+far-future personal appointments (two overlapping, one touching) and
+deletes them again:
+`cargo test --test live_outlook -- --ignored find_conflicts_groups_two_overlapping_probes`.
+
 Batch `respond_to_meeting` reuses the single-response client path once per
 id, so it has no separate live test (a live response would notify a real
 organizer).
