@@ -4,7 +4,7 @@ use outlook_mcp_rs::outlook::fake::{FakeOutlookClient, EMAIL_ID};
 use outlook_mcp_rs::server::{
     CheckAvailabilityParams, CreateDraftParams, CreateEventParams, CreateNoteParams, CreateTaskParams,
     DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams,
-    GetEventParams, GetInlineImageParams, GetNoteParams, GetTaskParams, ListAttachmentsParams,
+    GetEventParams, GetInlineImageParams, MoveEventsParams, GetNoteParams, GetTaskParams, ListAttachmentsParams,
     EmptyDeletedItemsParams,
     ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
@@ -605,6 +605,14 @@ fn utf8_cases() -> Vec<Utf8Case> {
         case("respond_to_meeting",
             json!({"event_id": EVENT_ID, "response": "accept", "comment": h, "send": false}),
             vec![]),
+        case("respond_to_meeting",
+            json!({"event_id": [EVENT_ID, EVENT_ID], "response": "decline", "comment": h,
+                   "send": false}),
+            vec![]),
+        case("move_events",
+            json!({"moves": [{"event_id": EVENT_ID, "start": "2026-06-11T10:00"}],
+                   "send_update": false}),
+            vec![("/results/0/subject", HE_TEXT)]),
         case("update_event",
             json!({"event_id": EVENT_ID, "subject": h, "location": h, "body": h,
                    "add_categories": [h], "remove_categories": [h],
@@ -1873,6 +1881,83 @@ async fn delete_event_on_an_occurrence_removes_only_that_date() {
     let v = result_json(&server.delete_event(Parameters(params)).await.unwrap());
     assert_eq!(v["occurrence"], true);
     assert!(v["note"].as_str().unwrap().starts_with("Only this occurrence"));
+}
+
+#[tokio::test]
+async fn respond_to_meeting_batch_returns_per_item_results() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, OCCURRENCE_ID};
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: RespondToMeetingParams = serde_json::from_value(json!({
+        "event_ids": [EVENT_ID, "bad|id|x", OCCURRENCE_ID], "response": "Accept", "send": false
+    })).unwrap();
+    let v = result_json(&server.respond_to_meeting(Parameters(params)).await.unwrap());
+    assert_eq!(v[0], json!({"id": EVENT_ID, "status": "Accept_sent"}));
+    assert_eq!(v[1]["id"], "bad|id|x");
+    assert!(v[1]["error"].as_str().unwrap().contains("Invalid event id"));
+    assert_eq!(v[2]["id"], OCCURRENCE_ID);
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(_, a)| a["send"] == false && a["response"] == "Accept"));
+
+    let params: RespondToMeetingParams = serde_json::from_value(
+        json!({"event_id": [EVENT_ID], "response": "maybe"})).unwrap();
+    let err = server.respond_to_meeting(Parameters(params)).await.unwrap_err();
+    assert!(err.message.contains("Invalid response"), "{}", err.message);
+    assert_eq!(fake.calls().len(), 2, "a bad response fails before any call");
+}
+
+#[tokio::test]
+async fn move_events_reports_previous_times_and_an_undo() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, MISSING_ID, OCCURRENCE_ID};
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: MoveEventsParams = serde_json::from_value(json!({
+        "moves": [
+            {"event_id": EVENT_ID, "start": "2026-06-11T10:00"},
+            {"event_id": MISSING_ID, "start": "2026-06-11T10:00"},
+            {"event_id": OCCURRENCE_ID, "start": "2026-06-12T15:00", "end": "2026-06-12T16:00"}
+        ],
+        "send_update": false
+    })).unwrap();
+    let v = result_json(&server.move_events(Parameters(params)).await.unwrap());
+    let r = &v["results"];
+    assert_eq!(r[0]["previous_start"], "2026-06-10T09:00:00");
+    assert_eq!(r[0]["start"], "2026-06-11T10:00:00");
+    assert_eq!(r[0]["end"], "2026-06-11T10:30:00", "duration kept");
+    assert_eq!(r[1]["event_id"], MISSING_ID);
+    assert!(r[1]["error"].is_string());
+    assert_eq!(r[2]["occurrence_id"], "entry-2|store-1|2026-06-12T15:00:00");
+    assert_eq!(r[2]["end"], "2026-06-12T16:00:00");
+    assert_eq!(v["undo"]["moves"], json!([
+        {"event_id": EVENT_ID, "start": "2026-06-10T09:00:00", "end": "2026-06-10T09:30:00"},
+        {"event_id": "entry-2|store-1|2026-06-12T15:00:00",
+         "start": "2026-06-10T09:00:00", "end": "2026-06-10T09:30:00"},
+    ]));
+    assert!(fake.calls().iter().all(|(n, a)| n == "move_events" && a["send_update"] == false));
+
+    // The undo moves are valid move_events input.
+    let undo: MoveEventsParams = serde_json::from_value(json!({"moves": v["undo"]["moves"]})).unwrap();
+    assert_eq!(undo.moves.len(), 2);
+    assert!(undo.send_update, "send_update defaults to true");
+}
+
+#[tokio::test]
+async fn move_events_rejects_empty_and_oversized_batches_and_bad_ends() {
+    use outlook_mcp_rs::outlook::fake::EVENT_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    let params: MoveEventsParams = serde_json::from_value(json!({"moves": []})).unwrap();
+    assert!(server.move_events(Parameters(params)).await.is_err());
+    let many: Vec<Value> = (0..101).map(|_| json!({"event_id": EVENT_ID, "start": "today"})).collect();
+    let params: MoveEventsParams = serde_json::from_value(json!({"moves": many})).unwrap();
+    assert!(server.move_events(Parameters(params)).await.is_err());
+    let params: MoveEventsParams = serde_json::from_value(json!({"moves": [
+        {"event_id": EVENT_ID, "start": "2026-06-11T10:00", "end": "2026-06-11T09:00"}
+    ]})).unwrap();
+    let v = result_json(&server.move_events(Parameters(params)).await.unwrap());
+    assert!(v["results"][0]["error"].as_str().unwrap().contains("before start"));
+    assert_eq!(v["undo"]["moves"], json!([]));
 }
 
 #[tokio::test]

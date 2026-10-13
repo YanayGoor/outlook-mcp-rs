@@ -35,7 +35,7 @@ use crate::outlook::{
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
     CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
     deleted_note, delete_event_note, delete_occurrence_note, meeting_is_canceled,
-    validate_occurrence_update,
+    validate_occurrence_update, moved_times, EventMove,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
     validate_draft_update, DraftUpdate, InlineImageSource, ValidatedInlineImage, MailBody,
@@ -1159,6 +1159,13 @@ fn resolve_occurrence(master: &IDispatch, start: &chrono::NaiveDateTime) -> Opti
         let appt = to_disp(get_property(&exc, "AppointmentItem").ok()?).ok()?;
         starts_at(&appt).then_some(appt)
     })
+}
+
+/// An appointment's `Start` / `End` as a datetime.
+fn item_datetime(item: &IDispatch, prop: &str) -> Result<chrono::NaiveDateTime, ToolError> {
+    variant_to_iso_string(&get_property(item, prop)?)
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S").ok())
+        .ok_or_else(|| ToolError::new(format!("could not read the event's {prop}")))
 }
 
 /// One `get_event` result.
@@ -2388,6 +2395,41 @@ impl OutlookClient for WindowsOutlookClient {
                 }));
             }
             Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
+        })
+    }
+
+    fn move_event(&self, m: EventMove) -> Result<Value, ToolError> {
+        let new_start = parse_dt(&m.start, "start")?;
+        let new_end = m.end.as_deref().map(|e| parse_dt(e, "end")).transpose()?;
+        self.with_com(|| {
+            let (_app, ns) = mapi()?;
+            let (item, parsed) = open_event(&ns, &m.event_id)?;
+            let prev_start = item_datetime(&item, "Start")?;
+            let prev_end = item_datetime(&item, "End")?;
+            let (start, end) = moved_times(prev_start, prev_end, new_start, new_end)?;
+            // Setting Start shifts End by the old duration; End is then set explicitly.
+            put_property(&item, "Start", variant_from_datetime(&start)?)?;
+            put_property(&item, "End", variant_from_datetime(&end)?)?;
+            let is_meeting =
+                variant_to_i32(&get_property(&item, "MeetingStatus")?).unwrap_or(c::OL_NONMEETING)
+                    != c::OL_NONMEETING;
+            let notified = is_meeting && m.send_update;
+            if notified {
+                call_method(&item, "Send", &mut [])?;
+            } else {
+                call_method(&item, "Save", &mut [])?;
+            }
+            let fmt = occurrence::format_start;
+            let mut out = json!({
+                "id": parsed.series_id(),
+                "subject": variant_to_string(&get_property(&item, "Subject")?),
+                "previous_start": fmt(&prev_start), "previous_end": fmt(&prev_end),
+                "start": fmt(&start), "end": fmt(&end), "notified": notified,
+            });
+            if parsed.is_occurrence() {
+                out["occurrence_id"] = json!(occurrence::occurrence_id_at(&parsed.series_id(), &start));
+            }
+            Ok(out)
         })
     }
 

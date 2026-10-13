@@ -11,7 +11,7 @@
 use outlook_mcp_rs::outlook::client::WindowsOutlookClient;
 use outlook_mcp_rs::outlook::read::single;
 use outlook_mcp_rs::outlook::ReadOptions;
-use outlook_mcp_rs::outlook::{MailBody, NewEmail, ReplyInput, CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
+use outlook_mcp_rs::outlook::{MailBody, NewEmail, ReplyInput, CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventMove, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 
 fn client() -> WindowsOutlookClient {
     WindowsOutlookClient::new()
@@ -1213,6 +1213,41 @@ fn occurrence_ids_act_on_one_occurrence_only() {
 
     c.delete_event(series, false, false).expect("cleanup: delete the series");
     assert!(list(&c).is_empty());
+}
+
+#[test]
+#[ignore]
+fn move_event_keeps_duration_and_undo_restores_it() {
+    // A far-future personal appointment: nothing is sent.
+    let c = client();
+    let created = c.create_event(CreateEventInput {
+        subject: "outlook-mcp-rs move_events probe".to_string(),
+        start: "2099-04-06T09:00".to_string(),
+        end: "2099-04-06T09:45".to_string(),
+        body: None, location: None, required_attendees: None, optional_attendees: None,
+        all_day: false, reminder_minutes: None, categories: None, show_as: None,
+        send: false, recurrence: None,
+    }).expect("create_event");
+    let id = created["id"].as_str().unwrap().to_string();
+    let moved = c.move_event(EventMove {
+        event_id: id.clone(), start: "2099-04-07T13:00".to_string(), end: None, send_update: true,
+    }).expect("move_event");
+    assert_eq!(moved["previous_start"], "2099-04-06T09:00:00");
+    assert_eq!(moved["previous_end"], "2099-04-06T09:45:00");
+    assert_eq!(moved["end"], "2099-04-07T13:45:00");
+    assert_eq!(moved["notified"], false, "a personal appointment never notifies");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event");
+    assert_eq!(detail.summary.start.as_deref(), Some("2099-04-07T13:00:00"));
+
+    // Undo: move back to the previous times.
+    c.move_event(EventMove {
+        event_id: id.clone(), start: "2099-04-06T09:00".to_string(),
+        end: Some("2099-04-06T09:45".to_string()), send_update: false,
+    }).expect("undo move");
+    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event");
+    assert_eq!(detail.summary.start.as_deref(), Some("2099-04-06T09:00:00"));
+    assert_eq!(detail.summary.end.as_deref(), Some("2099-04-06T09:45:00"));
+    c.delete_event(id, false, false).expect("cleanup");
 }
 
 #[test]

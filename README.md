@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **30 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **31 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 30 tools below become available.
+already running, and the 31 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 30 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 31 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
@@ -130,7 +130,7 @@ The Outlook tools then appear in that client.
 
 ## Available tools
 
-30 MCP tools, grouped by category:
+31 MCP tools, grouped by category:
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
@@ -149,7 +149,8 @@ The Outlook tools then appear in that client.
 - `get_event` — get the full details of one calendar event by id (or `occurrence_id`), or several in one call (same output options as `get_email`, plain-text body only)
 - `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out; `body` or `body_file`
 - `update_event` — change an existing event (subject, times, location, body or `body_file`, attendees, reminder, recurrence…); optionally notify attendees. With an `occurrence_id` it changes just that occurrence and returns its new `occurrence_id`
-- `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative): a whole series, or one occurrence with its `occurrence_id`
+- `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative): a whole series, or one occurrence with its `occurrence_id`; pass a list of ids to answer several invites in one call (per-item results; one failure doesn't stop the rest). `send=false` records the answer without emailing the organizer
+- `move_events` — move several events in one call: `moves: [{event_id, start, end?}]` (up to 100; `end` omitted keeps the duration; series, one-off or occurrence ids). Each result has `previous_start`/`previous_end`, and `undo.moves` is ready to pass back to `move_events` to roll everything back. `send_update` (default true) notifies a meeting's attendees
 - `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); for a meeting you organize, `send_cancellation` (default true) notifies attendees first, independent of `permanent`. A recurring event's `id` names the whole series, so the whole series is deleted; an `occurrence_id` deletes just that occurrence
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
@@ -341,8 +342,8 @@ rather than destroying them. Permanent deletes must always be asked for explicit
 A few tools have real, outbound effects, and these are also explicit in the tool call:
 
 - `send_email` delivers mail, as do `reply_email` (unless `send=false`) and `update_draft` with `send=true`;
-- `respond_to_meeting` notifies an organizer;
-- `create_event`, `update_event` and `delete_event` notify attendees when their send/update/cancellation flag is set.
+- `respond_to_meeting` notifies an organizer (unless `send=false`);
+- `create_event`, `update_event`, `move_events` and `delete_event` notify attendees when their send/update/cancellation flag is set.
 
 `update_draft` edits a draft and only sends it when `send=true` is passed. [`TESTING.md`](TESTING.md) spells out exactly which behaviors are
 covered by automated tests versus verified by hand precisely because they send real mail.

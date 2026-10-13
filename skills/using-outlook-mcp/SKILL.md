@@ -22,6 +22,7 @@ unless they already asked for that exact send in this conversation:
 | `reply_email` | `send` (default true) | `send: false` saves a draft |
 | `create_event` with attendees | `send` (default true) | `send: false` saves unsent |
 | `update_event` on a meeting | `send_update` (default true) | `send_update: false` |
+| `move_events` with meetings | `send_update` (default true) | `send_update: false` |
 | `delete_event` you organize | `send_cancellation` (default true; independent of `permanent`) | `send_cancellation: false` |
 | `respond_to_meeting` | `send` (default true) | `send: false` |
 | `update_draft` | only with `send: true` | omit `send` (default false) |
@@ -114,6 +115,7 @@ permanent delete. Never set `confirm: true` on your own initiative.
   - `get_task` returns one task's body, start/completion dates, percent complete and reminder.
   - `update_task` with `mark_complete` completes or reopens a task.
   - Deleting a task, note or event moves it to Deleted Items, where it can be recovered, unless `permanent: true` (see above).
+  - Batch calendar writes: `respond_to_meeting` takes a list of ids (one `response` for all), and `move_events` moves many events at once. Keep `move_events`' `undo.moves`: passing it back to `move_events` restores every moved event.
   - A recurring event's `id` names the whole series: deleting, answering or editing it affects every occurrence. Use the row's `occurrence_id` to act on one date only. After moving an occurrence, use the new `occurrence_id` that `update_event` returns.
 
 ## Common mistakes

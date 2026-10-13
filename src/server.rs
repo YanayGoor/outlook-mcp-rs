@@ -12,6 +12,7 @@ use crate::error::ToolError;
 use crate::outlook::event_rows;
 use crate::outlook::filters::{self, normalize_choices};
 use crate::outlook::read::{read_options, ReadRequest, ReadTool};
+use crate::outlook::{EventMove, MAX_EVENT_MOVES};
 use crate::outlook::{DEFAULT_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
 use crate::params::OneOrMany;
 use serde_json::{json, Value};
@@ -74,6 +75,32 @@ fn batch_content<T: serde::Serialize>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(CallToolResult::success(vec![json_content(&items)?]))
+}
+
+/// A batch item's result with the id it answers first: `{"id", ...v}`.
+fn merge_id(id: &str, v: Value) -> Value {
+    let mut out = json!({"id": id});
+    if let (Some(o), Value::Object(fields)) = (out.as_object_mut(), v) {
+        for (k, val) in fields {
+            o.entry(k).or_insert(val);
+        }
+    }
+    out
+}
+
+/// `move_events`' result: the per-move results, plus `undo.moves`, the
+/// moves that put each successfully moved event back (by its id after the
+/// move: an occurrence's new occurrence_id).
+fn move_events_result(results: Vec<Value>) -> Value {
+    let undo: Vec<Value> = results
+        .iter()
+        .filter(|r| r.get("error").is_none())
+        .map(|r| json!({
+            "event_id": r.get("occurrence_id").unwrap_or(&r["id"]),
+            "start": r["previous_start"], "end": r["previous_end"],
+        }))
+        .collect();
+    json!({"results": results, "undo": {"moves": undo}})
 }
 
 #[derive(Clone)]
@@ -546,12 +573,38 @@ pub struct CreateEventParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RespondToMeetingParams {
-    pub event_id: String,
+    /// One event id (series id, occurrence_id, or a meeting request's id),
+    /// or a list of ids (alias `event_ids`); a list returns a list in the
+    /// same order, and an id that fails becomes {"id", "error"}.
+    #[serde(alias = "event_ids")]
+    pub event_id: OneOrMany<String>,
+    /// "accept" | "decline" | "tentative", applied to every id.
     pub response: String,
     #[serde(default)]
     pub comment: Option<String>,
     #[serde(default = "default_true")]
     pub send: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EventMoveParams {
+    /// A series id, one-off event id, or occurrence_id from list_events.
+    pub event_id: String,
+    /// New start (any date form, e.g. '2026-10-15T14:00' or 'tomorrow+14h').
+    pub start: String,
+    /// New end; omit to keep the event's duration.
+    #[serde(default)]
+    pub end: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveEventsParams {
+    /// The events to move, in order (at most 100).
+    pub moves: Vec<EventMoveParams>,
+    /// For meetings: notify attendees of the new time (default true).
+    /// false = change your own copy only. Ignored for personal appointments.
+    #[serde(default = "default_true")]
+    pub send_update: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1174,14 +1227,54 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Respond to a meeting invite: accept, decline, or tentative. event_id is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. send=false records the response in your calendar without emailing the organizer.")]
+    #[tool(description = "Respond to one or more meeting invites: accept, decline, or tentative. event_id (one id, or a list: the result is then a list in the same order, and an id that fails becomes {\"id\", \"error\"} without stopping the rest) is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. send=false records the response in your calendar without emailing the organizer.")]
     pub async fn respond_to_meeting(
         &self,
         Parameters(RespondToMeetingParams { event_id, response, comment, send }): Parameters<RespondToMeetingParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (ids, many) = batch_ids(event_id, "event_id")?;
+        if crate::constants::meeting_response_to_id(&response.trim().to_lowercase()).is_none() {
+            return Err(ToolError::new(format!(
+                "Invalid response {response:?}: use 'accept', 'decline' or 'tentative'."
+            )).into());
+        }
         let client = self.client.clone();
-        let result = run_blocking(move || client.respond_to_meeting(event_id, response, comment, send)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        let batch = ids.clone();
+        let results = run_blocking(move || {
+            Ok(batch
+                .into_iter()
+                .map(|id| client.respond_to_meeting(id, response.clone(), comment.clone(), send))
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        batch_content(&ids, many, results, merge_id)
+    }
+
+    #[tool(description = "Move several calendar events in one call. moves: [{event_id, start, end?}] (at most 100); end omitted keeps the event's duration; dates take any date form. event_id may be a series id (moves the whole series), a one-off event's id, or an occurrence_id (moves just that occurrence). send_update (default true) notifies a meeting's attendees; false changes your own copy only. Each event is moved independently: results[i] is {id, occurrence_id (for an occurrence: its NEW id), subject, previous_start, previous_end, start, end, notified} or {event_id, error}, and a failure doesn't stop the rest. undo.moves holds the moves that put every successfully moved event back: pass it to move_events again to roll back.")]
+    pub async fn move_events(
+        &self,
+        Parameters(p): Parameters<MoveEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if p.moves.is_empty() || p.moves.len() > MAX_EVENT_MOVES {
+            return Err(ToolError::new(format!(
+                "moves must list between 1 and {MAX_EVENT_MOVES} events."
+            )).into());
+        }
+        let client = self.client.clone();
+        let send_update = p.send_update;
+        let results = run_blocking(move || {
+            Ok(p.moves
+                .into_iter()
+                .map(|m| {
+                    let event_id = m.event_id.clone();
+                    client
+                        .move_event(EventMove { event_id: m.event_id, start: m.start, end: m.end, send_update })
+                        .unwrap_or_else(|e| json!({"event_id": event_id, "error": e.0}))
+                })
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        Ok(CallToolResult::success(vec![json_content(&move_events_result(results))?]))
     }
 
     #[tool(description = "Update an existing calendar event: subject, start/end, location, body (or body_file: a local UTF-8 text file path), show_as, add/remove categories, add/remove attendees, reminder, all_day, recurrence (set/replace) or clear_recurrence (remove it). Adding an attendee converts a personal appointment into a meeting. A series id (an event's id) edits the whole series; an occurrence_id from list_events edits just that occurrence (recurrence / clear_recurrence need the series id) and the result carries the occurrence's new occurrence_id, since moving it changes its start. send_update (default true) notifies attendees if the event is a meeting.")]

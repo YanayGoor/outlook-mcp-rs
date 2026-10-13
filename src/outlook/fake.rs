@@ -9,7 +9,7 @@ use super::filters::DateRange;
 use super::occurrence;
 use super::{
     require_empty_confirm, deleted_note, delete_occurrence_note, validate_occurrence_update, validate_recurrence_update, CheckAvailabilityInput,
-    CreateEventInput,
+    CreateEventInput, EventMove, moved_times,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate, NewEmail,
     ReplyInput, parse_importance, prepare_html_images, prepare_mail_body, ValidatedInlineImage,
@@ -482,6 +482,36 @@ impl OutlookClient for FakeOutlookClient {
                 "changed": changed}));
         }
         Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
+    }
+
+    /// Every event starts at 2026-06-10 09:00 and lasts 30 minutes (an
+    /// occurrence at its id's start), so results are predictable.
+    fn move_event(&self, m: EventMove) -> Result<Value, ToolError> {
+        let parsed = parse_event_id(&m.event_id)?;
+        if m.event_id == MISSING_ID {
+            return Err(not_found(&m.event_id));
+        }
+        let parse = |s: &str, f: &str| super::dates::parse_date_param(s, f, FAKE_WEEK_START).map(|d| d.at);
+        let new_start = parse(&m.start, "start")?;
+        let new_end = m.end.as_deref().map(|e| parse(e, "end")).transpose()?;
+        self.record("move_events", json!({
+            "event_id": m.event_id, "start": m.start, "end": m.end, "send_update": m.send_update,
+        }))?;
+        let prev_start = parsed.occurrence_start.unwrap_or_else(|| {
+            chrono::NaiveDateTime::parse_from_str("2026-06-10T09:00:00", "%Y-%m-%dT%H:%M:%S").unwrap()
+        });
+        let prev_end = prev_start + chrono::Duration::minutes(30);
+        let (start, end) = moved_times(prev_start, prev_end, new_start, new_end)?;
+        let fmt = occurrence::format_start;
+        let mut out = json!({
+            "id": parsed.series_id(), "subject": self.t("Standup"),
+            "previous_start": fmt(&prev_start), "previous_end": fmt(&prev_end),
+            "start": fmt(&start), "end": fmt(&end), "notified": false,
+        });
+        if parsed.is_occurrence() {
+            out["occurrence_id"] = json!(occurrence::occurrence_id_at(&parsed.series_id(), &start));
+        }
+        Ok(out)
     }
 
     fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)

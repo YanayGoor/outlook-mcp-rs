@@ -157,6 +157,13 @@ far-future daily series of personal appointments (nothing is sent), reads,
 moves and deletes single occurrences, and deletes the series:
 `cargo test --test live_outlook -- --ignored occurrence_ids_act_on_one_occurrence_only`.
 
+`move_events` (issue #46) is covered by a live test that moves a far-future
+personal appointment, checks the kept duration, and moves it back:
+`cargo test --test live_outlook -- --ignored move_event_keeps_duration_and_undo_restores_it`.
+Batch `respond_to_meeting` reuses the single-response client path once per
+id, so it has no separate live test (a live response would notify a real
+organizer).
+
 `check_availability`'s single-mailbox path (resolving your own address and
 reading its free/busy slots, plus the graceful-failure path for an address
 that can't provide free/busy data) is covered by the live suite:
