@@ -34,17 +34,21 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - Recurring meetings: every occurrence has an `occurrence_id`; `get_event`, `respond_to_meeting`, `update_event` and `delete_event` act on just that occurrence with it ([#50](https://github.com/adamkopelman/outlook-mcp-rs/pull/50)).
 - Batch writes: every `update_*` / `delete_*` tool and `respond_to_meeting` take a list of ids (the same change to each); `update_*` tools also take `updates: [...]` (a different change per item); per-item results and errors ([#51](https://github.com/adamkopelman/outlook-mcp-rs/pull/51)).
 - Every `update_*` result has `undo`, the update that reverts it (pass a batch's `undo` objects as `updates` to roll it back), and `not_undoable` for what it can't revert ([#51](https://github.com/adamkopelman/outlook-mcp-rs/pull/51)).
+- `require_no_attendees` on `create_event`, `update_event` and `delete_event`: the server refuses, changing nothing, to touch a meeting with attendees or add any ([#53](https://github.com/adamkopelman/outlook-mcp-rs/pull/53)).
+- MCP safety hints (read-only, destructive, open-world) on every tool, and a calendar-autopilot Claude Code hook (`hooks/calendar_autopilot.py`) that auto-approves reads, silent meeting responses and guarded event changes and asks for everything else ([#53](https://github.com/adamkopelman/outlook-mcp-rs/pull/53)).
 
 ### Changed
 
 - HTTP mode answers a request body over 64 MiB with `413` and a compressed body with `415`, instead of a generic error ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
 - A multi-word unquoted `query` matches all words in any order; a bare date in `*_before` includes that whole day; tasks and notes page at 500 ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
+- The calendar tools share one notify flag, `notify`, on `create_event`, `respond_to_meeting`, `update_event` and `delete_event` ([#53](https://github.com/adamkopelman/outlook-mcp-rs/pull/53)).
 
 ### Deprecated
 
 - `send_email` / `create_draft` `html: bool` (use `html_body`), and `update_draft`'s `draft_id` (use `email_id`) ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
 - `get_email` `prefer_html` (use `body_format: "html"`) ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
 - `list_emails` `since_days`, `flagged`, `high_importance`, and `list_events` `start_date` / `end_date` ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
+- `send` on `create_event` / `respond_to_meeting`, `send_update` on `update_event`, `send_cancellation` on `delete_event` (use `notify`) ([#53](https://github.com/adamkopelman/outlook-mcp-rs/pull/53)).
 
 ### Fixed
 

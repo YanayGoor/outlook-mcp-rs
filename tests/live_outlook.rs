@@ -210,7 +210,7 @@ fn permanent_delete_event_skips_deleted_items() {
             created["id"].as_str().unwrap().to_string()
         },
         // Personal appointment: send_cancellation has nothing to cancel.
-        |id, permanent| c.delete_event(id, true, permanent).expect("delete_event should succeed"),
+        |id, permanent| c.delete_event(id, true, permanent, false).expect("delete_event should succeed"),
     );
 }
 
@@ -234,7 +234,7 @@ fn permanent_delete_of_unsent_meeting_cancels_quietly_then_skips_deleted_items()
     }).expect("create_event should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let deleted = c.delete_event(id.clone(), false, true).expect("delete_event should succeed");
+    let deleted = c.delete_event(id.clone(), false, true, false).expect("delete_event should succeed");
     assert_eq!(deleted["permanent"], true);
     assert_eq!(
         deleted["note"],
@@ -294,7 +294,7 @@ fn create_event_then_delete_it() {
     }).expect("create_event should succeed");
     let id = created["id"].as_str().unwrap().to_string();
     let _ = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event should round-trip before cleanup");
-    c.delete_event(id, true, false).expect("cleanup delete_event");
+    c.delete_event(id, true, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -326,7 +326,7 @@ fn create_event_with_tiers_categories_and_show_as() {
     assert!(detail.summary.categories.iter().any(|cat| cat == "Work"));
     assert_eq!(detail.summary.show_as, "tentative");
     assert!(detail.summary.is_meeting);
-    c.delete_event(id, false, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -362,7 +362,7 @@ fn update_event_edits_fields_and_manages_attendees() {
         remove_attendees: Some(vec!["required-probe@example.com".to_string()]),
         send_update: false,
         recurrence: None,
-        clear_recurrence: false,
+        clear_recurrence: false, require_no_attendees: false,
     }).expect("update_event should succeed");
     assert_eq!(updated["status"], "updated");
     let changed = updated["changed"].as_array().unwrap();
@@ -379,7 +379,7 @@ fn update_event_edits_fields_and_manages_attendees() {
     assert!(!detail.summary.required_attendees.contains("required-probe@example.com"));
     assert!(detail.summary.optional_attendees.contains("optional-probe@example.com"));
 
-    c.delete_event(id, false, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn delete_event_removes_a_personal_appointment() {
     }).expect("create_event should succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
-    let deleted = c.delete_event(id.clone(), true, false).expect("delete_event should succeed");
+    let deleted = c.delete_event(id.clone(), true, false, false).expect("delete_event should succeed");
     assert_eq!(deleted["status"], "deleted");
     assert_eq!(deleted["note"], "Moved to Deleted Items.");
 
@@ -1147,7 +1147,7 @@ fn create_event_weekly_recurrence_round_trips() {
     assert_eq!(recurrence.occurrences, Some(10));
     assert!(!recurrence.no_end);
 
-    c.delete_event(id, false, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false, false).expect("cleanup delete_event");
 }
 
 /// An `EventUpdate` for `event_id` that changes nothing and notifies nobody.
@@ -1156,7 +1156,7 @@ fn no_op_event_update(event_id: &str) -> EventUpdate {
         event_id: event_id.to_string(), subject: None, start: None, end: None, location: None,
         body: None, all_day: None, reminder_minutes: None, show_as: None, add_categories: None,
         remove_categories: None, add_required_attendees: None, add_optional_attendees: None,
-        remove_attendees: None, send_update: false, recurrence: None, clear_recurrence: false,
+        remove_attendees: None, send_update: false, recurrence: None, clear_recurrence: false, require_no_attendees: false,
     }
 }
 
@@ -1219,11 +1219,11 @@ fn occurrence_ids_act_on_one_occurrence_only() {
 
     // Deleting one occurrence leaves the other four.
     let second = after[1].occurrence_id.clone().unwrap();
-    let deleted = c.delete_event(second, false, false).expect("delete one occurrence");
+    let deleted = c.delete_event(second, false, false, false).expect("delete one occurrence");
     assert_eq!(deleted["occurrence"], true);
     assert_eq!(list(&c).len(), 4);
 
-    c.delete_event(series, false, false).expect("cleanup: delete the series");
+    c.delete_event(series, false, false, false).expect("cleanup: delete the series");
     assert!(list(&c).is_empty());
 }
 
@@ -1277,7 +1277,7 @@ fn update_event_undo_restores_the_previous_values() {
     assert_eq!(detail.summary.location, "Room A");
     assert_eq!(detail.summary.show_as, "busy");
     assert_eq!(detail.summary.categories, vec!["Blue".to_string()]);
-    c.delete_event(id, false, false).expect("cleanup");
+    c.delete_event(id, false, false, false).expect("cleanup");
 }
 
 #[test]
@@ -1316,7 +1316,7 @@ fn create_event_monthly_recurrence_with_until_round_trips() {
     // here rather than asserted absent.
     assert_eq!(recurrence.occurrences, Some(6));
 
-    c.delete_event(id, false, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -1350,7 +1350,7 @@ fn create_event_yearly_recurrence_with_no_end_round_trips() {
     assert!(recurrence.until.is_none());
     assert!(recurrence.occurrences.is_none());
 
-    c.delete_event(id, false, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false, false).expect("cleanup delete_event");
 }
 
 #[test]
@@ -1384,7 +1384,7 @@ fn update_event_changes_then_clears_recurrence() {
             days_of_week: Some(vec!["tuesday".to_string()]),
             day_of_month: None, until: None, occurrences: Some(4),
         }),
-        clear_recurrence: false,
+        clear_recurrence: false, require_no_attendees: false,
     }).expect("update_event with recurrence should succeed");
     assert!(updated["changed"].as_array().unwrap().iter().any(|v| v == "recurrence"));
 
@@ -1402,7 +1402,7 @@ fn update_event_changes_then_clears_recurrence() {
         add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
         send_update: false,
         recurrence: None,
-        clear_recurrence: true,
+        clear_recurrence: true, require_no_attendees: false,
     }).expect("update_event with clear_recurrence should succeed");
     assert!(cleared["changed"].as_array().unwrap().iter().any(|v| v == "clear_recurrence"));
 
@@ -1410,7 +1410,7 @@ fn update_event_changes_then_clears_recurrence() {
     assert!(!detail.summary.is_recurring);
     assert!(detail.recurrence.is_none());
 
-    c.delete_event(id, false, false).expect("cleanup delete_event");
+    c.delete_event(id, false, false, false).expect("cleanup delete_event");
 }
 
 #[test]

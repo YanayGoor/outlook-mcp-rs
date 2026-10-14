@@ -179,3 +179,11 @@ check, since Outlook must actually have published free/busy for that
 account, which can't be arranged from an automated test. To verify by hand,
 call `check_availability` with a colleague's email address in `people` and
 confirm their slots reflect their real calendar.
+
+The calendar safety features (issue #48) are covered by the fake-based tool
+tests: `require_no_attendees` on `create_event`, `update_event` (including
+inside an `updates` batch, whose undo keeps it) and `delete_event`; the
+shared `notify` flag and its old names; and the MCP safety hints of every
+tool. The `calendar_autopilot` Claude Code hook has its own tests (Python 3,
+standard library only), which also check its tables against the tools' MCP
+hints: `python -m unittest discover hooks`.

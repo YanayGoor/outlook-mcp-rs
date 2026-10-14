@@ -36,7 +36,7 @@ use crate::outlook::{
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
     CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
     deleted_note, delete_event_note, delete_occurrence_note, meeting_is_canceled,
-    validate_occurrence_update,
+    validate_occurrence_update, check_no_attendees, update_adds_attendees,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
     validate_draft_update, DraftUpdate, InlineImageSource, ValidatedInlineImage, MailBody,
@@ -2364,9 +2364,16 @@ impl OutlookClient for WindowsOutlookClient {
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError> {
         let parsed = occurrence::parse_event_id(&u.event_id)?;
         validate_occurrence_update(parsed.is_occurrence(), &u)?;
+        check_no_attendees(u.require_no_attendees, false, update_adds_attendees(&u), "")?;
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             let (item, parsed) = open_event(&ns, &u.event_id)?;
+            if u.require_no_attendees {
+                let status = variant_to_i32(&get_property(&item, "MeetingStatus")?)
+                    .unwrap_or(c::OL_NONMEETING);
+                let subject = variant_to_string(&get_property(&item, "Subject")?);
+                check_no_attendees(true, status != c::OL_NONMEETING, false, &subject)?;
+            }
             let mut changed: Vec<&str> = Vec::new();
             let mut undo = Undo::new();
             let old_str = |prop: &str| -> Result<String, ToolError> {
@@ -2508,13 +2515,19 @@ impl OutlookClient for WindowsOutlookClient {
             let ids = event_ids_after(&item, &parsed)?;
             // The undo addresses the occurrence (or event) by its id now.
             let undo_id = ids.get("occurrence_id").unwrap_or(&ids["id"]).as_str().unwrap_or_default().to_string();
-            let undo = undo.finish("event_id", &undo_id, &[("send_update", json!(u.send_update))]);
+            // The undo is applied the way the update was: as quietly, and
+            // under the same guard.
+            let mut keep = vec![("notify", json!(u.send_update))];
+            if u.require_no_attendees {
+                keep.push(("require_no_attendees", json!(true)));
+            }
+            let undo = undo.finish("event_id", &undo_id, &keep);
             Ok(undo::merged(with_ids(ids, json!({"status": "updated", "changed": changed})), undo))
         })
     }
 
-    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
-        -> Result<Value, ToolError> {
+    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool,
+        require_no_attendees: bool) -> Result<Value, ToolError> {
         self.with_com(|| {
             let (_app, ns) = mapi()?;
             // A series id (`id` from list_events) deletes the whole series,
@@ -2523,6 +2536,7 @@ impl OutlookClient for WindowsOutlookClient {
             let subject = variant_to_string(&get_property(&item, "Subject")?);
             let meeting_status =
                 variant_to_i32(&get_property(&item, "MeetingStatus")?).unwrap_or(c::OL_NONMEETING);
+            check_no_attendees(require_no_attendees, meeting_status != c::OL_NONMEETING, false, &subject)?;
             let organized_meeting = meeting_status == c::OL_MEETING;
             if organized_meeting {
                 // You organize this meeting: mark it canceled and optionally

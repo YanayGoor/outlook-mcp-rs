@@ -372,6 +372,9 @@ pub struct EventUpdate {
     pub send_update: bool,
     pub recurrence: Option<RecurrenceInput>,
     pub clear_recurrence: bool,
+    /// Refuse if the event is a meeting, and refuse to add attendees (see
+    /// [`check_no_attendees`]).
+    pub require_no_attendees: bool,
 }
 
 /// One recurrence pattern for `create_event`/`update_event`. `pattern`
@@ -415,7 +418,8 @@ pub trait OutlookClient: Send + Sync {
     fn respond_to_meeting(&self, event_id: String, response: String,
         comment: Option<String>, send: bool) -> Result<Value, ToolError>;
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError>;
-    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
+    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool,
+        require_no_attendees: bool)
         -> Result<Value, ToolError>;
     fn check_availability(&self, input: CheckAvailabilityInput) -> Result<AvailabilityResult, ToolError>;
 
@@ -523,6 +527,36 @@ pub fn validate_occurrence_update(is_occurrence: bool, u: &EventUpdate) -> Resul
         ));
     }
     Ok(())
+}
+
+/// The `require_no_attendees` guard of the event-writing tools (issue #48):
+/// with it set, only a personal appointment (not a meeting) may be created,
+/// changed or deleted, so a caller (or a permission hook) can let such
+/// calls through knowing no attendee is affected. `is_meeting` is the
+/// event's current state; `adds_attendees` whether the call would add any.
+pub fn check_no_attendees(require: bool, is_meeting: bool, adds_attendees: bool, subject: &str)
+    -> Result<(), ToolError> {
+    if !require {
+        return Ok(());
+    }
+    if adds_attendees {
+        return Err(ToolError::new(
+            "require_no_attendees is set, but this call adds attendees (it would invite people).",
+        ));
+    }
+    if is_meeting {
+        return Err(ToolError::new(format!(
+            "require_no_attendees is set, but {subject:?} is a meeting with attendees: \
+             nothing was changed. Call again without require_no_attendees to change it."
+        )));
+    }
+    Ok(())
+}
+
+/// Whether an update adds any attendee.
+pub fn update_adds_attendees(u: &EventUpdate) -> bool {
+    u.add_required_attendees.as_ref().is_some_and(|v| !v.is_empty())
+        || u.add_optional_attendees.as_ref().is_some_and(|v| !v.is_empty())
 }
 
 /// The status string `create_event` returns: `"meeting_sent"` (attendees +
@@ -1430,9 +1464,20 @@ mod tests {
         parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
         EventUpdate, RecurrenceInput, permanent_delete_needs_move, require_empty_confirm,
         deleted_note, delete_event_note, delete_occurrence_note, validate_occurrence_update,
+        check_no_attendees,
         draft_update_changes, validate_draft_update, DraftUpdate, InlineImage, merge_categories,
         parse_importance,
     };
+
+    #[test]
+    fn no_attendees_guard_only_lets_personal_appointments_through() {
+        assert!(check_no_attendees(false, true, true, "x").is_ok());
+        assert!(check_no_attendees(true, false, false, "x").is_ok());
+        let e = check_no_attendees(true, true, false, "Standup").unwrap_err().to_string();
+        assert!(e.contains("\"Standup\" is a meeting") && e.contains("nothing was changed"), "{e}");
+        let e = check_no_attendees(true, false, true, "x").unwrap_err().to_string();
+        assert!(e.contains("adds attendees"), "{e}");
+    }
 
     #[test]
     fn occurrence_delete_note_says_only_that_date_went() {
@@ -1447,7 +1492,7 @@ mod tests {
             start: None, end: None, location: None, body: None, all_day: None,
             reminder_minutes: None, show_as: None, add_categories: None, remove_categories: None,
             add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
-            send_update: true, recurrence: None, clear_recurrence: false };
+            send_update: true, recurrence: None, clear_recurrence: false, require_no_attendees: false };
         assert!(validate_occurrence_update(true, &u).is_ok());
         u.clear_recurrence = true;
         assert!(validate_occurrence_update(false, &u).is_ok());
@@ -1660,7 +1705,7 @@ mod tests {
             add_categories: None, remove_categories: None,
             add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
             send_update: false,
-            recurrence: None, clear_recurrence: false,
+            recurrence: None, clear_recurrence: false, require_no_attendees: false,
         }
     }
 

@@ -20,13 +20,24 @@ unless they already asked for that exact send in this conversation:
 |---|---|---|
 | `send_email` | always | `create_draft` |
 | `reply_email` | `send` (default true) | `send: false` saves a draft |
-| `create_event` with attendees | `send` (default true) | `send: false` saves unsent |
-| `update_event` on a meeting | `send_update` (default true) | `send_update: false` |
-| `delete_event` you organize | `send_cancellation` (default true; independent of `permanent`) | `send_cancellation: false` |
-| `respond_to_meeting` | `send` (default true) | `send: false` |
+| `create_event` with attendees | `notify` (default true) | `notify: false` saves unsent |
+| `update_event` on a meeting | `notify` (default true) | `notify: false` |
+| `delete_event` you organize | `notify` (default true; independent of `permanent`) | `notify: false` |
+| `respond_to_meeting` | `notify` (default true) | `notify: false` |
 | `update_draft` | only with `send: true` | omit `send` (default false) |
 
+The calendar tools call this flag `notify`; the mail tools' `send` means "send rather than save a draft". The old calendar names (`send`, `send_update`, `send_cancellation`) still work.
+
 When the user's intent is ambiguous ("write to Dana about…"), make a draft and say so.
+
+**Calendar autopilot.** The user may have the `calendar_autopilot` hook installed (README, "Calendar autopilot"). Then some calls run without a prompt:
+- reads;
+- `respond_to_meeting` with `notify: false`;
+- `update_event` with `require_no_attendees: true` (on every entry of `updates`).
+
+Everything else prompts them. Phrase calls so the routine part can run unattended:
+- Answer invites silently (`notify: false`) unless the user wants the organizer to get the response.
+- When changing the user's own appointments, pass `require_no_attendees: true`. If the server refuses an event because it is a meeting, collect those and change them in one separate call without the flag. The user then approves that call.
 To revise a draft before it goes out, use `update_draft`. It saves the draft and sends it only
 with `send: true`, which needs the same go-ahead as `send_email`.
 

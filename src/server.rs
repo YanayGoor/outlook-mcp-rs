@@ -15,6 +15,7 @@ use crate::outlook::read::{read_options, ReadRequest, ReadTool};
 use crate::outlook::{DEFAULT_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
 use crate::params::OneOrMany;
 use serde_json::{json, Value};
+use crate::outlook::check_no_attendees;
 use crate::outlook::{CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 use crate::outlook::{require_mail_body, resolve_mail_body, resolve_text_input, BodyInputs, MailBody, NewEmail, ReplyInput};
 
@@ -727,9 +728,15 @@ pub struct CreateEventParams {
     /// "free" | "tentative" | "busy" | "out_of_office" | "working_elsewhere".
     #[serde(default)]
     pub show_as: Option<String>,
-    /// If false, a meeting with attendees is saved (not sent) for later review.
-    #[serde(default = "default_true")]
-    pub send: bool,
+    /// Send the invitations (default true). false = a meeting with attendees
+    /// is saved, not sent, for later review. `send` is a deprecated alias.
+    #[serde(default = "default_true", alias = "send")]
+    pub notify: bool,
+    /// Refuse (changing nothing) if the event is a meeting with attendees (any attendee given):
+    /// only personal appointments are touched, so the call can never affect
+    /// anyone else. Default false.
+    #[serde(default)]
+    pub require_no_attendees: bool,
     /// Repeat this event daily/weekly/monthly/yearly. Omit for a one-off event.
     #[serde(default)]
     pub recurrence: Option<RecurrenceParams>,
@@ -746,8 +753,10 @@ pub struct RespondToMeetingParams {
     pub response: String,
     #[serde(default)]
     pub comment: Option<String>,
-    #[serde(default = "default_true")]
-    pub send: bool,
+    /// Email the response to the organizer (default true). false = record it
+    /// in your calendar only. `send` is a deprecated alias.
+    #[serde(default = "default_true", alias = "send")]
+    pub notify: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -794,8 +803,14 @@ pub struct UpdateEventParams {
     pub remove_attendees: Option<Vec<String>>,
     /// If the event is a meeting, notify attendees of these changes (default true).
     /// false = apply quietly to your own copy only. Ignored for non-meetings.
-    #[serde(default = "default_true")]
-    pub send_update: bool,
+    /// `send_update` is a deprecated alias.
+    #[serde(default = "default_true", alias = "send_update")]
+    pub notify: bool,
+    /// Refuse (changing nothing) if the event is a meeting with attendees, or if this update adds attendees:
+    /// only personal appointments are touched, so the call can never affect
+    /// anyone else. Default false.
+    #[serde(default)]
+    pub require_no_attendees: bool,
     /// Set or replace the event's recurrence pattern (whole series, not one
     /// occurrence). Mutually exclusive with `clear_recurrence`.
     #[serde(default)]
@@ -819,8 +834,14 @@ pub struct DeleteEventParams {
     pub event_id: OneOrMany<String>,
     /// If you organize the meeting, notify attendees of the cancellation (default true).
     /// Independent of `permanent`: the cancellation is sent before the delete.
-    #[serde(default = "default_true")]
-    pub send_cancellation: bool,
+    /// `send_cancellation` is a deprecated alias.
+    #[serde(default = "default_true", alias = "send_cancellation")]
+    pub notify: bool,
+    /// Refuse (changing nothing) if the event is a meeting with attendees:
+    /// only personal appointments are touched, so the call can never affect
+    /// anyone else. Default false.
+    #[serde(default)]
+    pub require_no_attendees: bool,
     /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
     /// moves the event to Deleted Items.
     #[serde(default)]
@@ -1187,7 +1208,7 @@ pub fn email_query(p: ListEmailsParams) -> Result<EmailQuery, ToolError> {
 
 #[tool_router]
 impl OutlookMcpServer {
-    #[tool(description = "List Outlook mail folders (name, path, item counts). fields picks the fields of each row (name, path, items, unread); compact=true returns path and unread. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    #[tool(description = "List Outlook mail folders (name, path, item counts). fields picks the fields of each row (name, path, items, unread); compact=true returns path and unread. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn list_folders(
         &self,
         Parameters(p): Parameters<ListFoldersParams>,
@@ -1198,7 +1219,7 @@ impl OutlookMcpServer {
         out.content(&result)
     }
 
-    #[tool(description = "Find emails in a folder (newest first). Filters (all optional, ANDed): query; from / to / category (one value or a list, matching any); item_type (as get_email reports it, e.g. [\"email\"] to skip meeting invites and bounces); importance; flag (follow_up/complete/clear, as in update_email); unread_only; has_attachments; received_after / received_before. `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). query syntax (shared by all list_* tools): space-separated terms that must all match, case-insensitive, any language; \"quoted phrase\" keeps words together; * is a wildcard (status*report); field:term limits a term to subject, from, to or body. Dates accept ISO ('2026-06-10'), keywords ('today', 'start_of_week') or offsets ('-14d'). Paging: count (default 10, max 200) and offset; to page, call again with offset += count until fewer than count results come back. Deprecated: since_days (use received_after: \"-14d\"), flagged (use flag), high_importance (use importance). fields picks the fields of each row (id, subject, sender, sender_email, to, received, unread, has_attachments, categories); compact=true returns id, subject, sender, received, unread, has_attachments. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    #[tool(description = "Find emails in a folder (newest first). Filters (all optional, ANDed): query; from / to / category (one value or a list, matching any); item_type (as get_email reports it, e.g. [\"email\"] to skip meeting invites and bounces); importance; flag (follow_up/complete/clear, as in update_email); unread_only; has_attachments; received_after / received_before. `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). query syntax (shared by all list_* tools): space-separated terms that must all match, case-insensitive, any language; \"quoted phrase\" keeps words together; * is a wildcard (status*report); field:term limits a term to subject, from, to or body. Dates accept ISO ('2026-06-10'), keywords ('today', 'start_of_week') or offsets ('-14d'). Paging: count (default 10, max 200) and offset; to page, call again with offset += count until fewer than count results come back. Deprecated: since_days (use received_after: \"-14d\"), flagged (use flag), high_importance (use importance). fields picks the fields of each row (id, subject, sender, sender_email, to, received, unread, has_attachments, categories); compact=true returns id, subject, sender, received, unread, has_attachments. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn list_emails(
         &self,
         Parameters(mut p): Parameters<ListEmailsParams>,
@@ -1210,7 +1231,7 @@ impl OutlookMcpServer {
         out.content(&result)
     }
 
-    #[tool(description = "Get one email by id, or several (email_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"} instead of failing the call). Returns the headers, item_type, is_meeting, plus the optional fields picked by `include` (any of \"body\", \"html_body\", \"attachments\" (file names), \"meeting\"; default [\"body\", \"attachments\", \"meeting\"]; [] = metadata only). body_format \"html\" (the deprecated prefer_html=true) also returns html_body. Each returned body reports *_truncated and *_length (full original length in characters): body_truncated/body_length, html_truncated/html_length. Inline bodies are cut at max_body_chars characters (default 100,000; allowed 1,000-5,000,000); if a *_truncated flag is true the cut may fall mid-tag or mid-image-data: call again with max_body_chars of at least the reported length, or use output_dir. output_dir writes each body in full to a file in that directory (created if missing) and returns body_file / html_body_file (absolute paths) instead of the text; re-reading the same email overwrites the same files. resolve_inline_images=true (implies html_body) replaces every cid: reference in html_body with the referenced attachment's base64 data: URI so the HTML is self-contained; Content-ID matching is case-insensitive, references with no matching attachment, or whose image is over 10 MB or unreadable, are left as cid: and listed in inline_images_unresolved (inline_images_resolved counts the replaced ones). Resolved HTML is usually large: combine it with output_dir.")]
+    #[tool(description = "Get one email by id, or several (email_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"} instead of failing the call). Returns the headers, item_type, is_meeting, plus the optional fields picked by `include` (any of \"body\", \"html_body\", \"attachments\" (file names), \"meeting\"; default [\"body\", \"attachments\", \"meeting\"]; [] = metadata only). body_format \"html\" (the deprecated prefer_html=true) also returns html_body. Each returned body reports *_truncated and *_length (full original length in characters): body_truncated/body_length, html_truncated/html_length. Inline bodies are cut at max_body_chars characters (default 100,000; allowed 1,000-5,000,000); if a *_truncated flag is true the cut may fall mid-tag or mid-image-data: call again with max_body_chars of at least the reported length, or use output_dir. output_dir writes each body in full to a file in that directory (created if missing) and returns body_file / html_body_file (absolute paths) instead of the text; re-reading the same email overwrites the same files. resolve_inline_images=true (implies html_body) replaces every cid: reference in html_body with the referenced attachment's base64 data: URI so the HTML is self-contained; Content-ID matching is case-insensitive, references with no matching attachment, or whose image is over 10 MB or unreadable, are left as cid: and listed in inline_images_unresolved (inline_images_resolved counts the replaced ones). Resolved HTML is usually large: combine it with output_dir.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn get_email(
         &self,
         Parameters(p): Parameters<GetEmailParams>,
@@ -1227,7 +1248,7 @@ impl OutlookMcpServer {
         batch_content(&ids, many, results, |_, v| v)
     }
 
-    #[tool(description = "Send a new email immediately. Give the body as exactly one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies). `html` is a deprecated flag: html=true makes body/body_file HTML. `attachments` is a list of local file paths. Images can be embedded two ways, both sent as hidden Content-ID attachments: `data:` image URIs inside the HTML (e.g. <img src=\"data:image/png;base64,...\">) are converted automatically, and `inline_images` takes images (a local path or base64 data) you reference as <img src=\"cid:CONTENT_ID\">. `categories` and `importance` (low/normal/high) are optional. Everything is validated before anything is sent.")]
+    #[tool(description = "Send a new email immediately. Give the body as exactly one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies). `html` is a deprecated flag: html=true makes body/body_file HTML. `attachments` is a list of local file paths. Images can be embedded two ways, both sent as hidden Content-ID attachments: `data:` image URIs inside the HTML (e.g. <img src=\"data:image/png;base64,...\">) are converted automatically, and `inline_images` takes images (a local path or base64 data) you reference as <img src=\"cid:CONTENT_ID\">. `categories` and `importance` (low/normal/high) are optional. Everything is validated before anything is sent.", annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true))]
     pub async fn send_email(
         &self,
         Parameters(p): Parameters<SendEmailParams>,
@@ -1247,7 +1268,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Create (but don't send) a draft email. Give the body as exactly one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies). `html` is a deprecated flag: html=true makes body/body_file HTML. `attachments` is a list of local file paths. Images can be embedded two ways, both saved as hidden Content-ID attachments: `data:` image URIs inside the HTML (e.g. <img src=\"data:image/png;base64,...\">) are converted automatically, and `inline_images` takes images (a local path or base64 data) you reference as <img src=\"cid:CONTENT_ID\">. `categories` and `importance` (low/normal/high) are optional. Everything is validated before the draft is created. Edit or send it later with update_draft.")]
+    #[tool(description = "Create (but don't send) a draft email. Give the body as exactly one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies). `html` is a deprecated flag: html=true makes body/body_file HTML. `attachments` is a list of local file paths. Images can be embedded two ways, both saved as hidden Content-ID attachments: `data:` image URIs inside the HTML (e.g. <img src=\"data:image/png;base64,...\">) are converted automatically, and `inline_images` takes images (a local path or base64 data) you reference as <img src=\"cid:CONTENT_ID\">. `categories` and `importance` (low/normal/high) are optional. Everything is validated before the draft is created. Edit or send it later with update_draft.", annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false))]
     pub async fn create_draft(
         &self,
         Parameters(p): Parameters<CreateDraftParams>,
@@ -1267,7 +1288,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Reply to an email, optionally to all recipients (reply_all), and send it (default) or save it as a draft (send=false). Give the reply text as exactly one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths); it goes above the quoted original. `html` is a deprecated flag: html=true makes body/body_file HTML. `data:` image URIs in an HTML reply become hidden Content-ID attachments, and `inline_images` adds images referenced as <img src=\"cid:CONTENT_ID\">. Optional `attachments` (local file paths), `categories` and `importance` (low/normal/high). Everything is validated before the reply is created.")]
+    #[tool(description = "Reply to an email, optionally to all recipients (reply_all), and send it (default) or save it as a draft (send=false). Give the reply text as exactly one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths); it goes above the quoted original. `html` is a deprecated flag: html=true makes body/body_file HTML. `data:` image URIs in an HTML reply become hidden Content-ID attachments, and `inline_images` adds images referenced as <img src=\"cid:CONTENT_ID\">. Optional `attachments` (local file paths), `categories` and `importance` (low/normal/high). Everything is validated before the reply is created.", annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true))]
     pub async fn reply_email(
         &self,
         Parameters(p): Parameters<ReplyEmailParams>,
@@ -1287,7 +1308,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Update an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, or set importance. Combine any of these in one call. Several items in one call: email_id as a list applies the same changes to each, or updates: [{email_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_email call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
+    #[tool(description = "Update an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, or set importance. Combine any of these in one call. Several items in one call: email_id as a list applies the same changes to each, or updates: [{email_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_email call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false))]
     pub async fn update_email(
         &self,
         Parameters(p): Parameters<UpdateEmailParams>,
@@ -1301,7 +1322,7 @@ impl OutlookMcpServer {
         })).await
     }
 
-    #[tool(description = "Edit an existing unsent draft (e.g. one from create_draft or reply_email with send=false) by `email_id` (`draft_id` is a deprecated alias), save it, and optionally send it (send=true; default false). Only the fields you pass change: subject; the body, as at most one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies), replaces the current body; to/cc/bcc replace that recipient line entirely (an empty list clears it); attachments are local file paths appended to the existing ones; add_categories/remove_categories; importance (low/normal/high). `data:` image URIs in a new HTML body become hidden Content-ID attachments, and `inline_images` (needs an HTML body) adds images referenced as <img src=\"cid:CONTENT_ID\">. send=true alone sends the draft as is. Sent or received emails are rejected. Returns the draft id and the list of changed fields (status \"draft_updated\"), or status \"sent\" when sent. Several items in one call: email_id as a list applies the same changes to each, or updates: [{email_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_draft call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
+    #[tool(description = "Edit an existing unsent draft (e.g. one from create_draft or reply_email with send=false) by `email_id` (`draft_id` is a deprecated alias), save it, and optionally send it (send=true; default false). Only the fields you pass change: subject; the body, as at most one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies), replaces the current body; to/cc/bcc replace that recipient line entirely (an empty list clears it); attachments are local file paths appended to the existing ones; add_categories/remove_categories; importance (low/normal/high). `data:` image URIs in a new HTML body become hidden Content-ID attachments, and `inline_images` (needs an HTML body) adds images referenced as <img src=\"cid:CONTENT_ID\">. send=true alone sends the draft as is. Sent or received emails are rejected. Returns the draft id and the list of changed fields (status \"draft_updated\"), or status \"sent\" when sent. Several items in one call: email_id as a list applies the same changes to each, or updates: [{email_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_draft call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = true))]
     pub async fn update_draft(
         &self,
         Parameters(p): Parameters<UpdateDraftParams>,
@@ -1328,7 +1349,7 @@ impl OutlookMcpServer {
         }).await
     }
 
-    #[tool(description = "Delete an email. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass email_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
+    #[tool(description = "Delete an email. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass email_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false))]
     pub async fn delete_email(
         &self,
         Parameters(p): Parameters<DeleteEmailParams>,
@@ -1338,7 +1359,7 @@ impl OutlookMcpServer {
         run_writes(items, many, move |id, p| client.delete_email(id, p.permanent)).await
     }
 
-    #[tool(description = "Permanently delete EVERYTHING in the default mailbox's Deleted Items folder (items and subfolders). IRREVERSIBLE: refuses unless confirm=true; only pass confirm=true when the user has explicitly asked to empty Deleted Items. Returns counts of items and folders deleted and failures. On Exchange/Microsoft 365 with retention, items may still be held in Recoverable Items per server policy.")]
+    #[tool(description = "Permanently delete EVERYTHING in the default mailbox's Deleted Items folder (items and subfolders). IRREVERSIBLE: refuses unless confirm=true; only pass confirm=true when the user has explicitly asked to empty Deleted Items. Returns counts of items and folders deleted and failures. On Exchange/Microsoft 365 with retention, items may still be held in Recoverable Items per server policy.", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false))]
     pub async fn empty_deleted_items(
         &self,
         Parameters(EmptyDeletedItemsParams { confirm }): Parameters<EmptyDeletedItemsParams>,
@@ -1350,7 +1371,7 @@ impl OutlookMcpServer {
 
     // ---- Calendar ----
 
-    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; is_canceled (false skips meetings the organizer canceled, true lists only those). calendar_of views another person's shared calendar. Recurring events are expanded: each occurrence's id is the SERIES id (acting on it acts on the whole series) and occurrence_id names just that occurrence; pass occurrence_id to get_event / respond_to_meeting / update_event / delete_event to act on one date. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists, nested up to 10 levels within a per-call budget (a meeting you organize or a personal appointment counts as required; both false = not among the attendees, use my_response; both null = unknown, because a list couldn't be expanded within the budget); and required_count / optional_count. To save tokens, compact=true returns only id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields (as on every list_* tool). Paging: count (default and max 250) and offset. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; is_canceled (false skips meetings the organizer canceled, true lists only those). calendar_of views another person's shared calendar. Recurring events are expanded: each occurrence's id is the SERIES id (acting on it acts on the whole series) and occurrence_id names just that occurrence; pass occurrence_id to get_event / respond_to_meeting / update_event / delete_event to act on one date. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists, nested up to 10 levels within a per-call budget (a meeting you organize or a personal appointment counts as required; both false = not among the attendees, use my_response; both null = unknown, because a list couldn't be expanded within the budget); and required_count / optional_count. To save tokens, compact=true returns only id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields (as on every list_* tool). Paging: count (default and max 250) and offset. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
@@ -1372,7 +1393,7 @@ impl OutlookMcpServer {
         out.content(&result)
     }
 
-    #[tool(description = "Get the full details of one calendar event by id (a series id, or an occurrence_id from list_events for one occurrence), or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
+    #[tool(description = "Get the full details of one calendar event by id (a series id, or an occurrence_id from list_events for one occurrence), or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn get_event(
         &self,
         Parameters(p): Parameters<GetEventParams>,
@@ -1388,15 +1409,19 @@ impl OutlookMcpServer {
         batch_content(&ids, many, results, |_, v| v)
     }
 
-    #[tool(description = "Create a calendar event. required_attendees/optional_attendees invite two tiers (attendees is a legacy alias merged into required_attendees); any attendee makes it a meeting. categories and show_as (busy status) can be set on creation. body (plain text) or body_file (a local UTF-8 text file path, for large text), not both. recurrence repeats the event (daily/weekly/monthly/yearly, with an interval and an until date or occurrence count). send (default true) controls whether a meeting is actually sent to attendees or just saved for review.")]
+    #[tool(description = "Create a calendar event. required_attendees/optional_attendees invite two tiers (attendees is a legacy alias merged into required_attendees); any attendee makes it a meeting. categories and show_as (busy status) can be set on creation. body (plain text) or body_file (a local UTF-8 text file path, for large text), not both. recurrence repeats the event (daily/weekly/monthly/yearly, with an interval and an until date or occurrence count). notify (default true; alias send) controls whether a meeting is actually sent to attendees or just saved for review. require_no_attendees=true refuses any attendee, so the call can never invite anyone.", annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true))]
     pub async fn create_event(
         &self,
         Parameters(CreateEventParams {
             subject, start, end, body, body_file, location, attendees, required_attendees,
-            optional_attendees, all_day, reminder_minutes, categories, show_as, send,
-            recurrence,
+            optional_attendees, all_day, reminder_minutes, categories, show_as, notify,
+            require_no_attendees, recurrence,
         }): Parameters<CreateEventParams>,
     ) -> Result<CallToolResult, McpError> {
+        let invites = [&attendees, &required_attendees, &optional_attendees]
+            .iter()
+            .any(|list| list.as_ref().is_some_and(|l| !l.is_empty()));
+        check_no_attendees(require_no_attendees, false, invites, &subject)?;
         let client = self.client.clone();
         let body = run_blocking(move || resolve_text_input(body, body_file, "body", "body_file")).await?;
         // `attendees` is a legacy alias for the required tier; merge it in.
@@ -1409,13 +1434,13 @@ impl OutlookMcpServer {
         });
         let input = CreateEventInput {
             subject, start, end, body, location, required_attendees, optional_attendees,
-            all_day, reminder_minutes, categories, show_as, send, recurrence,
+            all_day, reminder_minutes, categories, show_as, send: notify, recurrence,
         };
         let result = run_blocking(move || client.create_event(input)).await?;
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Respond to one or more meeting invites: accept, decline, or tentative. event_id (one id, or a list: the result is then a list in the same order, and an id that fails becomes {\"id\", \"error\"} without stopping the rest) is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. send=false records the response in your calendar without emailing the organizer.")]
+    #[tool(description = "Respond to one or more meeting invites: accept, decline, or tentative. event_id (one id, or a list: the result is then a list in the same order, and an id that fails becomes {\"id\", \"error\"} without stopping the rest) is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. notify=false (alias send) records the response in your calendar without emailing the organizer.", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = true))]
     pub async fn respond_to_meeting(
         &self,
         Parameters(p): Parameters<RespondToMeetingParams>,
@@ -1428,11 +1453,11 @@ impl OutlookMcpServer {
         let (items, many) = write_items(p)?;
         let client = self.client.clone();
         run_writes(items, many, move |id, p| {
-            client.respond_to_meeting(id, p.response, p.comment, p.send)
+            client.respond_to_meeting(id, p.response, p.comment, p.notify)
         }).await
     }
 
-    #[tool(description = "Update an existing calendar event: subject, start/end, location, body (or body_file: a local UTF-8 text file path), show_as, add/remove categories, add/remove attendees, reminder, all_day, recurrence (set/replace) or clear_recurrence (remove it). Adding an attendee converts a personal appointment into a meeting. A series id (an event's id) edits the whole series; an occurrence_id from list_events edits just that occurrence (recurrence / clear_recurrence need the series id) and the result carries the occurrence's new occurrence_id, since moving it changes its start. send_update (default true) notifies attendees if the event is a meeting. Several items in one call: event_id as a list applies the same changes to each, or updates: [{event_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_event call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
+    #[tool(description = "Update an existing calendar event: subject, start/end, location, body (or body_file: a local UTF-8 text file path), show_as, add/remove categories, add/remove attendees, reminder, all_day, recurrence (set/replace) or clear_recurrence (remove it). Adding an attendee converts a personal appointment into a meeting. A series id (an event's id) edits the whole series; an occurrence_id from list_events edits just that occurrence (recurrence / clear_recurrence need the series id) and the result carries the occurrence's new occurrence_id, since moving it changes its start. notify (default true; alias send_update) notifies attendees if the event is a meeting. Several items in one call: event_id as a list applies the same changes to each, or updates: [{event_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_event call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees). require_no_attendees=true refuses (changing nothing) if the event is a meeting or the update adds attendees, so the call can never affect anyone else; an undo keeps it.", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = true))]
     pub async fn update_event(
         &self,
         Parameters(p): Parameters<UpdateEventParams>,
@@ -1452,14 +1477,15 @@ impl OutlookMcpServer {
             add_categories: p.add_categories, remove_categories: p.remove_categories,
             add_required_attendees: p.add_required_attendees,
             add_optional_attendees: p.add_optional_attendees,
-            remove_attendees: p.remove_attendees, send_update: p.send_update,
+            remove_attendees: p.remove_attendees, send_update: p.notify,
+            require_no_attendees: p.require_no_attendees,
             recurrence, clear_recurrence: p.clear_recurrence,
         };
         client.update_event(u)
         }).await
     }
 
-    #[tool(description = "Delete/cancel a calendar event. If you organize the meeting, send_cancellation (default true) notifies attendees; if false, it's canceled quietly; this is independent of permanent (the cancellation is sent first). For a recurring event, a series id (an event's id from list_events) deletes the whole series; an occurrence_id deletes just that occurrence (it is removed from the series, never moved to Deleted Items, so permanent has no effect on it). By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass event_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
+    #[tool(description = "Delete/cancel a calendar event. If you organize the meeting, notify (default true; alias send_cancellation) notifies attendees; if false, it's canceled quietly; this is independent of permanent (the cancellation is sent first). For a recurring event, a series id (an event's id from list_events) deletes the whole series; an occurrence_id deletes just that occurrence (it is removed from the series, never moved to Deleted Items, so permanent has no effect on it). By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass event_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. require_no_attendees=true refuses to delete a meeting (only personal appointments go).", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = true))]
     pub async fn delete_event(
         &self,
         Parameters(p): Parameters<DeleteEventParams>,
@@ -1467,11 +1493,11 @@ impl OutlookMcpServer {
         let (items, many) = write_items(p)?;
         let client = self.client.clone();
         run_writes(items, many, move |id, p| {
-            client.delete_event(id, p.send_cancellation, p.permanent)
+            client.delete_event(id, p.notify, p.permanent, p.require_no_attendees)
         }).await
     }
 
-    #[tool(description = "Check free/busy availability for one or more people over a time window. Returns each person's raw status per time slot (never event details) plus common_free: the windows where everyone is available. treat_as_free (default [\"free\"]) controls which statuses count as available when computing common_free; a person whose address can't be resolved, or who resolves but has no loadable free/busy data, is marked resolved:false with empty slots and doesn't fail the call.")]
+    #[tool(description = "Check free/busy availability for one or more people over a time window. Returns each person's raw status per time slot (never event details) plus common_free: the windows where everyone is available. treat_as_free (default [\"free\"]) controls which statuses count as available when computing common_free; a person whose address can't be resolved, or who resolves but has no loadable free/busy data, is marked resolved:false with empty slots and doesn't fail the call.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn check_availability(
         &self,
         Parameters(CheckAvailabilityParams { people, start, end, interval_minutes, treat_as_free }):
@@ -1485,7 +1511,7 @@ impl OutlookMcpServer {
 
     // ---- Attachments ----
 
-    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden). email_id may be a list: the result is then a list in the same order of {\"id\", \"attachments\": [...]}, or {\"id\", \"error\"} for an id that fails. fields picks the fields of each attachment (index, filename, size, type, content_id, mime_type, hidden, is_inline); compact=true returns index, filename, size, is_inline. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden). email_id may be a list: the result is then a list in the same order of {\"id\", \"attachments\": [...]}, or {\"id\", \"error\"} for an id that fails. fields picks the fields of each attachment (index, filename, size, type, content_id, mime_type, hidden, is_inline); compact=true returns index, filename, size, is_inline. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn list_attachments(
         &self,
         Parameters(ListAttachmentsParams { email_id, rows: row_params }): Parameters<ListAttachmentsParams>,
@@ -1501,7 +1527,7 @@ impl OutlookMcpServer {
         out.content_value(batch_value(&ids, many, results, |id, v| json!({"id": id, "attachments": v}))?)
     }
 
-    #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Pass `inline: false` to save only regular attachments and skip inline images (`is_inline`), e.g. when re-sending an email whose HTML already carries its images (get_email with resolve_inline_images) so they aren't attached twice; `inline: true` saves only the inline images. Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.")]
+    #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Pass `inline: false` to save only regular attachments and skip inline images (`is_inline`), e.g. when re-sending an email whose HTML already carries its images (get_email with resolve_inline_images) so they aren't attached twice; `inline: true` saves only the inline images. Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.", annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false))]
     pub async fn save_attachments(
         &self,
         Parameters(SaveAttachmentsParams { email_id, save_dir, attachment_names, inline }): Parameters<SaveAttachmentsParams>,
@@ -1511,7 +1537,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files. Pass `content_ids` (a list) instead of `content_id` to fetch several images of the same email in one call: the result is a list in the same order, where a Content-ID that fails becomes {\"id\": <content id>, \"error\"}. output_dir writes each image's decoded bytes to a file there (created if missing) and returns `data_file` (absolute path) instead of `data_uri`. Optional `context_lines` (max 50) also returns `context`: the last that-many non-empty lines of plain text immediately before the image's first `cid:` reference in the HTML body (tags stripped, entities decoded), useful for knowing what the image shows. `context` is \"\" when the HTML body never references the image, and is omitted when `context_lines` is not given. To get an email's HTML with every image already inlined, use get_email with resolve_inline_images.")]
+    #[tool(description = "Fetch an email's attachment by Content-ID (e.g. an inline image an HTML body references as `cid:...`; see `content_id` from list_attachments) as a base64 data URI. Returns `content_id`, `filename`, `mime_type` (application/octet-stream if unknown), `size` (bytes) and `data_uri`. A `cid:` prefix and surrounding `<>` are accepted; matching is case-insensitive. Limited to 10 MB; use save_attachments for larger files. Pass `content_ids` (a list) instead of `content_id` to fetch several images of the same email in one call: the result is a list in the same order, where a Content-ID that fails becomes {\"id\": <content id>, \"error\"}. output_dir writes each image's decoded bytes to a file there (created if missing) and returns `data_file` (absolute path) instead of `data_uri`. Optional `context_lines` (max 50) also returns `context`: the last that-many non-empty lines of plain text immediately before the image's first `cid:` reference in the HTML body (tags stripped, entities decoded), useful for knowing what the image shows. `context` is \"\" when the HTML body never references the image, and is omitted when `context_lines` is not given. To get an email's HTML with every image already inlined, use get_email with resolve_inline_images.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn get_inline_image(
         &self,
         Parameters(GetInlineImageParams { email_id, content_id, content_ids, context_lines, output_dir }):
@@ -1540,7 +1566,7 @@ impl OutlookMcpServer {
 
     // ---- Tasks ----
 
-    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filters (all optional, ANDed): category and importance (one value or a list, matching any); due_after / due_before (any date form, e.g. 'end_of_week'); query (shared list query syntax; field scopes subject and body; unscoped terms search both). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, due_date, complete, status, importance, categories); compact=true returns id, subject, due_date, status, importance. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filters (all optional, ANDed): category and importance (one value or a list, matching any); due_after / due_before (any date form, e.g. 'end_of_week'); query (shared list query syntax; field scopes subject and body; unscoped terms search both). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, due_date, complete, status, importance, categories); compact=true returns id, subject, due_date, status, importance. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn list_tasks(
         &self,
         Parameters(p): Parameters<ListTasksParams>,
@@ -1557,7 +1583,7 @@ impl OutlookMcpServer {
         out.content(&result)
     }
 
-    #[tool(description = "Create a new task. body (plain text) or body_file (a local UTF-8 text file path, for large text), not both. reminder_time (ISO datetime) is an absolute reminder time, unlike appointment reminders which are minutes-before-start.")]
+    #[tool(description = "Create a new task. body (plain text) or body_file (a local UTF-8 text file path, for large text), not both. reminder_time (ISO datetime) is an absolute reminder time, unlike appointment reminders which are minutes-before-start.", annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false))]
     pub async fn create_task(
         &self,
         Parameters(CreateTaskParams {
@@ -1572,7 +1598,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Get the full details of one task by id, or several (task_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). Returns the list_tasks fields (subject, due_date, complete, status, importance, categories) plus start_date, date_completed, percent_complete, reminder_set, reminder_time, created, modified (unset dates are null) and the optional body. `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
+    #[tool(description = "Get the full details of one task by id, or several (task_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). Returns the list_tasks fields (subject, due_date, complete, status, importance, categories) plus start_date, date_completed, percent_complete, reminder_set, reminder_time, created, modified (unset dates are null) and the optional body. `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn get_task(
         &self,
         Parameters(p): Parameters<GetTaskParams>,
@@ -1588,7 +1614,7 @@ impl OutlookMcpServer {
         batch_content(&ids, many, results, |_, v| v)
     }
 
-    #[tool(description = "Update an existing task: mark_complete (true=complete, false=reopen), subject, body (or body_file: a local UTF-8 text file path), due_date, start_date, importance, add/remove categories, percent_complete, reminder_time. Combine any of these in one call. Note: mark_complete is applied last and both complete/reopen set percent_complete themselves, so mark_complete:false always resets percent_complete to 0 even if you also pass an explicit percent_complete in the same call — set it in a separate call afterward if you need it to stick. Several items in one call: task_id as a list applies the same changes to each, or updates: [{task_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_task call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
+    #[tool(description = "Update an existing task: mark_complete (true=complete, false=reopen), subject, body (or body_file: a local UTF-8 text file path), due_date, start_date, importance, add/remove categories, percent_complete, reminder_time. Combine any of these in one call. Note: mark_complete is applied last and both complete/reopen set percent_complete themselves, so mark_complete:false always resets percent_complete to 0 even if you also pass an explicit percent_complete in the same call — set it in a separate call afterward if you need it to stick. Several items in one call: task_id as a list applies the same changes to each, or updates: [{task_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_task call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false))]
     pub async fn update_task(
         &self,
         Parameters(p): Parameters<UpdateTaskParams>,
@@ -1607,7 +1633,7 @@ impl OutlookMcpServer {
         }).await
     }
 
-    #[tool(description = "Delete a task. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass task_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
+    #[tool(description = "Delete a task. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass task_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false))]
     pub async fn delete_task(
         &self,
         Parameters(p): Parameters<DeleteTaskParams>,
@@ -1619,7 +1645,7 @@ impl OutlookMcpServer {
 
     // ---- Notes ----
 
-    #[tool(description = "List Outlook notes. Filters (all optional, ANDed): category (one value or a list, matching any); created_after / created_before (any date form); query (shared list query syntax; field scopes subject, i.e. the first line, and body; unscoped terms search the body). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, created, categories); compact=true returns id, subject, created. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    #[tool(description = "List Outlook notes. Filters (all optional, ANDed): category (one value or a list, matching any); created_after / created_before (any date form); query (shared list query syntax; field scopes subject, i.e. the first line, and body; unscoped terms search the body). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, created, categories); compact=true returns id, subject, created. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn list_notes(
         &self,
         Parameters(p): Parameters<ListNotesParams>,
@@ -1635,7 +1661,7 @@ impl OutlookMcpServer {
         out.content(&result)
     }
 
-    #[tool(description = "Get the full body of one note by id, or several (note_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = subject, dates and categories only). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
+    #[tool(description = "Get the full body of one note by id, or several (note_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = subject, dates and categories only). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".", annotations(read_only_hint = true, open_world_hint = false))]
     pub async fn get_note(
         &self,
         Parameters(p): Parameters<GetNoteParams>,
@@ -1651,7 +1677,7 @@ impl OutlookMcpServer {
         batch_content(&ids, many, results, |_, v| v)
     }
 
-    #[tool(description = "Create a new note. Give its text as exactly one of `body` or `body_file` (a local UTF-8 text file path, for large text). Optional categories and color.")]
+    #[tool(description = "Create a new note. Give its text as exactly one of `body` or `body_file` (a local UTF-8 text file path, for large text). Optional categories and color.", annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false))]
     pub async fn create_note(
         &self,
         Parameters(CreateNoteParams { body, body_file, categories, color }): Parameters<CreateNoteParams>,
@@ -1666,7 +1692,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Update an existing note: body (or body_file: a local UTF-8 text file path), add/remove categories, color. Combine any of these in one call. Several items in one call: note_id as a list applies the same changes to each, or updates: [{note_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_note call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
+    #[tool(description = "Update an existing note: body (or body_file: a local UTF-8 text file path), add/remove categories, color. Combine any of these in one call. Several items in one call: note_id as a list applies the same changes to each, or updates: [{note_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_note call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false))]
     pub async fn update_note(
         &self,
         Parameters(p): Parameters<UpdateNoteParams>,
@@ -1682,7 +1708,7 @@ impl OutlookMcpServer {
         }).await
     }
 
-    #[tool(description = "Delete a note. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass note_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
+    #[tool(description = "Delete a note. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass note_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.", annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false))]
     pub async fn delete_note(
         &self,
         Parameters(p): Parameters<DeleteNoteParams>,

@@ -753,7 +753,7 @@ fn system_test_plans_1_to_9() {
             reminder_minutes: Some(20), show_as: Some("tentative".into()),
             add_categories: Some(vec!["Yellow Category".into()]), remove_categories: None,
             add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
-            send_update: true, recurrence: None, clear_recurrence: false,
+            send_update: true, recurrence: None, clear_recurrence: false, require_no_attendees: false,
         }) {
             Ok(_) => {
                 let after_add = single(c.get_event(vec![id.clone()], &ReadOptions::default())).ok();
@@ -769,7 +769,7 @@ fn system_test_plans_1_to_9() {
                     subject: None, start: None, end: None, location: None, body: None, all_day: None,
                     reminder_minutes: None, show_as: None, add_categories: None,
                     add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
-                    recurrence: None, clear_recurrence: false,
+                    recurrence: None, clear_recurrence: false, require_no_attendees: false,
                 }) {
                     Ok(_) => r.record("B7", add_ok, format!("edits applied: {add_ok}")),
                     Err(e) => r.record("B7", false, format!("remove_categories failed: {e}")),
@@ -789,7 +789,7 @@ fn system_test_plans_1_to_9() {
             send_update: true,
             subject: None, start: None, end: None, location: None, body: None, all_day: None,
             reminder_minutes: None, show_as: None, add_categories: None, remove_categories: None,
-            add_optional_attendees: None, remove_attendees: None, recurrence: None, clear_recurrence: false,
+            add_optional_attendees: None, remove_attendees: None, recurrence: None, clear_recurrence: false, require_no_attendees: false,
         }) {
             Ok(_) => {
                 let is_meeting = single(c.get_event(vec![id.clone()], &ReadOptions::default())).map(|d| d.summary.is_meeting
@@ -799,7 +799,7 @@ fn system_test_plans_1_to_9() {
                     send_update: false,
                     subject: None, start: None, end: None, location: None, body: None, all_day: None,
                     reminder_minutes: None, show_as: None, add_categories: None, remove_categories: None,
-                    add_required_attendees: None, add_optional_attendees: None, recurrence: None, clear_recurrence: false,
+                    add_required_attendees: None, add_optional_attendees: None, recurrence: None, clear_recurrence: false, require_no_attendees: false,
                 }) {
                     Ok(_) => r.record("B8", is_meeting, format!("became meeting with attendee: {is_meeting}, then reverted quietly")),
                     Err(e) => r.record("B8", false, format!("remove_attendees revert failed: {e}")),
@@ -825,7 +825,7 @@ fn system_test_plans_1_to_9() {
         for label in ["B2", "B4", "B5"] {
             if let Some(pos) = cleanup_events.iter().position(|(l, _, _)| l == label) {
                 let (_, id, send_cancellation) = cleanup_events.remove(pos);
-                match c.delete_event(id, send_cancellation, false) {
+                match c.delete_event(id, send_cancellation, false, false) {
                     Ok(v) => notes.push(format!("{label}: {}", v["status"])),
                     Err(e) => { ok = false; notes.push(format!("{label} FAILED: {e}")); }
                 }
@@ -849,7 +849,7 @@ fn system_test_plans_1_to_9() {
         }
     }
     for (label, id, _) in cleanup_events {
-        match c.delete_event(id.clone(), false, false) {
+        match c.delete_event(id.clone(), false, false, false) {
             Ok(_) => println!("cleaned up event {label} ({id})"),
             Err(e) => {
                 println!("FAILED to clean up event {label} ({id}): {e}");

@@ -1748,8 +1748,8 @@ async fn create_event_passes_attendees() {
             reminder_minutes: None,
             categories: None,
             show_as: None,
-            send: true,
-            recurrence: None,
+            notify: true,
+            recurrence: None, require_no_attendees: false,
         }))
         .await
         .unwrap();
@@ -1770,9 +1770,9 @@ async fn create_event_status_reflects_attendees_and_send() {
         body: None, body_file: None, location: None, attendees: None,
         required_attendees: required, optional_attendees: None,
         all_day: false, reminder_minutes: None, categories: None, show_as: None,
-        send,
-        recurrence: None,
-    };
+        notify: send,
+        recurrence: None, require_no_attendees: false,
+        };
 
     let r = server.create_event(Parameters(base(Some(vec!["a@example.com".to_string()]), true)))
         .await.unwrap();
@@ -1798,7 +1798,7 @@ async fn create_event_forwards_recurrence() {
             body: None, body_file: None, location: None, attendees: None,
             required_attendees: None, optional_attendees: None,
             all_day: false, reminder_minutes: None, categories: None, show_as: None,
-            send: true,
+            notify: true,
             recurrence: Some(RecurrenceParams {
                 pattern: "weekly".to_string(),
                 interval: Some(1),
@@ -1806,7 +1806,7 @@ async fn create_event_forwards_recurrence() {
                 day_of_month: None,
                 until: None,
                 occurrences: Some(10),
-            }),
+            }), require_no_attendees: false,
         }))
         .await
         .unwrap();
@@ -2059,9 +2059,9 @@ async fn updates_apply_different_changes_per_item_and_undo_rolls_them_back() {
     ]})).unwrap();
     let v = result_json(&server.update_event(Parameters(params)).await.unwrap());
     assert_eq!(v[0]["undo"], json!({"event_id": EVENT_ID, "start": "2026-06-10T09:00:00",
-        "end": "2026-06-10T09:30:00", "send_update": false}));
+        "end": "2026-06-10T09:30:00", "notify": false}));
     assert_eq!(v[1]["undo"], json!({"event_id": OCCURRENCE_ID, "subject": "Standup",
-        "remove_categories": ["Blue"], "send_update": true}));
+        "remove_categories": ["Blue"], "notify": true}));
     assert_eq!(v[1]["not_undoable"], json!(["body"]));
     let calls = fake.calls();
     assert_eq!(calls[0].1["start"], "2026-06-11T10:00");
@@ -2124,6 +2124,96 @@ async fn write_batches_reject_bad_shapes() {
 }
 
 #[tokio::test]
+async fn calendar_notify_flags_share_one_name_and_keep_the_old_ones() {
+    use outlook_mcp_rs::outlook::fake::EVENT_ID;
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    macro_rules! call {
+        ($tool:ident, $args:expr) => {
+            server.$tool(Parameters(serde_json::from_value($args).unwrap())).await.unwrap()
+        };
+    }
+    for old in ["notify", "send"] {
+        call!(create_event, json!({"subject": "s", "start": "2026-06-10T10:00", "end": "2026-06-10T11:00", old: false}));
+        assert_eq!(fake.calls().pop().unwrap().1["send"], false, "create_event {old}");
+        call!(respond_to_meeting, json!({"event_id": EVENT_ID, "response": "accept", old: false}));
+        assert_eq!(fake.calls().pop().unwrap().1["send"], false, "respond_to_meeting {old}");
+    }
+    for old in ["notify", "send_update"] {
+        call!(update_event, json!({"event_id": EVENT_ID, "subject": "s", old: false}));
+        assert_eq!(fake.calls().pop().unwrap().1["send_update"], false, "update_event {old}");
+    }
+    for old in ["notify", "send_cancellation"] {
+        call!(delete_event, json!({"event_id": EVENT_ID, old: false}));
+        assert_eq!(fake.calls().pop().unwrap().1["send_cancellation"], false, "delete_event {old}");
+    }
+}
+
+#[tokio::test]
+async fn require_no_attendees_guards_every_event_write() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, MEETING_ID};
+    let fake = Arc::new(FakeOutlookClient::new());
+    let server = OutlookMcpServer::new(fake.clone());
+    macro_rules! call {
+        ($tool:ident, $args:expr) => {
+            server.$tool(Parameters(serde_json::from_value($args).unwrap())).await
+        };
+    }
+    let guard = true;
+    // A personal appointment passes.
+    call!(update_event, json!({"event_id": EVENT_ID, "start": "2026-06-11T10:00", "require_no_attendees": guard})).unwrap();
+    call!(delete_event, json!({"event_id": EVENT_ID, "require_no_attendees": guard})).unwrap();
+    call!(create_event, json!({"subject": "s", "start": "2026-06-10T10:00", "end": "2026-06-10T11:00",
+        "require_no_attendees": guard})).unwrap();
+    let before = fake.calls().len();
+    // A meeting, or adding people, is refused before anything changes.
+    let refusals = [
+        call!(update_event, json!({"event_id": MEETING_ID, "subject": "s", "require_no_attendees": guard})),
+        call!(delete_event, json!({"event_id": MEETING_ID, "require_no_attendees": guard})),
+        call!(update_event, json!({"event_id": EVENT_ID, "add_optional_attendees": ["a@x.com"], "require_no_attendees": guard})),
+        call!(create_event, json!({"subject": "s", "start": "2026-06-10T10:00", "end": "2026-06-10T11:00",
+            "attendees": ["a@x.com"], "require_no_attendees": guard})),
+    ];
+    for r in refusals {
+        let e = r.unwrap_err().message.to_string();
+        assert!(e.contains("require_no_attendees"), "{e}");
+    }
+    assert_eq!(fake.calls().len(), before, "nothing reached Outlook");
+    // In a batch, a refused meeting is one failed item; the rest go through,
+    // and their undo keeps the guard.
+    let v = result_json(&call!(update_event, json!({"updates": [
+        {"event_id": EVENT_ID, "start": "2026-06-11T10:00", "require_no_attendees": guard},
+        {"event_id": MEETING_ID, "start": "2026-06-11T10:00", "require_no_attendees": guard},
+    ]})).unwrap());
+    assert_eq!(v[0]["undo"]["require_no_attendees"], true);
+    assert!(v[1]["error"].as_str().unwrap().contains("is a meeting"));
+}
+
+#[tokio::test]
+async fn every_tool_advertises_mcp_safety_hints() {
+    let mut wire = WireClient::start(OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()))).await;
+    let (_, listed) = wire.request("tools/list", json!({})).await;
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 30);
+    for t in tools {
+        let name = t["name"].as_str().unwrap();
+        let a = &t["annotations"];
+        let read_only = a["readOnlyHint"].as_bool().unwrap_or_else(|| panic!("{name}: no readOnlyHint"));
+        assert!(a["openWorldHint"].is_boolean(), "{name}: no openWorldHint");
+        if read_only {
+            assert!(name.starts_with("list_") || name.starts_with("get_") || name == "check_availability", "{name}");
+        } else {
+            assert!(a["destructiveHint"].is_boolean(), "{name}: no destructiveHint");
+        }
+        // Anything that can send or notify is marked open-world.
+        if ["send_email", "reply_email", "update_draft", "create_event", "update_event",
+            "delete_event", "respond_to_meeting"].contains(&name) {
+            assert_eq!(a["openWorldHint"], true, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn update_event_lists_changed_fields() {
     use outlook_mcp_rs::outlook::fake::EVENT_ID;
     let fake = Arc::new(FakeOutlookClient::new());
@@ -2138,9 +2228,9 @@ async fn update_event_lists_changed_fields() {
             remove_categories: None,
             add_required_attendees: Some(vec!["a@example.com".to_string()]),
             add_optional_attendees: None, remove_attendees: None,
-            send_update: true,
+            notify: true,
             recurrence: None, clear_recurrence: false,
-            updates: None,
+            updates: None, require_no_attendees: false,
         }))
         .await
         .unwrap();
@@ -2169,9 +2259,9 @@ async fn update_event_remove_attendees_is_tracked() {
             add_categories: None, remove_categories: None,
             add_required_attendees: None, add_optional_attendees: None,
             remove_attendees: Some(vec!["a@example.com".to_string()]),
-            send_update: false,
+            notify: false,
             recurrence: None, clear_recurrence: false,
-            updates: None,
+            updates: None, require_no_attendees: false,
         }))
         .await
         .unwrap();
@@ -2191,13 +2281,13 @@ async fn update_event_forwards_recurrence() {
             all_day: None, reminder_minutes: None, show_as: None,
             add_categories: None, remove_categories: None,
             add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
-            send_update: false,
+            notify: false,
             recurrence: Some(RecurrenceParams {
                 pattern: "daily".to_string(), interval: Some(2), days_of_week: None,
                 day_of_month: None, until: Some("2099-06-01".to_string()), occurrences: None,
             }),
             clear_recurrence: false,
-            updates: None,
+            updates: None, require_no_attendees: false,
         }))
         .await
         .unwrap();
@@ -2220,10 +2310,10 @@ async fn update_event_forwards_clear_recurrence() {
             all_day: None, reminder_minutes: None, show_as: None,
             add_categories: None, remove_categories: None,
             add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
-            send_update: false,
+            notify: false,
             recurrence: None,
             clear_recurrence: true,
-            updates: None,
+            updates: None, require_no_attendees: false,
         }))
         .await
         .unwrap();
@@ -2243,13 +2333,13 @@ async fn update_event_rejects_recurrence_and_clear_recurrence_together() {
             all_day: None, reminder_minutes: None, show_as: None,
             add_categories: None, remove_categories: None,
             add_required_attendees: None, add_optional_attendees: None, remove_attendees: None,
-            send_update: false,
+            notify: false,
             recurrence: Some(RecurrenceParams {
                 pattern: "daily".to_string(), interval: None, days_of_week: None,
                 day_of_month: None, until: None, occurrences: None,
             }),
             clear_recurrence: true,
-            updates: None,
+            updates: None, require_no_attendees: false,
         }))
         .await
         .unwrap_err();
@@ -2264,8 +2354,8 @@ async fn delete_event_returns_deleted_status() {
     let result = server
         .delete_event(Parameters(DeleteEventParams {
             event_id: OneOrMany::One(EVENT_ID.to_string()),
-            send_cancellation: true,
-            permanent: false,
+            notify: true,
+            permanent: false, require_no_attendees: false,
         }))
         .await
         .unwrap();
@@ -2291,7 +2381,7 @@ async fn delete_event_defaults_to_soft_delete_with_cancellation() {
         fake.calls(),
         vec![(
             "delete_event".to_string(),
-            json!({"event_id": EVENT_ID, "send_cancellation": true, "permanent": false})
+            json!({"event_id": EVENT_ID, "send_cancellation": true, "permanent": false, "require_no_attendees": false})
         )]
     );
 }
@@ -2311,7 +2401,7 @@ async fn delete_event_forwards_permanent_independent_of_send_cancellation() {
         fake.calls(),
         vec![(
             "delete_event".to_string(),
-            json!({"event_id": EVENT_ID, "send_cancellation": false, "permanent": true})
+            json!({"event_id": EVENT_ID, "send_cancellation": false, "permanent": true, "require_no_attendees": false})
         )]
     );
 }

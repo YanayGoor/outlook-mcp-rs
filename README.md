@@ -147,10 +147,10 @@ The Outlook tools then appear in that client.
 **Calendar**
 - `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `is_canceled` filters canceled meetings; `count` default and max 250, page with `offset`. Recurring events are expanded; each occurrence has the series' `id` plus its own `occurrence_id` (see "Recurring meetings"). Each row says whether you're a required or optional attendee (`user_is_required`/`user_is_optional`, see below) and how many attendees each tier has. `compact=true` or `fields=[...]` returns only the fields you need
 - `get_event` — get the full details of one calendar event by id (or `occurrence_id`), or several in one call (same output options as `get_email`, plain-text body only)
-- `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out; `body` or `body_file`
+- `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `notify` (formerly `send`) controlling whether invites actually go out; `body` or `body_file`
 - `update_event` — change an existing event (subject, times, location, body or `body_file`, attendees, reminder, recurrence…); optionally notify attendees. With an `occurrence_id` it changes just that occurrence and returns its new `occurrence_id`
 - `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative): a whole series, or one occurrence with its `occurrence_id`; pass a list of ids to answer several invites in one call (per-item results; one failure doesn't stop the rest). `send=false` records the answer without emailing the organizer
-- `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); for a meeting you organize, `send_cancellation` (default true) notifies attendees first, independent of `permanent`. A recurring event's `id` names the whole series, so the whole series is deleted; an `occurrence_id` deletes just that occurrence
+- `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); `notify` (default true; formerly `send_cancellation`) notifies attendees first, independent of `permanent`. A recurring event's `id` names the whole series, so the whole series is deleted; an `occurrence_id` deletes just that occurrence
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
 **Attachments**
@@ -217,7 +217,7 @@ Every write tool that takes an item id can act on several items in one call:
   - E.g. `update_event` with `updates: [{event_id: a, start: …, end: …}, {event_id: b, subject: …}]`.
 
 At most 100 items per call. A list comes back as a list in the same order. A failed item becomes `{"id", "error"}` and doesn't stop the rest. Outlook can't make a batch atomic, so every `update_*` result instead carries:
-- **`undo`:** the update that puts back what it changed, in the same tool's parameters and addressed by the item's current id (an event's undo keeps its `send_update`). Pass a batch's `undo` objects as `updates` to roll the whole batch back.
+- **`undo`:** the update that puts back what it changed, in the same tool's parameters and addressed by the item's current id (an event's undo keeps its `notify` and `require_no_attendees`). Pass a batch's `undo` objects as `updates` to roll the whole batch back.
 - **`not_undoable`:** changes `undo` can't revert: bodies, attachments, inline images, recurrence, removed attendees, a reminder or date that wasn't set before.
 
 ### Ids after a write
@@ -375,11 +375,59 @@ rather than destroying them. Permanent deletes must always be asked for explicit
 A few tools have real, outbound effects, and these are also explicit in the tool call:
 
 - `send_email` delivers mail, as do `reply_email` (unless `send=false`) and `update_draft` with `send=true`;
-- `respond_to_meeting` notifies an organizer (unless `send=false`);
-- `create_event`, `update_event` and `delete_event` notify attendees when their send/update/cancellation flag is set.
+- `respond_to_meeting` notifies an organizer (unless `notify=false`);
+- `create_event`, `update_event` and `delete_event` notify attendees unless `notify=false`. The calendar tools share this one flag name; the old `send` / `send_update` / `send_cancellation` still work.
+- `require_no_attendees: true` on `create_event`, `update_event` and `delete_event` makes the server refuse, changing nothing, to touch a meeting with attendees or to add any. A call with it can never affect anyone else.
 
 `update_draft` edits a draft and only sends it when `send=true` is passed. [`TESTING.md`](TESTING.md) spells out exactly which behaviors are
 covered by automated tests versus verified by hand precisely because they send real mail.
+
+## Calendar autopilot (Claude Code)
+
+When an assistant organizes your calendar, most of its calls only touch your own calendar and don't need a prompt each time. A few reach other people and should always be approved by hand. Claude Code permission rules only match a tool's *name*, and "accept edits" mode only covers file edits. So this split comes from a `PreToolUse` hook that reads each call's arguments: [`hooks/calendar_autopilot.py`](hooks/calendar_autopilot.py) (Python 3, standard library only).
+
+| Runs without a prompt | Asks you first |
+|---|---|
+| Reading: `list_*`, `get_*`, `check_availability` | `respond_to_meeting` that emails the organizer (`notify` true or omitted) |
+| `respond_to_meeting` with `notify: false` (accept/decline silently), for one invite or a list | `update_event` without `require_no_attendees: true` on every change, i.e. anything that may move a meeting with attendees |
+| `update_event` with `require_no_attendees: true` (on every entry of an `updates` batch) | Every other tool that writes or sends (`send_email`, deletes, `create_event`, …) |
+
+`require_no_attendees: true` is enforced by the server. It refuses to change an event that is a meeting, or to add attendees, and changes nothing in that case. So an auto-approved call can never move a meeting someone else attends. An `undo` keeps the flag, so rolling back an auto-approved batch is auto-approved too.
+
+To turn it on, add this to `.claude/settings.json`:
+- in the folder where you run your calendar skill, so it acts as a mode for that project only;
+- or in `~/.claude/settings.json` for every session.
+
+Replace `outlook` in the matcher with the name you gave the server in your MCP config, and fix the path (on Windows use `py C:\path\to\calendar_autopilot.py`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__outlook__.*",
+        "hooks": [
+          { "type": "command", "command": "python3 /path/to/outlook-mcp-rs/hooks/calendar_autopilot.py" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Every outlook-mcp-rs tool is classified in the hook. Its tests fail if a new tool isn't classified, or if the hook's tables disagree with the tools' MCP hints (read-only / open-world). Everything that can reach another person always prompts:
+- sending or replying to mail;
+- creating or editing a draft;
+- creating an event (invitations);
+- deleting one (cancellations);
+- a meeting response that is emailed;
+- moving or editing a meeting with attendees.
+
+Writes to your own mailbox prompt too, and so does any tool the hook doesn't know. The prompt says why (e.g. "respond_to_meeting emails your response to the organizer"). If the hook can't read a call, it asks; it never allows by mistake.
+
+Keep it that way:
+- Don't add `allow` permission rules for the Outlook tools (e.g. `mcp__outlook__*`): those would also let through the calls the hook leaves to a prompt if the hook isn't running.
+- The hook only sees outlook-mcp-rs tools. Any other tool goes through your normal permissions, so don't auto-approve shell commands that could drive Outlook directly.
 
 ## Troubleshooting
 

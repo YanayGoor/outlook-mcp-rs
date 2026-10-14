@@ -9,7 +9,8 @@ use super::filters::DateRange;
 use super::occurrence;
 use super::undo::{self, Undo};
 use super::{
-    require_empty_confirm, deleted_note, delete_occurrence_note, validate_occurrence_update, validate_recurrence_update, CheckAvailabilityInput,
+    require_empty_confirm, deleted_note, delete_occurrence_note, validate_occurrence_update,
+    check_no_attendees, update_adds_attendees, validate_recurrence_update, CheckAvailabilityInput,
     CreateEventInput,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate, NewEmail,
@@ -27,6 +28,9 @@ pub const FAKE_WEEK_START: chrono::Weekday = chrono::Weekday::Mon;
 
 pub const EMAIL_ID: &str = "entry-1|store-1";
 pub const EVENT_ID: &str = "entry-2|store-1";
+/// An event the fake treats as a meeting with attendees (every other id is
+/// a personal appointment), for the `require_no_attendees` guard.
+pub const MEETING_ID: &str = "entry-5|store-1";
 /// One occurrence of `EVENT_ID` (as if it were a recurring series).
 pub const OCCURRENCE_ID: &str = "entry-2|store-1|2026-06-10T09:00:00";
 pub const TASK_ID: &str = "entry-3|store-1";
@@ -487,6 +491,8 @@ impl OutlookClient for FakeOutlookClient {
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError> {
         let parsed = parse_event_id(&u.event_id)?;
         validate_occurrence_update(parsed.is_occurrence(), &u)?;
+        check_no_attendees(u.require_no_attendees, parsed.series_id() == MEETING_ID,
+            update_adds_attendees(&u), "Standup")?;
         validate_recurrence_update(&u)?;
         self.record("update_event", json!({
             "event_id": u.event_id, "subject": u.subject, "start": u.start, "end": u.end,
@@ -501,6 +507,7 @@ impl OutlookClient for FakeOutlookClient {
                 "day_of_month": r.day_of_month, "until": r.until, "occurrences": r.occurrences,
             })),
             "clear_recurrence": u.clear_recurrence,
+            "require_no_attendees": u.require_no_attendees,
         }))?;
         let mut changed: Vec<&str> = Vec::new();
         if u.subject.is_some() { changed.push("subject"); }
@@ -525,7 +532,10 @@ impl OutlookClient for FakeOutlookClient {
         if !added.is_empty() {
             undo.set("remove_attendees", added);
         }
-        let keep = [("send_update", json!(u.send_update))];
+        let mut keep = vec![("notify", json!(u.send_update))];
+        if u.require_no_attendees {
+            keep.push(("require_no_attendees", json!(true)));
+        }
         if let Some(old_start) = parsed.occurrence_start {
             let start = match u.start.as_deref() {
                 Some(s) => super::dates::parse_date_param(s, "start", FAKE_WEEK_START)?.at,
@@ -540,11 +550,13 @@ impl OutlookClient for FakeOutlookClient {
         Ok(undo::merged(result, undo.finish("event_id", &u.event_id, &keep)))
     }
 
-    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
-        -> Result<Value, ToolError> {
+    fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool,
+        require_no_attendees: bool) -> Result<Value, ToolError> {
         let parsed = parse_event_id(&event_id)?;
+        check_no_attendees(require_no_attendees, parsed.series_id() == MEETING_ID, false, "Standup")?;
         self.record("delete_event", json!({
             "event_id": event_id, "send_cancellation": send_cancellation, "permanent": permanent,
+            "require_no_attendees": require_no_attendees,
         }))?;
         if parsed.is_occurrence() {
             return Ok(json!({"status": "deleted", "occurrence": true,
