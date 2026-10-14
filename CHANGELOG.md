@@ -21,6 +21,16 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - A system test for PRs #14–#25, and guidance for testing a batch of PRs ([#26](https://github.com/adamkopelman/outlook-mcp-rs/pull/26)).
 - User-facing skills (`using-outlook-mcp`, `troubleshooting-outlook-mcp`), and README / CONTRIBUTING brought up to date ([#27](https://github.com/adamkopelman/outlook-mcp-rs/pull/27)).
 - This changelog; every PR adds its entry under Unreleased ([#56](https://github.com/adamkopelman/outlook-mcp-rs/pull/56)).
+- Content-writing tools share one input convention: exactly one of `body` / `html_body` / `body_file` / `html_body_file` on the mail tools, `body_file` on event, task and note tools; `categories` / `importance` on `send_email`, `create_draft`, `reply_email` and `update_draft`; `inline_images` on `reply_email` and `update_draft`; `update_draft` can `send`. ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37))
+- `data:` image URIs in an HTML body become inline attachments on every mail-writing tool ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
+
+### Changed
+
+- HTTP mode answers a request body over 64 MiB with `413` and a compressed body with `415`, instead of a generic error ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
+
+### Deprecated
+
+- `send_email` / `create_draft` `html: bool` (use `html_body`), and `update_draft`'s `draft_id` (use `email_id`) ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
 
 ### Fixed
 
