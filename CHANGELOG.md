@@ -27,6 +27,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - `get_task` tool; `get_email` `resolve_inline_images` (`cid:` → `data:`); `save_attachments` `inline` filter ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
 - One date grammar for every date parameter (ISO, keywords such as `start_of_week`, offsets such as `-14d`), and `<field>_after` / `<field>_before` range filters on every list tool ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
 - Shared `list_*` conventions: one `query` syntax (phrases, wildcards, `field:` scopes), list-valued filters, enum filters that mirror output fields (`item_type`, `importance`, `flag`), and `count` / `offset` paging on every list tool ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
+- A Hebrew round-trip test of every text field of every tool over the wire, a live mojibake diagnostic, and README troubleshooting for garbled text ([#40](https://github.com/adamkopelman/outlook-mcp-rs/pull/40)).
 
 ### Changed
 
@@ -42,6 +43,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 ### Fixed
 
 - `list_emails` search with Hebrew or other non-ASCII text returned nothing; it now falls back to a client-side match ([#15](https://github.com/adamkopelman/outlook-mcp-rs/pull/15)).
+- HTTP mode declares `charset=utf-8` on its responses, so clients no longer decode Hebrew as Latin-1 ([#40](https://github.com/adamkopelman/outlook-mcp-rs/pull/40)).
 
 ## [0.3.0] - 2026-07-18
 
