@@ -31,6 +31,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - `delete_event`, `delete_task` and `delete_note` take `permanent`, like `delete_email` ([#41](https://github.com/adamkopelman/outlook-mcp-rs/pull/41)).
 - Every `list_*` tool takes `fields` / `compact` (a per-tool preset) to return less per row, and `output_dir` to write the rows to a JSON Lines file (`{rows_file, count}`) ([#49](https://github.com/adamkopelman/outlook-mcp-rs/pull/49)).
 - Events report `user_is_required` / `user_is_optional` (matched by address and through distribution lists nested up to 10 levels, within a per-call member and time budget; `null` when unknown), `required_count` / `optional_count` and `is_canceled`, with an `is_canceled` filter ([#49](https://github.com/adamkopelman/outlook-mcp-rs/pull/49)).
+- Recurring meetings: every occurrence has an `occurrence_id`; `get_event`, `respond_to_meeting`, `update_event` and `delete_event` act on just that occurrence with it ([#50](https://github.com/adamkopelman/outlook-mcp-rs/pull/50)).
 
 ### Changed
 
@@ -47,6 +48,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 
 - `list_emails` search with Hebrew or other non-ASCII text returned nothing; it now falls back to a client-side match ([#15](https://github.com/adamkopelman/outlook-mcp-rs/pull/15)).
 - HTTP mode declares `charset=utf-8` on its responses, so clients no longer decode Hebrew as Latin-1 ([#40](https://github.com/adamkopelman/outlook-mcp-rs/pull/40)).
+- Ids after a write: every tool that changes an item and leaves it in place returns its current id. `respond_to_meeting` returned none, though accepting gives the item a new one; `update_event`, `update_task` and `update_note` echoed the id they were given ([#50](https://github.com/adamkopelman/outlook-mcp-rs/pull/50)).
 
 ## [0.3.0] - 2026-07-18
 

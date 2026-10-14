@@ -44,8 +44,13 @@ permanent delete. Never set `confirm: true` on your own initiative.
 ## Ids
 
 - Take ids only from a tool result (`list_*`, `create_*`). Never build or guess one.
-- Moving an email (`update_email` with `move_to`) or deleting it **changes its id**.
-  From then on, use the `id` in that call's result, or find the item again.
+- Some writes **change an item's id**:
+  - moving an email (`update_email` with `move_to`);
+  - accepting a meeting;
+  - moving one occurrence;
+  - deleting.
+
+  Every tool that changes an item and leaves it in place returns its current `id` (and `occurrence_id` for an occurrence). From then on, use the ids in that call's result, or find the item again.
 
 ## Quick reference
 

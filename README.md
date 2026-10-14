@@ -207,6 +207,19 @@ The Outlook tools then appear in that client.
 
 If neither `user_is_*` field is requested (see `fields` under [List tool conventions](#list-tool-conventions)), the server skips reading the recipients, which makes the call faster.
 
+### Ids after a write
+
+Ids can change when an item changes:
+- moving an email to another folder;
+- accepting or tentatively accepting a meeting (Outlook replaces the calendar item with a copy);
+- moving one occurrence of a recurring meeting.
+
+So **every tool that changes an item and leaves it in place returns the item's current `id`**, plus `occurrence_id` when it acted on one occurrence:
+- `create_*`, `update_*` and `respond_to_meeting`;
+- `reply_email` and `update_draft` when they save a draft.
+
+Use that id from then on. Tools whose item doesn't stay in place return no id: anything that sends (the mail moves to Sent Items) and deletes.
+
 ### Recurring meetings
 
 `list_events` expands a recurring series into its occurrences. Every occurrence carries two ids:
@@ -217,7 +230,7 @@ If neither `user_is_*` field is requested (see `fields` under [List tool convent
 | `occurrence_id` | this one occurrence: the series id plus its start, `"{id}\|2026-10-14T09:30:00"` | read, answer, move or delete just that date |
 
 `get_event`, `respond_to_meeting`, `update_event` and `delete_event` accept either. Notes:
-- An `occurrence_id` stays valid until that occurrence is moved. `update_event` returns the new `occurrence_id` after a move. If you get "Occurrence not found", the occurrence was moved or deleted elsewhere: call `list_events` for that day again and match on the series `id` and the start.
+- An `occurrence_id` stays valid until that occurrence is moved. `update_event` and `respond_to_meeting` return the occurrence's current `occurrence_id` (see "Ids after a write"). If you get "Occurrence not found", the occurrence was moved or deleted elsewhere: call `list_events` for that day again and match on the series `id` and the start.
 - `recurrence` / `clear_recurrence` always need the series `id`.
 - Deleting an occurrence removes just that date from the series. It never goes to Deleted Items, so `permanent` has no effect.
 - Other tools (`get_email`, `update_email`, …) reject an `occurrence_id`.

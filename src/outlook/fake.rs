@@ -304,7 +304,8 @@ impl OutlookClient for FakeOutlookClient {
             "inline_images": r.inline_images, "inline_content_ids": content_ids(&images),
             "categories": r.categories, "importance": r.importance,
         }))?;
-        Ok(json!({"status": if r.send { "sent" } else { "draft_saved" }}))
+        // Like the real client: a saved reply draft reports its id.
+        Ok(if r.send { json!({"status": "sent"}) } else { json!({"status": "draft_saved", "id": EMAIL_ID}) })
     }
 
     fn update_email(&self, u: EmailUpdate) -> Result<Value, ToolError> {
@@ -435,7 +436,13 @@ impl OutlookClient for FakeOutlookClient {
         parse_event_id(&event_id)?;
         self.record("respond_to_meeting",
             json!({"event_id": event_id, "response": response, "comment": comment, "send": send}))?;
-        Ok(json!({"status": format!("{response}_sent")}))
+        // Like the real client: the ids the item has after the response.
+        let parsed = parse_event_id(&event_id)?;
+        let mut out = json!({"id": parsed.series_id(), "status": format!("{response}_sent")});
+        if let Some(start) = parsed.occurrence_start {
+            out["occurrence_id"] = json!(occurrence::occurrence_id_at(&parsed.series_id(), &start));
+        }
+        Ok(out)
     }
 
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError> {

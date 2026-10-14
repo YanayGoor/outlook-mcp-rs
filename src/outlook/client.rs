@@ -1205,6 +1205,31 @@ fn resolve_occurrence(master: &IDispatch, start: &chrono::NaiveDateTime) -> Opti
     })
 }
 
+/// The ids of a calendar item after a write (see `occurrence::current_ids`),
+/// read back from the item: a write can change them (accepting a meeting
+/// replaces the item; moving an occurrence changes its start). The store
+/// comes from the id the caller passed, since an occurrence's
+/// `Parent.StoreID` is unreliable (see `event_summary`).
+fn event_ids_after(item: &IDispatch, parsed: &EventId) -> Result<Value, ToolError> {
+    let entry_id = variant_to_string(&get_property(item, "EntryID")?);
+    let start = if parsed.is_occurrence() {
+        Some(variant_to_iso_string(&get_property(item, "Start")?)
+            .ok_or_else(|| ToolError::new("could not read the occurrence's start"))?)
+    } else {
+        None
+    };
+    Ok(occurrence::current_ids(&entry_id, &parsed.store_id, start.as_deref()))
+}
+
+/// Adds `ids` (an object) in front of `rest`'s fields.
+fn with_ids(ids: Value, rest: Value) -> Value {
+    let mut out = ids;
+    if let (Some(o), Value::Object(fields)) = (out.as_object_mut(), rest) {
+        o.extend(fields);
+    }
+    out
+}
+
 /// One `get_event` result.
 fn read_event(ns: &IDispatch, event_id: &str, opts: &ReadOptions,
     out_dir: Option<&std::path::Path>, rows: &mut EventRows) -> Result<EventDetail, ToolError> {
@@ -2278,7 +2303,7 @@ impl OutlookClient for WindowsOutlookClient {
         })?;
         self.with_com(|| {
             let (_app, ns) = mapi()?;
-            let (mut item, _) = open_event(&ns, &event_id)?;
+            let (mut item, mut parsed) = open_event(&ns, &event_id)?;
             // A meeting request from the inbox resolves to a MeetingItem; get
             // its appointment. Calendar ids resolve straight to appointments.
             if has_member(&item, "GetAssociatedAppointment") {
@@ -2287,6 +2312,9 @@ impl OutlookClient for WindowsOutlookClient {
                     "GetAssociatedAppointment",
                     &mut [variant_from_bool(true)],
                 )?)?;
+                // The result names the calendar item, not the request.
+                let (entry_id, store_id) = parse_item_id(&make_id(&item)?)?;
+                parsed = EventId { entry_id, store_id, occurrence_start: None };
             }
             let resp = call_method(
                 &item,
@@ -2305,7 +2333,9 @@ impl OutlookClient for WindowsOutlookClient {
             }
             let subject = variant_to_string(&get_property(&item, "Subject")?);
             let status = format!("{response_key}{}", if send { "_sent" } else { "_saved" });
-            Ok(json!({"status": status, "subject": subject}))
+            // Accepting replaces the item with a copy under a new EntryID
+            // (AppointmentItem.Respond docs): return the id it has now.
+            Ok(with_ids(event_ids_after(&item, &parsed)?, json!({"status": status, "subject": subject})))
         })
     }
 
@@ -2421,17 +2451,8 @@ impl OutlookClient for WindowsOutlookClient {
                 call_method(&item, "Save", &mut [])?;
             }
 
-            if parsed.is_occurrence() {
-                // Moving an occurrence changes its id: return the new one.
-                let start = variant_to_iso_string(&get_property(&item, "Start")?)
-                    .ok_or_else(|| ToolError::new("could not read the occurrence's new start"))?;
-                return Ok(json!({
-                    "status": "updated", "id": parsed.series_id(),
-                    "occurrence_id": occurrence::make_occurrence_id(&parsed.series_id(), &start),
-                    "changed": changed,
-                }));
-            }
-            Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
+            // Moving an occurrence changes its id: return the ids it has now.
+            Ok(with_ids(event_ids_after(&item, &parsed)?, json!({"status": "updated", "changed": changed})))
         })
     }
 
@@ -2837,7 +2858,7 @@ impl OutlookClient for WindowsOutlookClient {
             }
 
             call_method(&task, "Save", &mut [])?;
-            Ok(json!({"status": "updated", "id": u.task_id, "changed": changed}))
+            Ok(json!({"status": "updated", "id": make_id(&task)?, "changed": changed}))
         })
     }
 
@@ -2965,7 +2986,7 @@ impl OutlookClient for WindowsOutlookClient {
             }
 
             call_method(&note, "Save", &mut [])?;
-            Ok(json!({"status": "updated", "id": u.note_id, "changed": changed}))
+            Ok(json!({"status": "updated", "id": make_id(&note)?, "changed": changed}))
         })
     }
 

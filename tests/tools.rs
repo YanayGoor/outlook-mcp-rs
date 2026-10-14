@@ -1948,6 +1948,39 @@ async fn delete_event_on_an_occurrence_removes_only_that_date() {
 }
 
 #[tokio::test]
+async fn every_write_that_keeps_its_item_returns_the_current_id() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, NOTE_ID, OCCURRENCE_ID, TASK_ID};
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    macro_rules! call {
+        ($tool:ident, $args:expr) => {
+            result_json(&server.$tool(Parameters(serde_json::from_value($args).unwrap())).await.unwrap())
+        };
+    }
+    let results = [
+        ("create_draft", call!(create_draft, json!({"to": ["a@x.com"], "subject": "s", "body": "b"}))),
+        ("reply_email", call!(reply_email, json!({"email_id": EMAIL_ID, "body": "b", "send": false}))),
+        ("update_email", call!(update_email, json!({"email_id": EMAIL_ID, "mark_read": true}))),
+        ("update_draft", call!(update_draft, json!({"email_id": EMAIL_ID, "subject": "s"}))),
+        ("create_event", call!(create_event, json!({"subject": "s", "start": "2026-06-10T10:00",
+            "end": "2026-06-10T11:00", "send": false}))),
+        ("respond_to_meeting", call!(respond_to_meeting,
+            json!({"event_id": EVENT_ID, "response": "accept", "send": false}))),
+        ("update_event", call!(update_event, json!({"event_id": EVENT_ID, "subject": "s"}))),
+        ("create_task", call!(create_task, json!({"subject": "s"}))),
+        ("update_task", call!(update_task, json!({"task_id": TASK_ID, "subject": "s"}))),
+        ("create_note", call!(create_note, json!({"body": "b"}))),
+        ("update_note", call!(update_note, json!({"note_id": NOTE_ID, "body": "b"}))),
+    ];
+    for (tool, v) in results {
+        assert!(v["id"].is_string(), "{tool} must return the item's current id: {v}");
+    }
+    // Acting on one occurrence also returns its (current) occurrence_id.
+    let v = call!(respond_to_meeting, json!({"event_id": OCCURRENCE_ID, "response": "accept", "send": false}));
+    assert_eq!(v["id"], EVENT_ID);
+    assert_eq!(v["occurrence_id"], OCCURRENCE_ID);
+}
+
+#[tokio::test]
 async fn update_event_lists_changed_fields() {
     use outlook_mcp_rs::outlook::fake::EVENT_ID;
     let fake = Arc::new(FakeOutlookClient::new());

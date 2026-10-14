@@ -1252,7 +1252,7 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Respond to a meeting invite: accept, decline, or tentative. event_id is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. send=false records the response in your calendar without emailing the organizer.")]
+    #[tool(description = "Respond to a meeting invite: accept, decline, or tentative. event_id is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. send=false records the response in your calendar without emailing the organizer. Returns the event's current id (accepting gives the calendar item a new one) and, for an occurrence, its occurrence_id.")]
     pub async fn respond_to_meeting(
         &self,
         Parameters(RespondToMeetingParams { event_id, response, comment, send }): Parameters<RespondToMeetingParams>,
