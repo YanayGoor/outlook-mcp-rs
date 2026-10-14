@@ -29,6 +29,8 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - Shared `list_*` conventions: one `query` syntax (phrases, wildcards, `field:` scopes), list-valued filters, enum filters that mirror output fields (`item_type`, `importance`, `flag`), and `count` / `offset` paging on every list tool ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
 - A Hebrew round-trip test of every text field of every tool over the wire, a live mojibake diagnostic, and README troubleshooting for garbled text ([#40](https://github.com/adamkopelman/outlook-mcp-rs/pull/40)).
 - `delete_event`, `delete_task` and `delete_note` take `permanent`, like `delete_email` ([#41](https://github.com/adamkopelman/outlook-mcp-rs/pull/41)).
+- Every `list_*` tool takes `fields` / `compact` (a per-tool preset) to return less per row, and `output_dir` to write the rows to a JSON Lines file (`{rows_file, count}`) ([#49](https://github.com/adamkopelman/outlook-mcp-rs/pull/49)).
+- Events report `user_is_required` / `user_is_optional` (matched by address and through distribution lists nested up to 10 levels, within a per-call member and time budget; `null` when unknown), `required_count` / `optional_count` and `is_canceled`, with an `is_canceled` filter ([#49](https://github.com/adamkopelman/outlook-mcp-rs/pull/49)).
 
 ### Changed
 
