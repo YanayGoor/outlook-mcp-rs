@@ -28,6 +28,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - One date grammar for every date parameter (ISO, keywords such as `start_of_week`, offsets such as `-14d`), and `<field>_after` / `<field>_before` range filters on every list tool ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
 - Shared `list_*` conventions: one `query` syntax (phrases, wildcards, `field:` scopes), list-valued filters, enum filters that mirror output fields (`item_type`, `importance`, `flag`), and `count` / `offset` paging on every list tool ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
 - A Hebrew round-trip test of every text field of every tool over the wire, a live mojibake diagnostic, and README troubleshooting for garbled text ([#40](https://github.com/adamkopelman/outlook-mcp-rs/pull/40)).
+- `delete_event`, `delete_task` and `delete_note` take `permanent`, like `delete_email` ([#41](https://github.com/adamkopelman/outlook-mcp-rs/pull/41)).
 
 ### Changed
 
