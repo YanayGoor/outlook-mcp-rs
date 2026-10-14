@@ -25,6 +25,7 @@ on stdin and prints a permissionDecision.
 """
 
 import json
+import os
 import sys
 
 # Every outlook-mcp-rs tool is classified below; a test checks the lists
@@ -116,7 +117,22 @@ def bare_tool_name(tool_name):
     return tool_name.rsplit("__", 1)[-1]
 
 
+def autopilot_enabled(env):
+    """False only for the plugin with its calendar_autopilot option off.
+
+    The plugin always registers this hook, and Claude Code exports each
+    plugin option to hook processes as CLAUDE_PLUGIN_OPTION_<KEY>. A hook
+    installed by hand in settings.json (no CLAUDE_PLUGIN_ROOT) is always on.
+    """
+    if "CLAUDE_PLUGIN_ROOT" not in env:
+        return True
+    value = env.get("CLAUDE_PLUGIN_OPTION_CALENDAR_AUTOPILOT", "")
+    return value.strip().lower() in ("true", "1", "yes")
+
+
 def main():
+    if not autopilot_enabled(os.environ):
+        return 0  # Mode off: the normal permission flow decides (it prompts).
     try:
         event = json.load(sys.stdin)
         tool = bare_tool_name(event.get("tool_name", ""))

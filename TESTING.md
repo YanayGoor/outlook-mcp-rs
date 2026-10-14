@@ -186,4 +186,7 @@ inside an `updates` batch, whose undo keeps it) and `delete_event`; the
 shared `notify` flag and its old names; and the MCP safety hints of every
 tool. The `calendar_autopilot` Claude Code hook has its own tests (Python 3,
 standard library only), which also check its tables against the tools' MCP
-hints: `python -m unittest discover hooks`.
+hints: `python -m unittest discover hooks`. They also cover the plugin launcher
+and its on/off option. The Claude Code plugin manifests are checked with
+`claude plugin validate .`; the only expected warning is the deliberately
+missing `version`.

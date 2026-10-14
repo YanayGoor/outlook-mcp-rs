@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from calendar_autopilot import (  # noqa: E402
-    OWN_WRITES, READ_TOOLS, REACHES_OTHERS, bare_tool_name, decide,
+    OWN_WRITES, READ_TOOLS, REACHES_OTHERS, autopilot_enabled, bare_tool_name, decide,
 )
 
 SERVER_RS = os.path.join(os.path.dirname(__file__), os.pardir, "src", "server.rs")
@@ -100,11 +100,39 @@ class DecideTest(unittest.TestCase):
             self.assertIn(tool, reason)
 
 
+class PluginOptionTest(unittest.TestCase):
+    def test_manual_install_is_always_on(self):
+        self.assertTrue(autopilot_enabled({}))
+
+    def test_plugin_follows_its_option(self):
+        root = {"CLAUDE_PLUGIN_ROOT": "/p"}
+        self.assertFalse(autopilot_enabled(root))
+        for on in ["true", "True", "1"]:
+            self.assertTrue(autopilot_enabled({**root, "CLAUDE_PLUGIN_OPTION_CALENDAR_AUTOPILOT": on}))
+        self.assertFalse(autopilot_enabled({**root, "CLAUDE_PLUGIN_OPTION_CALENDAR_AUTOPILOT": "false"}))
+
+
 class HookProtocolTest(unittest.TestCase):
-    def run_hook(self, event):
-        out = subprocess.run([sys.executable, HOOK], input=json.dumps(event),
-                             capture_output=True, text=True, check=True).stdout
+    def run_hook(self, event, env=None, cmd=None):
+        full_env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_PLUGIN")}
+        full_env.update(env or {})
+        out = subprocess.run(cmd or [sys.executable, HOOK], input=json.dumps(event),
+                             capture_output=True, text=True, check=True, env=full_env).stdout
         return json.loads(out) if out else None
+
+    def test_plugin_launcher_runs_the_hook_when_the_mode_is_on(self):
+        launcher = ["sh", os.path.join(os.path.dirname(__file__), "run_calendar_autopilot.sh")]
+        event = {"tool_name": "mcp__plugin_outlook-mcp-rs_outlook__list_events", "tool_input": {}}
+        on = {"CLAUDE_PLUGIN_ROOT": "/p", "CLAUDE_PLUGIN_OPTION_CALENDAR_AUTOPILOT": "true"}
+        out = self.run_hook(event, on, launcher)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
+        self.assertIsNone(self.run_hook(event, {"CLAUDE_PLUGIN_ROOT": "/p"}, launcher), "mode off")
+
+    def test_launcher_asks_when_no_python_is_found(self):
+        launcher = os.path.join(os.path.dirname(__file__), "run_calendar_autopilot.sh")
+        event = {"tool_name": "mcp__plugin_outlook-mcp-rs_outlook__send_email", "tool_input": {}}
+        out = self.run_hook(event, {"PATH": "/nonexistent"}, ["/bin/sh", launcher])
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
 
     def test_prints_a_pre_tool_use_decision(self):
         out = self.run_hook({"tool_name": "mcp__outlook__respond_to_meeting",

@@ -58,6 +58,26 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 Restart the client after editing its config. The server connects to whatever Outlook is
 already running, and the 30 tools below become available.
 
+### Install as a Claude Code plugin
+
+On the Windows machine where Outlook runs, Claude Code can install everything in one step:
+- the MCP server;
+- both [skills](#skills-for-ai-assistants);
+- the optional [calendar autopilot](#calendar-autopilot-claude-code) hook.
+
+Run these in Claude Code:
+
+```
+/plugin marketplace add adamkopelman/outlook-mcp-rs
+/plugin install outlook-mcp-rs@outlook-mcp-rs
+```
+
+Claude Code asks for two settings. You can change both later in `/config`:
+- **outlook-mcp-rs.exe:** the full path to the executable you downloaded or built.
+- **Calendar autopilot:** off by default. When on, reads, silent meeting responses and changes to personal appointments run without a prompt. Anything that can reach other people still asks.
+
+If you added the server by hand before (`claude mcp add` or a `.mcp.json`), remove that entry, or the tools appear twice. `/plugin marketplace update outlook-mcp-rs` picks up new versions. The plugin runs the server over stdio, so it doesn't cover [remote mode](#remote--network-mode-connect-from-another-machine). For that setup, configure the server by hand and copy the skills and hook as described in their sections.
+
 ## Remote / network mode (connect from another machine)
 
 By default the server speaks MCP over **stdio**, which requires the MCP client
@@ -394,7 +414,9 @@ When an assistant organizes your calendar, most of its calls only touch your own
 
 `require_no_attendees: true` is enforced by the server. It refuses to change an event that is a meeting, or to add attendees, and changes nothing in that case. So an auto-approved call can never move a meeting someone else attends. An `undo` keeps the flag, so rolling back an auto-approved batch is auto-approved too.
 
-To turn it on, add this to `.claude/settings.json`:
+**With the [plugin](#install-as-a-claude-code-plugin):** the hook is already installed. Turn on its **Calendar autopilot** option (`/config`, or when you install). Nothing else is needed: the plugin registers the hook for its own server.
+
+**Without the plugin:** add this to `.claude/settings.json`:
 - in the folder where you run your calendar skill, so it acts as a mode for that project only;
 - or in `~/.claude/settings.json` for every session.
 
@@ -500,8 +522,9 @@ that teach an assistant (such as Claude Code) to use these tools well:
 - [`troubleshooting-outlook-mcp`](skills/troubleshooting-outlook-mcp/SKILL.md) maps each
   error message to its cause and fix, and covers results that look wrong without an error.
 
-To use them with Claude Code, copy both folders into `~/.claude/skills/` (for every
-project) or into a project's `.claude/skills/`.
+The [Claude Code plugin](#install-as-a-claude-code-plugin) installs them. Without it,
+copy both folders into `~/.claude/skills/` (for every project) or into a project's
+`.claude/skills/`.
 
 ## Development
 

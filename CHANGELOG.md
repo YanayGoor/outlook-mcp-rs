@@ -36,6 +36,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - Every `update_*` result has `undo`, the update that reverts it (pass a batch's `undo` objects as `updates` to roll it back), and `not_undoable` for what it can't revert ([#51](https://github.com/adamkopelman/outlook-mcp-rs/pull/51)).
 - `require_no_attendees` on `create_event`, `update_event` and `delete_event`: the server refuses, changing nothing, to touch a meeting with attendees or add any ([#53](https://github.com/adamkopelman/outlook-mcp-rs/pull/53)).
 - MCP safety hints (read-only, destructive, open-world) on every tool, and a calendar-autopilot Claude Code hook (`hooks/calendar_autopilot.py`) that auto-approves reads, silent meeting responses and guarded event changes and asks for everything else ([#53](https://github.com/adamkopelman/outlook-mcp-rs/pull/53)).
+- A Claude Code plugin: `/plugin marketplace add adamkopelman/outlook-mcp-rs` installs the MCP server, both skills and the calendar-autopilot hook (off until its option is turned on) ([#55](https://github.com/adamkopelman/outlook-mcp-rs/pull/55)).
 
 ### Changed
 

@@ -30,7 +30,7 @@ The calendar tools call this flag `notify`; the mail tools' `send` means "send r
 
 When the user's intent is ambiguous ("write to Dana about…"), make a draft and say so.
 
-**Calendar autopilot.** The user may have the `calendar_autopilot` hook installed (README, "Calendar autopilot"). Then some calls run without a prompt:
+**Calendar autopilot.** The user may have the `calendar_autopilot` hook on: the plugin's "Calendar autopilot" option, or the hook added by hand (README, "Calendar autopilot"). Then some calls run without a prompt:
 - reads;
 - `respond_to_meeting` with `notify: false`;
 - `update_event` with `require_no_attendees: true` (on every entry of `updates`).
