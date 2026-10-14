@@ -145,21 +145,27 @@ tasks and notes) are covered by read-only live tests:
 On a day-first Windows locale the date test can still fail because of issue #1
 (`jet_datetime`), which is independent of the grammar.
 
-`list_events`' `user_is_required` / `user_is_optional`, attendee counts,
-`include_canceled` and the skipped role computation (issues #43, #44) are
-covered by a read-only live test over this week's real calendar:
+`list_events`' `user_is_required` / `user_is_optional` (including `null`
+when list expansion hits its bounds), attendee counts, the `is_canceled`
+filter, the skipped role computation, and the time the role computation
+adds (issues #43, #44) are covered by a read-only live test over this
+week's real calendar:
 `cargo test --test live_outlook -- --ignored list_events_user_role_and_compact_fields_on_a_real_week`.
-It prints how many invites the user was found on; check that number against
-Outlook, especially for meetings sent to a distribution list.
+It prints how many invites the user was found on, how many came back
+unknown, and both timings; check the counts against Outlook, especially for
+meetings sent to a distribution list. `fields` / `compact` / `output_dir`
+on every list tool are covered by the fake-based tool tests.
 
 Occurrence ids (issue #45) are covered by a live test that creates a
 far-future daily series of personal appointments (nothing is sent), reads,
 moves and deletes single occurrences, and deletes the series:
 `cargo test --test live_outlook -- --ignored occurrence_ids_act_on_one_occurrence_only`.
 
-`move_events` (issue #46) is covered by a live test that moves a far-future
-personal appointment, checks the kept duration, and moves it back:
-`cargo test --test live_outlook -- --ignored move_event_keeps_duration_and_undo_restores_it`.
+Batch writes and `undo` (issue #46) are covered by the fake-based tool tests
+(lists of ids and `updates` on every write tool, per-item errors, and
+rolling a batch back with its `undo` objects), and by a live test that
+updates a far-future personal appointment and puts it back with its `undo`:
+`cargo test --test live_outlook -- --ignored update_event_undo_restores_the_previous_values`.
 Batch `respond_to_meeting` reuses the single-response client path once per
 id, so it has no separate live test (a live response would notify a real
 organizer).

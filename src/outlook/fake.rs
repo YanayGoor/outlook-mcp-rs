@@ -7,9 +7,10 @@ use crate::error::ToolError;
 use super::types::*;
 use super::filters::DateRange;
 use super::occurrence;
+use super::undo::{self, Undo};
 use super::{
     require_empty_confirm, deleted_note, delete_occurrence_note, validate_occurrence_update, validate_recurrence_update, CheckAvailabilityInput,
-    CreateEventInput, EventMove, moved_times,
+    CreateEventInput,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     TaskQuery, TaskUpdate, draft_update_changes, validate_draft_update, DraftUpdate, NewEmail,
     ReplyInput, parse_importance, prepare_html_images, prepare_mail_body, ValidatedInlineImage,
@@ -52,6 +53,38 @@ fn parse_event_id(id: &str) -> Result<occurrence::EventId, ToolError> {
         });
     }
     occurrence::parse_event_id(id)
+}
+
+/// The fake's undo: every item's previous state is the canned one
+/// (subject "Standup", 09:00-09:30 on 2026-06-10, read, no flag, normal
+/// importance, category "Work", yellow, 0% done), so tests can check that
+/// each changed field gets an undo value and the rest stay out of it.
+fn fake_undo(changed: &[&str]) -> Undo {
+    let mut undo = Undo::new();
+    for field in changed {
+        match *field {
+            "subject" => undo.set("subject", "Standup"),
+            "start" | "end" => {
+                undo.set("start", "2026-06-10T09:00:00");
+                undo.set("end", "2026-06-10T09:30:00");
+            }
+            "location" => undo.set("location", ""),
+            "all_day" => undo.set("all_day", false),
+            "show_as" => undo.set("show_as", "busy"),
+            "mark_read" => undo.set("mark_read", true),
+            "flag" => undo.set("flag", "clear"),
+            "importance" => undo.set("importance", "normal"),
+            "move_to" => undo.set("move_to", "Inbox"),
+            "color" => undo.set("color", "yellow"),
+            "percent_complete" => undo.set("percent_complete", 0),
+            "mark_complete" => undo.set("mark_complete", false),
+            "due_date" | "start_date" | "reminder_time" | "reminder_minutes" => undo.not_undoable(field),
+            "add_categories" | "remove_categories" | "add_required_attendees"
+            | "add_optional_attendees" => {}
+            _ => undo.not_undoable(field),
+        }
+    }
+    undo
 }
 
 /// What a batch read records: the ids plus the resolved options.
@@ -166,7 +199,7 @@ impl FakeOutlookClient {
             location: self.t(""), organizer: self.t(""), all_day: false,
             is_recurring: false, is_meeting: false, is_canceled: false, categories: self.tv(&[]),
             show_as: "busy".into(), my_response: "accepted".into(),
-            user_is_required: true, user_is_optional: false, required_count: 0, optional_count: 0,
+            user_is_required: Some(true), user_is_optional: Some(false), required_count: 0, optional_count: 0,
             required_attendees: self.t(""), optional_attendees: self.t(""),
         }
     }
@@ -304,7 +337,8 @@ impl OutlookClient for FakeOutlookClient {
             "inline_images": r.inline_images, "inline_content_ids": content_ids(&images),
             "categories": r.categories, "importance": r.importance,
         }))?;
-        Ok(json!({"status": if r.send { "sent" } else { "draft_saved" }}))
+        // Like the real client: a saved reply draft reports its id.
+        Ok(if r.send { json!({"status": "sent"}) } else { json!({"status": "draft_saved", "id": EMAIL_ID}) })
     }
 
     fn update_email(&self, u: EmailUpdate) -> Result<Value, ToolError> {
@@ -327,7 +361,10 @@ impl OutlookClient for FakeOutlookClient {
         } else {
             u.email_id.clone()
         };
-        Ok(json!({"status": "updated", "id": id, "changed": changed}))
+        let mut undo = fake_undo(&changed);
+        undo.categories(&["Work".to_string()], u.add_categories.as_deref(), u.remove_categories.as_deref());
+        let result = json!({"status": "updated", "id": id, "changed": changed});
+        Ok(undo::merged(result, undo.finish("email_id", &id, &[])))
     }
 
     fn update_draft(&self, u: DraftUpdate) -> Result<Value, ToolError> {
@@ -352,7 +389,10 @@ impl OutlookClient for FakeOutlookClient {
         if u.send {
             return Ok(json!({"status": "sent", "subject": u.subject.unwrap_or_default(), "changed": changed}));
         }
-        Ok(json!({"status": "draft_updated", "id": u.email_id, "changed": changed}))
+        let mut undo = fake_undo(&changed);
+        undo.categories(&["Work".to_string()], u.add_categories.as_deref(), u.remove_categories.as_deref());
+        let result = json!({"status": "draft_updated", "id": u.email_id, "changed": changed});
+        Ok(undo::merged(result, undo.finish("email_id", &u.email_id, &[])))
     }
 
     fn delete_email(&self, email_id: String, permanent: bool) -> Result<Value, ToolError> {
@@ -375,7 +415,7 @@ impl OutlookClient for FakeOutlookClient {
             "category": q.category, "show_as": q.show_as, "my_response": q.my_response,
             "attendees": q.attendees, "attendee_role": q.attendee_role,
             "meetings_only": q.meetings_only, "all_day": q.all_day,
-            "calendar_of": q.calendar_of, "include_canceled": q.include_canceled,
+            "calendar_of": q.calendar_of, "is_canceled": q.is_canceled,
             "user_role": q.user_role, "count": q.count, "offset": q.offset,
         }))?;
         Ok(vec![self.event_summary(EVENT_ID.into())])
@@ -435,7 +475,13 @@ impl OutlookClient for FakeOutlookClient {
         parse_event_id(&event_id)?;
         self.record("respond_to_meeting",
             json!({"event_id": event_id, "response": response, "comment": comment, "send": send}))?;
-        Ok(json!({"status": format!("{response}_sent")}))
+        // Like the real client: the ids the item has after the response.
+        let parsed = parse_event_id(&event_id)?;
+        let mut out = json!({"id": parsed.series_id(), "status": format!("{response}_sent")});
+        if let Some(start) = parsed.occurrence_start {
+            out["occurrence_id"] = json!(occurrence::occurrence_id_at(&parsed.series_id(), &start));
+        }
+        Ok(out)
     }
 
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError> {
@@ -472,46 +518,26 @@ impl OutlookClient for FakeOutlookClient {
         if u.remove_attendees.is_some() { changed.push("remove_attendees"); }
         if u.recurrence.is_some() { changed.push("recurrence"); }
         if u.clear_recurrence { changed.push("clear_recurrence"); }
+        let mut undo = fake_undo(&changed);
+        undo.categories(&["Work".to_string()], u.add_categories.as_deref(), u.remove_categories.as_deref());
+        let added: Vec<String> = u.add_required_attendees.iter().chain(&u.add_optional_attendees)
+            .flatten().cloned().collect();
+        if !added.is_empty() {
+            undo.set("remove_attendees", added);
+        }
+        let keep = [("send_update", json!(u.send_update))];
         if let Some(old_start) = parsed.occurrence_start {
             let start = match u.start.as_deref() {
                 Some(s) => super::dates::parse_date_param(s, "start", FAKE_WEEK_START)?.at,
                 None => old_start,
             };
-            return Ok(json!({"status": "updated", "id": parsed.series_id(),
-                "occurrence_id": occurrence::occurrence_id_at(&parsed.series_id(), &start),
-                "changed": changed}));
+            let occurrence_id = occurrence::occurrence_id_at(&parsed.series_id(), &start);
+            let result = json!({"status": "updated", "id": parsed.series_id(),
+                "occurrence_id": occurrence_id, "changed": changed});
+            return Ok(undo::merged(result, undo.finish("event_id", &occurrence_id, &keep)));
         }
-        Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
-    }
-
-    /// Every event starts at 2026-06-10 09:00 and lasts 30 minutes (an
-    /// occurrence at its id's start), so results are predictable.
-    fn move_event(&self, m: EventMove) -> Result<Value, ToolError> {
-        let parsed = parse_event_id(&m.event_id)?;
-        if m.event_id == MISSING_ID {
-            return Err(not_found(&m.event_id));
-        }
-        let parse = |s: &str, f: &str| super::dates::parse_date_param(s, f, FAKE_WEEK_START).map(|d| d.at);
-        let new_start = parse(&m.start, "start")?;
-        let new_end = m.end.as_deref().map(|e| parse(e, "end")).transpose()?;
-        self.record("move_events", json!({
-            "event_id": m.event_id, "start": m.start, "end": m.end, "send_update": m.send_update,
-        }))?;
-        let prev_start = parsed.occurrence_start.unwrap_or_else(|| {
-            chrono::NaiveDateTime::parse_from_str("2026-06-10T09:00:00", "%Y-%m-%dT%H:%M:%S").unwrap()
-        });
-        let prev_end = prev_start + chrono::Duration::minutes(30);
-        let (start, end) = moved_times(prev_start, prev_end, new_start, new_end)?;
-        let fmt = occurrence::format_start;
-        let mut out = json!({
-            "id": parsed.series_id(), "subject": self.t("Standup"),
-            "previous_start": fmt(&prev_start), "previous_end": fmt(&prev_end),
-            "start": fmt(&start), "end": fmt(&end), "notified": false,
-        });
-        if parsed.is_occurrence() {
-            out["occurrence_id"] = json!(occurrence::occurrence_id_at(&parsed.series_id(), &start));
-        }
-        Ok(out)
+        let result = json!({"status": "updated", "id": u.event_id, "changed": changed});
+        Ok(undo::merged(result, undo.finish("event_id", &u.event_id, &keep)))
     }
 
     fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
@@ -705,7 +731,10 @@ impl OutlookClient for FakeOutlookClient {
         if u.remove_categories.is_some() { changed.push("remove_categories"); }
         if u.percent_complete.is_some() { changed.push("percent_complete"); }
         if u.reminder_time.is_some() { changed.push("reminder_time"); }
-        Ok(json!({"status": "updated", "id": u.task_id, "changed": changed}))
+        let mut undo = fake_undo(&changed);
+        undo.categories(&["Work".to_string()], u.add_categories.as_deref(), u.remove_categories.as_deref());
+        let result = json!({"status": "updated", "id": u.task_id, "changed": changed});
+        Ok(undo::merged(result, undo.finish("task_id", &u.task_id, &[])))
     }
 
     fn delete_task(&self, task_id: String, permanent: bool) -> Result<Value, ToolError> {
@@ -758,7 +787,10 @@ impl OutlookClient for FakeOutlookClient {
         if u.add_categories.is_some() { changed.push("add_categories"); }
         if u.remove_categories.is_some() { changed.push("remove_categories"); }
         if u.color.is_some() { changed.push("color"); }
-        Ok(json!({"status": "updated", "id": u.note_id, "changed": changed}))
+        let mut undo = fake_undo(&changed);
+        undo.categories(&["Work".to_string()], u.add_categories.as_deref(), u.remove_categories.as_deref());
+        let result = json!({"status": "updated", "id": u.note_id, "changed": changed});
+        Ok(undo::merged(result, undo.finish("note_id", &u.note_id, &[])))
     }
 
     fn delete_note(&self, note_id: String, permanent: bool) -> Result<Value, ToolError> {

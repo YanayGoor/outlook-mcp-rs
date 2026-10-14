@@ -4,12 +4,13 @@ use outlook_mcp_rs::outlook::fake::{FakeOutlookClient, EMAIL_ID};
 use outlook_mcp_rs::server::{
     CheckAvailabilityParams, CreateDraftParams, CreateEventParams, CreateNoteParams, CreateTaskParams,
     DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams,
-    GetEventParams, GetInlineImageParams, MoveEventsParams, GetNoteParams, GetTaskParams, ListAttachmentsParams,
+    GetEventParams, GetInlineImageParams, GetNoteParams, GetTaskParams, ListAttachmentsParams,
     EmptyDeletedItemsParams,
-    ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
+    ListEmailsParams, ListEventsParams, ListFoldersParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
     SendEmailParams, UpdateDraftParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
 };
+use outlook_mcp_rs::params::OneOrMany;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
@@ -45,7 +46,7 @@ fn result_json(result: &CallToolResult) -> Value {
 async fn list_folders_records_call() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server.list_folders().await.unwrap();
+    server.list_folders(Parameters(ListFoldersParams::default())).await.unwrap();
     assert_eq!(fake.calls(), vec![("list_folders".to_string(), json!({}))]);
 }
 
@@ -609,10 +610,6 @@ fn utf8_cases() -> Vec<Utf8Case> {
             json!({"event_id": [EVENT_ID, EVENT_ID], "response": "decline", "comment": h,
                    "send": false}),
             vec![]),
-        case("move_events",
-            json!({"moves": [{"event_id": EVENT_ID, "start": "2026-06-11T10:00"}],
-                   "send_update": false}),
-            vec![("/results/0/subject", HE_TEXT)]),
         case("update_event",
             json!({"event_id": EVENT_ID, "subject": h, "location": h, "body": h,
                    "add_categories": [h], "remove_categories": [h],
@@ -1276,7 +1273,7 @@ async fn update_draft_rejects_bad_inputs_without_touching_the_draft() {
 fn write_tool_schemas_reflect_the_new_body_convention() {
     // Compared sorted: the order schemars lists required fields in is not part of the contract.
     let required = |schema: schemars::Schema| {
-        let mut names: Vec<String> = serde_json::from_value(serde_json::to_value(&schema).unwrap()["required"].clone()).unwrap();
+        let mut names: Vec<String> = serde_json::from_value(serde_json::to_value(&schema).unwrap()["required"].clone()).unwrap_or_default();
         names.sort();
         json!(names)
     };
@@ -1284,7 +1281,8 @@ fn write_tool_schemas_reflect_the_new_body_convention() {
     assert_eq!(required(schemars::schema_for!(SendEmailParams)), json!(["subject", "to"]));
     assert_eq!(required(schemars::schema_for!(CreateDraftParams)), json!(["subject", "to"]));
     assert_eq!(required(schemars::schema_for!(ReplyEmailParams)), json!(["email_id"]));
-    assert_eq!(required(schemars::schema_for!(UpdateDraftParams)), json!(["email_id"]));
+    // email_id may be omitted when `updates` carries the ids (see write_items).
+    assert_eq!(required(schemars::schema_for!(UpdateDraftParams)), json!([]));
     for schema in [
         schemars::schema_for!(SendEmailParams), schemars::schema_for!(CreateDraftParams),
         schemars::schema_for!(ReplyEmailParams), schemars::schema_for!(UpdateDraftParams),
@@ -1359,10 +1357,11 @@ async fn update_email_move_returns_new_id() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .update_email(Parameters(UpdateEmailParams {
-            email_id: EMAIL_ID.to_string(),
+            email_id: Some(OneOrMany::One(EMAIL_ID.to_string())),
             move_to: Some("Archive".to_string()),
             mark_read: None, flag: None, add_categories: None,
             remove_categories: None, importance: None,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -1378,13 +1377,14 @@ async fn update_email_state_only_keeps_same_id_and_lists_changes() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .update_email(Parameters(UpdateEmailParams {
-            email_id: EMAIL_ID.to_string(),
+            email_id: Some(OneOrMany::One(EMAIL_ID.to_string())),
             move_to: None,
             mark_read: Some(true),
             flag: Some("follow_up".to_string()),
             add_categories: Some(vec!["Work".to_string()]),
             remove_categories: None,
             importance: Some("high".to_string()),
+            updates: None,
         }))
         .await
         .unwrap();
@@ -1572,6 +1572,78 @@ async fn list_events_filters_accept_lists_and_single_values() {
     assert!(err.message.contains("Invalid show_as \"away\""), "{}", err.message);
 }
 
+/// Calls one list tool with `args` and returns its JSON rows.
+async fn list_rows(server: &OutlookMcpServer, tool: &str, args: Value) -> Value {
+    let result = match tool {
+        "list_folders" => server.list_folders(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_emails" => server.list_emails(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_events" => server.list_events(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_tasks" => server.list_tasks(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_notes" => server.list_notes(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_attachments" => {
+            let mut args = args;
+            args["email_id"] = json!(EMAIL_ID);
+            server.list_attachments(Parameters(serde_json::from_value(args).unwrap())).await
+        }
+        other => panic!("not a list tool: {other}"),
+    };
+    result_json(&result.unwrap())
+}
+
+#[tokio::test]
+async fn every_list_tool_supports_fields_and_compact() {
+    use outlook_mcp_rs::outlook::rows::*;
+    let specs = [("list_folders", FOLDER_ROWS), ("list_emails", EMAIL_ROWS),
+        ("list_events", EVENT_ROWS), ("list_tasks", TASK_ROWS), ("list_notes", NOTE_ROWS),
+        ("list_attachments", ATTACHMENT_ROWS)];
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    for (tool, spec) in specs {
+        // The table lists exactly the fields a row has.
+        let rows = list_rows(&server, tool, json!({})).await;
+        // occurrence_id only appears on occurrences of a recurring series.
+        let sometimes = |f: &&str| *f != "occurrence_id";
+        let mut keys: Vec<&str> = rows[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut all: Vec<&str> = spec.all.iter().copied().filter(sometimes).collect();
+        keys.sort();
+        all.sort();
+        assert_eq!(keys, all, "{tool}: rows::*_ROWS.all is out of date");
+
+        let rows = list_rows(&server, tool, json!({"compact": true})).await;
+        let mut keys: Vec<&str> = rows[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut compact: Vec<&str> = spec.compact.iter().copied().filter(sometimes).collect();
+        keys.sort();
+        compact.sort();
+        assert_eq!(keys, compact, "{tool}: compact");
+
+        let first = spec.all[0];
+        let rows = list_rows(&server, tool, json!({"fields": [first]})).await;
+        assert_eq!(rows[0].as_object().unwrap().len(), 1, "{tool}: fields");
+        assert!(rows[0].get(first).is_some(), "{tool}: fields");
+    }
+    // A batch of list_attachments applies fields inside each item.
+    let v = result_json(&server.list_attachments(Parameters(serde_json::from_value(
+        json!({"email_id": [EMAIL_ID], "fields": ["filename"]})).unwrap())).await.unwrap());
+    assert_eq!(v[0]["attachments"][0].as_object().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn every_list_tool_can_write_its_rows_to_a_json_lines_file() {
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    let dir = std::env::temp_dir().join(format!("omcp-list-rows-{}", std::process::id()));
+    let dir_s = dir.to_str().unwrap().to_string();
+    for tool in ["list_folders", "list_emails", "list_events", "list_tasks", "list_notes", "list_attachments"] {
+        let inline = list_rows(&server, tool, json!({"compact": true})).await;
+        let v = list_rows(&server, tool, json!({"compact": true, "output_dir": dir_s})).await;
+        let path = v["rows_file"].as_str().unwrap_or_else(|| panic!("{tool}: {v}"));
+        assert!(path.contains(tool) && path.ends_with(".jsonl"), "{path}");
+        let lines: Vec<Value> = std::fs::read_to_string(path).unwrap().lines()
+            .map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(v["count"], lines.len(), "{tool}");
+        assert_eq!(Value::Array(lines), inline, "{tool}: the file holds the same rows");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn list_events_returns_every_field_by_default() {
     let fake = Arc::new(FakeOutlookClient::new());
@@ -1580,15 +1652,15 @@ async fn list_events_returns_every_field_by_default() {
     let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
     let row = v[0].as_object().unwrap();
     // occurrence_id is only present on occurrences of a recurring series.
-    for field in outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS {
+    for field in outlook_mcp_rs::outlook::rows::EVENT_ROWS.all {
         assert_eq!(row.contains_key(*field), *field != "occurrence_id", "{field}");
     }
-    assert_eq!(row.len(), outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS.len() - 1);
+    assert_eq!(row.len(), outlook_mcp_rs::outlook::rows::EVENT_ROWS.all.len() - 1);
     assert_eq!(v[0]["user_is_required"], true);
     assert_eq!(v[0]["user_is_optional"], false);
     assert_eq!(v[0]["is_canceled"], false);
     let (_, args) = fake.calls().pop().unwrap();
-    assert_eq!(args["include_canceled"], true);
+    assert_eq!(args["is_canceled"], Value::Null);
     assert_eq!(args["user_role"], true);
 }
 
@@ -1599,7 +1671,7 @@ async fn list_events_compact_returns_the_preset_fields() {
     let params: ListEventsParams = serde_json::from_value(json!({"compact": true})).unwrap();
     let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
     let mut keys: Vec<&str> = v[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    let mut want = outlook_mcp_rs::outlook::event_rows::COMPACT_EVENT_FIELDS.to_vec();
+    let mut want = outlook_mcp_rs::outlook::rows::EVENT_ROWS.compact.to_vec();
     want.retain(|f| *f != "occurrence_id"); // a one-off event has none
     keys.sort();
     want.sort();
@@ -1629,13 +1701,13 @@ async fn list_events_fields_pick_exact_fields_and_skip_unneeded_work() {
 }
 
 #[tokio::test]
-async fn list_events_forwards_include_canceled() {
+async fn list_events_forwards_the_is_canceled_filter() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
     let params: ListEventsParams =
-        serde_json::from_value(json!({"include_canceled": false})).unwrap();
+        serde_json::from_value(json!({"is_canceled": false})).unwrap();
     server.list_events(Parameters(params)).await.unwrap();
-    assert_eq!(fake.calls().pop().unwrap().1["include_canceled"], false);
+    assert_eq!(fake.calls().pop().unwrap().1["is_canceled"], false);
 }
 
 #[tokio::test]
@@ -1908,56 +1980,147 @@ async fn respond_to_meeting_batch_returns_per_item_results() {
 }
 
 #[tokio::test]
-async fn move_events_reports_previous_times_and_an_undo() {
-    use outlook_mcp_rs::outlook::fake::{EVENT_ID, MISSING_ID, OCCURRENCE_ID};
-    let fake = Arc::new(FakeOutlookClient::new());
-    let server = OutlookMcpServer::new(fake.clone());
-    let params: MoveEventsParams = serde_json::from_value(json!({
-        "moves": [
-            {"event_id": EVENT_ID, "start": "2026-06-11T10:00"},
-            {"event_id": MISSING_ID, "start": "2026-06-11T10:00"},
-            {"event_id": OCCURRENCE_ID, "start": "2026-06-12T15:00", "end": "2026-06-12T16:00"}
-        ],
-        "send_update": false
-    })).unwrap();
-    let v = result_json(&server.move_events(Parameters(params)).await.unwrap());
-    let r = &v["results"];
-    assert_eq!(r[0]["previous_start"], "2026-06-10T09:00:00");
-    assert_eq!(r[0]["start"], "2026-06-11T10:00:00");
-    assert_eq!(r[0]["end"], "2026-06-11T10:30:00", "duration kept");
-    assert_eq!(r[1]["event_id"], MISSING_ID);
-    assert!(r[1]["error"].is_string());
-    assert_eq!(r[2]["occurrence_id"], "entry-2|store-1|2026-06-12T15:00:00");
-    assert_eq!(r[2]["end"], "2026-06-12T16:00:00");
-    assert_eq!(v["undo"]["moves"], json!([
-        {"event_id": EVENT_ID, "start": "2026-06-10T09:00:00", "end": "2026-06-10T09:30:00"},
-        {"event_id": "entry-2|store-1|2026-06-12T15:00:00",
-         "start": "2026-06-10T09:00:00", "end": "2026-06-10T09:30:00"},
-    ]));
-    assert!(fake.calls().iter().all(|(n, a)| n == "move_events" && a["send_update"] == false));
-
-    // The undo moves are valid move_events input.
-    let undo: MoveEventsParams = serde_json::from_value(json!({"moves": v["undo"]["moves"]})).unwrap();
-    assert_eq!(undo.moves.len(), 2);
-    assert!(undo.send_update, "send_update defaults to true");
+async fn every_write_that_keeps_its_item_returns_the_current_id() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, NOTE_ID, OCCURRENCE_ID, TASK_ID};
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    macro_rules! call {
+        ($tool:ident, $args:expr) => {
+            result_json(&server.$tool(Parameters(serde_json::from_value($args).unwrap())).await.unwrap())
+        };
+    }
+    let results = [
+        ("create_draft", call!(create_draft, json!({"to": ["a@x.com"], "subject": "s", "body": "b"}))),
+        ("reply_email", call!(reply_email, json!({"email_id": EMAIL_ID, "body": "b", "send": false}))),
+        ("update_email", call!(update_email, json!({"email_id": EMAIL_ID, "mark_read": true}))),
+        ("update_draft", call!(update_draft, json!({"email_id": EMAIL_ID, "subject": "s"}))),
+        ("create_event", call!(create_event, json!({"subject": "s", "start": "2026-06-10T10:00",
+            "end": "2026-06-10T11:00", "send": false}))),
+        ("respond_to_meeting", call!(respond_to_meeting,
+            json!({"event_id": EVENT_ID, "response": "accept", "send": false}))),
+        ("update_event", call!(update_event, json!({"event_id": EVENT_ID, "subject": "s"}))),
+        ("create_task", call!(create_task, json!({"subject": "s"}))),
+        ("update_task", call!(update_task, json!({"task_id": TASK_ID, "subject": "s"}))),
+        ("create_note", call!(create_note, json!({"body": "b"}))),
+        ("update_note", call!(update_note, json!({"note_id": NOTE_ID, "body": "b"}))),
+    ];
+    for (tool, v) in results {
+        assert!(v["id"].is_string(), "{tool} must return the item's current id: {v}");
+    }
+    // Acting on one occurrence also returns its (current) occurrence_id.
+    let v = call!(respond_to_meeting, json!({"event_id": OCCURRENCE_ID, "response": "accept", "send": false}));
+    assert_eq!(v["id"], EVENT_ID);
+    assert_eq!(v["occurrence_id"], OCCURRENCE_ID);
 }
 
 #[tokio::test]
-async fn move_events_rejects_empty_and_oversized_batches_and_bad_ends() {
-    use outlook_mcp_rs::outlook::fake::EVENT_ID;
+async fn every_write_tool_takes_a_list_of_ids_with_per_item_results() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, MISSING_ID, NOTE_ID, TASK_ID};
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    macro_rules! call {
+        ($tool:ident, $args:expr) => {
+            result_json(&server.$tool(Parameters(serde_json::from_value($args).unwrap())).await.unwrap())
+        };
+    }
+    let bad = "e|s|not-a-date";
+    let cases = [
+        ("update_email", call!(update_email, json!({"email_id": [EMAIL_ID, EMAIL_ID], "mark_read": true}))),
+        ("update_draft", call!(update_draft, json!({"email_id": [EMAIL_ID, EMAIL_ID], "subject": "s"}))),
+        ("delete_email", call!(delete_email, json!({"email_id": [EMAIL_ID, EMAIL_ID]}))),
+        ("update_event", call!(update_event, json!({"event_id": [EVENT_ID, bad], "subject": "s"}))),
+        ("delete_event", call!(delete_event, json!({"event_id": [EVENT_ID, bad], "send_cancellation": false}))),
+        ("respond_to_meeting", call!(respond_to_meeting,
+            json!({"event_id": [EVENT_ID, bad], "response": "accept", "send": false}))),
+        ("update_task", call!(update_task, json!({"task_id": [TASK_ID, TASK_ID], "subject": "s"}))),
+        ("delete_task", call!(delete_task, json!({"task_id": [TASK_ID, TASK_ID]}))),
+        ("update_note", call!(update_note, json!({"note_id": [NOTE_ID, NOTE_ID], "body": "b"}))),
+        ("delete_note", call!(delete_note, json!({"note_id": [NOTE_ID, NOTE_ID]}))),
+    ];
+    for (tool, v) in cases {
+        let items = v.as_array().unwrap_or_else(|| panic!("{tool}: a list in, a list out: {v}"));
+        assert_eq!(items.len(), 2, "{tool}");
+        assert!(items[0].get("error").is_none(), "{tool}: {v}");
+    }
+    // A failing item doesn't stop the rest, and names its id.
+    let v = call!(update_event, json!({"event_id": [bad, EVENT_ID], "subject": "s"}));
+    assert_eq!(v[0]["id"], bad);
+    assert!(v[0]["error"].as_str().unwrap().contains("Invalid event id"));
+    assert_eq!(v[1]["status"], "updated");
+    let _ = MISSING_ID;
+}
+
+#[tokio::test]
+async fn updates_apply_different_changes_per_item_and_undo_rolls_them_back() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, OCCURRENCE_ID};
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    let params: MoveEventsParams = serde_json::from_value(json!({"moves": []})).unwrap();
-    assert!(server.move_events(Parameters(params)).await.is_err());
-    let many: Vec<Value> = (0..101).map(|_| json!({"event_id": EVENT_ID, "start": "today"})).collect();
-    let params: MoveEventsParams = serde_json::from_value(json!({"moves": many})).unwrap();
-    assert!(server.move_events(Parameters(params)).await.is_err());
-    let params: MoveEventsParams = serde_json::from_value(json!({"moves": [
-        {"event_id": EVENT_ID, "start": "2026-06-11T10:00", "end": "2026-06-11T09:00"}
+    let params: UpdateEventParams = serde_json::from_value(json!({"updates": [
+        {"event_id": EVENT_ID, "start": "2026-06-11T10:00", "end": "2026-06-11T10:30", "send_update": false},
+        {"event_id": OCCURRENCE_ID, "subject": "Moved standup", "add_categories": ["Blue"], "body": "b"},
     ]})).unwrap();
-    let v = result_json(&server.move_events(Parameters(params)).await.unwrap());
-    assert!(v["results"][0]["error"].as_str().unwrap().contains("before start"));
-    assert_eq!(v["undo"]["moves"], json!([]));
+    let v = result_json(&server.update_event(Parameters(params)).await.unwrap());
+    assert_eq!(v[0]["undo"], json!({"event_id": EVENT_ID, "start": "2026-06-10T09:00:00",
+        "end": "2026-06-10T09:30:00", "send_update": false}));
+    assert_eq!(v[1]["undo"], json!({"event_id": OCCURRENCE_ID, "subject": "Standup",
+        "remove_categories": ["Blue"], "send_update": true}));
+    assert_eq!(v[1]["not_undoable"], json!(["body"]));
+    let calls = fake.calls();
+    assert_eq!(calls[0].1["start"], "2026-06-11T10:00");
+    assert_eq!(calls[1].1["subject"], "Moved standup");
+
+    // The undo objects are valid `updates`.
+    let undo: Vec<Value> = v.as_array().unwrap().iter().map(|r| r["undo"].clone()).collect();
+    let params: UpdateEventParams = serde_json::from_value(json!({"updates": undo})).unwrap();
+    let back = result_json(&server.update_event(Parameters(params)).await.unwrap());
+    assert_eq!(back.as_array().unwrap().len(), 2);
+    let calls = fake.calls();
+    assert_eq!(calls[2].1["start"], "2026-06-10T09:00:00");
+    assert_eq!(calls[2].1["send_update"], false, "the undo is applied as quietly as the change");
+    assert_eq!(calls[3].1["remove_categories"], json!(["Blue"]));
+}
+
+#[tokio::test]
+async fn every_update_tool_returns_an_undo() {
+    use outlook_mcp_rs::outlook::fake::{EVENT_ID, NOTE_ID, TASK_ID};
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    macro_rules! call {
+        ($tool:ident, $args:expr) => {
+            result_json(&server.$tool(Parameters(serde_json::from_value($args).unwrap())).await.unwrap())
+        };
+    }
+    let cases = [
+        ("update_email", "email_id", call!(update_email, json!({"email_id": EMAIL_ID, "flag": "follow_up"})), json!({"flag": "clear"})),
+        ("update_draft", "email_id", call!(update_draft, json!({"email_id": EMAIL_ID, "importance": "high"})), json!({"importance": "normal"})),
+        ("update_event", "event_id", call!(update_event, json!({"event_id": EVENT_ID, "show_as": "free"})), json!({"show_as": "busy"})),
+        ("update_task", "task_id", call!(update_task, json!({"task_id": TASK_ID, "mark_complete": true})), json!({"mark_complete": false})),
+        ("update_note", "note_id", call!(update_note, json!({"note_id": NOTE_ID, "color": "blue"})), json!({"color": "yellow"})),
+    ];
+    for (tool, id_param, v, expected) in cases {
+        let undo = v["undo"].as_object().unwrap_or_else(|| panic!("{tool}: {v}"));
+        assert_eq!(undo[id_param], v["id"], "{tool}");
+        for (k, want) in expected.as_object().unwrap() {
+            assert_eq!(&undo[k], want, "{tool}.{k}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn write_batches_reject_bad_shapes() {
+    use outlook_mcp_rs::outlook::fake::EVENT_ID;
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    let err = |args: Value| {
+        let server = server.clone();
+        async move {
+            let p: UpdateEventParams = serde_json::from_value(args).unwrap();
+            server.update_event(Parameters(p)).await.unwrap_err().message.to_string()
+        }
+    };
+    assert!(err(json!({"subject": "s"})).await.contains("event_id is required"));
+    assert!(err(json!({"event_id": EVENT_ID, "updates": [{"event_id": EVENT_ID}]})).await.contains("not both"));
+    assert!(err(json!({"updates": [{"subject": "s"}]})).await.contains("needs its event_id"));
+    assert!(err(json!({"updates": [{"event_id": EVENT_ID, "updates": []}]})).await.contains("can't contain"));
+    assert!(err(json!({"updates": []})).await.contains("1 to 100"));
+    let many: Vec<&str> = vec![EVENT_ID; 101];
+    assert!(err(json!({"event_id": many})).await.contains("1 to 100"));
 }
 
 #[tokio::test]
@@ -1967,7 +2130,7 @@ async fn update_event_lists_changed_fields() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .update_event(Parameters(UpdateEventParams {
-            event_id: EVENT_ID.to_string(),
+            event_id: Some(OneOrMany::One(EVENT_ID.to_string())),
             subject: Some("Renamed sync".to_string()),
             start: None, end: None, location: None, body: None, body_file: None, all_day: None,
             reminder_minutes: None, show_as: Some("tentative".to_string()),
@@ -1977,6 +2140,7 @@ async fn update_event_lists_changed_fields() {
             add_optional_attendees: None, remove_attendees: None,
             send_update: true,
             recurrence: None, clear_recurrence: false,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -1999,7 +2163,7 @@ async fn update_event_remove_attendees_is_tracked() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .update_event(Parameters(UpdateEventParams {
-            event_id: EVENT_ID.to_string(),
+            event_id: Some(OneOrMany::One(EVENT_ID.to_string())),
             subject: None, start: None, end: None, location: None, body: None, body_file: None,
             all_day: None, reminder_minutes: None, show_as: None,
             add_categories: None, remove_categories: None,
@@ -2007,6 +2171,7 @@ async fn update_event_remove_attendees_is_tracked() {
             remove_attendees: Some(vec!["a@example.com".to_string()]),
             send_update: false,
             recurrence: None, clear_recurrence: false,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2021,7 +2186,7 @@ async fn update_event_forwards_recurrence() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .update_event(Parameters(UpdateEventParams {
-            event_id: EVENT_ID.to_string(),
+            event_id: Some(OneOrMany::One(EVENT_ID.to_string())),
             subject: None, start: None, end: None, location: None, body: None, body_file: None,
             all_day: None, reminder_minutes: None, show_as: None,
             add_categories: None, remove_categories: None,
@@ -2032,6 +2197,7 @@ async fn update_event_forwards_recurrence() {
                 day_of_month: None, until: Some("2099-06-01".to_string()), occurrences: None,
             }),
             clear_recurrence: false,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2049,7 +2215,7 @@ async fn update_event_forwards_clear_recurrence() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .update_event(Parameters(UpdateEventParams {
-            event_id: EVENT_ID.to_string(),
+            event_id: Some(OneOrMany::One(EVENT_ID.to_string())),
             subject: None, start: None, end: None, location: None, body: None, body_file: None,
             all_day: None, reminder_minutes: None, show_as: None,
             add_categories: None, remove_categories: None,
@@ -2057,6 +2223,7 @@ async fn update_event_forwards_clear_recurrence() {
             send_update: false,
             recurrence: None,
             clear_recurrence: true,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2071,7 +2238,7 @@ async fn update_event_rejects_recurrence_and_clear_recurrence_together() {
     let server = OutlookMcpServer::new(fake.clone());
     let err = server
         .update_event(Parameters(UpdateEventParams {
-            event_id: EVENT_ID.to_string(),
+            event_id: Some(OneOrMany::One(EVENT_ID.to_string())),
             subject: None, start: None, end: None, location: None, body: None, body_file: None,
             all_day: None, reminder_minutes: None, show_as: None,
             add_categories: None, remove_categories: None,
@@ -2082,6 +2249,7 @@ async fn update_event_rejects_recurrence_and_clear_recurrence_together() {
                 day_of_month: None, until: None, occurrences: None,
             }),
             clear_recurrence: true,
+            updates: None,
         }))
         .await
         .unwrap_err();
@@ -2095,7 +2263,7 @@ async fn delete_event_returns_deleted_status() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .delete_event(Parameters(DeleteEventParams {
-            event_id: EVENT_ID.to_string(),
+            event_id: OneOrMany::One(EVENT_ID.to_string()),
             send_cancellation: true,
             permanent: false,
         }))
@@ -2431,10 +2599,11 @@ async fn update_task_marks_complete() {
     use outlook_mcp_rs::outlook::fake::TASK_ID;
     server
         .update_task(Parameters(UpdateTaskParams {
-            task_id: TASK_ID.to_string(), mark_complete: Some(true),
+            task_id: Some(OneOrMany::One(TASK_ID.to_string())), mark_complete: Some(true),
             subject: None, body: None, body_file: None, due_date: None, start_date: None,
             importance: None, add_categories: None, remove_categories: None,
             percent_complete: None, reminder_time: None,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2449,10 +2618,11 @@ async fn update_task_reopens_with_mark_complete_false() {
     use outlook_mcp_rs::outlook::fake::TASK_ID;
     let result = server
         .update_task(Parameters(UpdateTaskParams {
-            task_id: TASK_ID.to_string(), mark_complete: Some(false),
+            task_id: Some(OneOrMany::One(TASK_ID.to_string())), mark_complete: Some(false),
             subject: None, body: None, body_file: None, due_date: None, start_date: None,
             importance: None, add_categories: None, remove_categories: None,
             percent_complete: None, reminder_time: None,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2467,11 +2637,12 @@ async fn update_task_forwards_field_edits() {
     use outlook_mcp_rs::outlook::fake::TASK_ID;
     server
         .update_task(Parameters(UpdateTaskParams {
-            task_id: TASK_ID.to_string(), mark_complete: None,
+            task_id: Some(OneOrMany::One(TASK_ID.to_string())), mark_complete: None,
             subject: Some("Renamed".to_string()), body: None, body_file: None,
             due_date: None, start_date: None, importance: Some("high".to_string()),
             add_categories: Some(vec!["Red Category".to_string()]), remove_categories: None,
             percent_complete: Some(50), reminder_time: None,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2488,7 +2659,7 @@ async fn delete_task_records_call() {
     let server = OutlookMcpServer::new(fake.clone());
     use outlook_mcp_rs::outlook::fake::TASK_ID;
     let result = server
-        .delete_task(Parameters(DeleteTaskParams { task_id: TASK_ID.to_string(), permanent: false }))
+        .delete_task(Parameters(DeleteTaskParams { task_id: OneOrMany::One(TASK_ID.to_string()), permanent: false }))
         .await
         .unwrap();
     let json = result_json(&result);
@@ -2650,10 +2821,11 @@ async fn update_note_forwards_body_and_color() {
     let server = OutlookMcpServer::new(fake.clone());
     server
         .update_note(Parameters(UpdateNoteParams {
-            note_id: NOTE_ID.to_string(),
+            note_id: Some(OneOrMany::One(NOTE_ID.to_string())),
             body: Some("Updated body".to_string()), body_file: None,
             add_categories: None, remove_categories: None,
             color: Some("pink".to_string()),
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2669,11 +2841,12 @@ async fn update_note_manages_categories() {
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
         .update_note(Parameters(UpdateNoteParams {
-            note_id: NOTE_ID.to_string(),
+            note_id: Some(OneOrMany::One(NOTE_ID.to_string())),
             body: None, body_file: None,
             add_categories: Some(vec!["Blue Category".to_string()]),
             remove_categories: None,
             color: None,
+            updates: None,
         }))
         .await
         .unwrap();
@@ -2687,7 +2860,7 @@ async fn delete_note_records_call() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
     let result = server
-        .delete_note(Parameters(DeleteNoteParams { note_id: NOTE_ID.to_string(), permanent: false }))
+        .delete_note(Parameters(DeleteNoteParams { note_id: OneOrMany::One(NOTE_ID.to_string()), permanent: false }))
         .await
         .unwrap();
     let json = result_json(&result);

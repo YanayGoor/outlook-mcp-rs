@@ -9,10 +9,9 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::error::ToolError;
-use crate::outlook::event_rows;
+use crate::outlook::rows;
 use crate::outlook::filters::{self, normalize_choices};
 use crate::outlook::read::{read_options, ReadRequest, ReadTool};
-use crate::outlook::{EventMove, MAX_EVENT_MOVES};
 use crate::outlook::{DEFAULT_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
 use crate::params::OneOrMany;
 use serde_json::{json, Value};
@@ -57,12 +56,22 @@ fn batch_content<T: serde::Serialize>(
     results: Vec<Result<T, ToolError>>,
     ok_item: impl Fn(&str, Value) -> Value,
 ) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::success(vec![json_content(&batch_value(ids, many, results, ok_item)?)?]))
+}
+
+/// [`batch_content`]'s JSON value.
+fn batch_value<T: serde::Serialize>(
+    ids: &[String],
+    many: bool,
+    results: Vec<Result<T, ToolError>>,
+    ok_item: impl Fn(&str, Value) -> Value,
+) -> Result<Value, McpError> {
     if !many {
         let one = results
             .into_iter()
             .next()
             .unwrap_or_else(|| Err(ToolError::new("no result returned for the requested id")))?;
-        return Ok(CallToolResult::success(vec![json_content(&one)?]));
+        return serde_json::to_value(one).map_err(|e| McpError::internal_error(e.to_string(), None));
     }
     let items = ids
         .iter()
@@ -74,7 +83,159 @@ fn batch_content<T: serde::Serialize>(
             Err(e) => Ok(json!({"id": id, "error": e.0})),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(CallToolResult::success(vec![json_content(&items)?]))
+    Ok(Value::Array(items))
+}
+
+/// `fields` / `compact`, shared by every `list_*` tool (see `outlook::rows`).
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct RowParams {
+    /// Return only these fields per row (default: all). An unknown name is an
+    /// error that lists the valid ones.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Return only the tool's compact preset of fields (see its description).
+    /// Not with fields.
+    #[serde(default)]
+    pub compact: bool,
+    /// Write the rows to a new JSON Lines file (one row per line) in this
+    /// directory, created if missing, and return {rows_file, count} instead
+    /// of the rows. For long lists; each page gets its own file.
+    #[serde(default)]
+    pub output_dir: Option<String>,
+}
+
+/// A `list_*` tool's resolved output options.
+struct RowOutput {
+    tool: &'static str,
+    fields: Option<Vec<String>>,
+    output_dir: Option<String>,
+}
+
+impl RowParams {
+    fn resolve(self, tool: &'static str, spec: rows::RowSpec) -> Result<RowOutput, ToolError> {
+        Ok(RowOutput {
+            tool,
+            fields: rows::row_fields(spec, self.fields, self.compact)?,
+            output_dir: self.output_dir.filter(|d| !d.trim().is_empty()),
+        })
+    }
+}
+
+impl RowOutput {
+    fn fields(&self) -> Option<&[String]> {
+        self.fields.as_deref()
+    }
+
+    /// The tool result: the rows with only the requested fields, or, with
+    /// output_dir, {rows_file, count}.
+    fn content<T: serde::Serialize>(&self, rows: &T) -> Result<CallToolResult, McpError> {
+        let value = serde_json::to_value(rows)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.content_value(rows::select_fields(value, self.fields()))
+    }
+
+    /// As `content`, for rows already shaped.
+    fn content_value(&self, rows: Value) -> Result<CallToolResult, McpError> {
+        let out = match &self.output_dir {
+            Some(dir) => rows::write_rows_file(dir, self.tool, &rows)?,
+            None => rows,
+        };
+        Ok(CallToolResult::success(vec![json_content(&out)?]))
+    }
+}
+
+/// Most items one write call may act on (ids in a list, or `updates`).
+pub const MAX_WRITE_BATCH: usize = 100;
+
+/// A write tool's parameters that can name several items: its id field as
+/// one id or a list (the same change to each), or, on an `update_*` tool,
+/// `updates`: a list of complete per-item calls.
+trait WriteBatch: Clone + Send + 'static {
+    /// The id parameter's name, for errors.
+    const ID: &'static str;
+    fn take_ids(&mut self) -> Option<OneOrMany<String>>;
+    fn take_updates(&mut self) -> Option<Vec<Self>> {
+        None
+    }
+}
+
+macro_rules! write_batch {
+    ($ty:ty, $field:ident, updates) => {
+        impl WriteBatch for $ty {
+            const ID: &'static str = stringify!($field);
+            fn take_ids(&mut self) -> Option<OneOrMany<String>> { self.$field.take() }
+            fn take_updates(&mut self) -> Option<Vec<Self>> { self.updates.take() }
+        }
+    };
+    ($ty:ty, $field:ident) => {
+        impl WriteBatch for $ty {
+            const ID: &'static str = stringify!($field);
+            fn take_ids(&mut self) -> Option<OneOrMany<String>> {
+                Some(std::mem::replace(&mut self.$field, OneOrMany::Many(Vec::new())))
+            }
+        }
+    };
+}
+write_batch!(UpdateEmailParams, email_id, updates);
+write_batch!(UpdateDraftParams, email_id, updates);
+write_batch!(UpdateEventParams, event_id, updates);
+write_batch!(UpdateTaskParams, task_id, updates);
+write_batch!(UpdateNoteParams, note_id, updates);
+write_batch!(DeleteEmailParams, email_id);
+write_batch!(DeleteEventParams, event_id);
+write_batch!(DeleteTaskParams, task_id);
+write_batch!(DeleteNoteParams, note_id);
+write_batch!(RespondToMeetingParams, event_id);
+
+/// The `(id, params)` pairs a write call acts on, and whether its result is
+/// a list: ids given as a list or `updates` give a list; one id, one object.
+fn write_items<P: WriteBatch>(mut p: P) -> Result<(Vec<(String, P)>, bool), ToolError> {
+    let id = P::ID;
+    let (items, many) = match (p.take_updates(), p.take_ids()) {
+        (Some(_), Some(_)) => {
+            return Err(ToolError::new(format!("Pass either {id} or updates, not both.")));
+        }
+        (Some(updates), None) => {
+            let mut items = Vec::new();
+            for mut u in updates {
+                if u.take_updates().is_some() {
+                    return Err(ToolError::new("updates can't contain updates."));
+                }
+                let ids = u.take_ids()
+                    .ok_or_else(|| ToolError::new(format!("Each entry of updates needs its {id}.")))?;
+                items.extend(ids.into_vec().into_iter().map(|i| (i, u.clone())));
+            }
+            (items, true)
+        }
+        (None, Some(ids)) => {
+            let many = ids.is_many();
+            (ids.into_vec().into_iter().map(|i| (i, p.clone())).collect(), many)
+        }
+        (None, None) => return Err(ToolError::new(format!("{id} is required."))),
+    };
+    if items.is_empty() || items.len() > MAX_WRITE_BATCH {
+        return Err(ToolError::new(format!(
+            "A write call acts on 1 to {MAX_WRITE_BATCH} items; got {}.", items.len()
+        )));
+    }
+    Ok((items, many))
+}
+
+/// Runs `one(id, params)` for each item on one blocking thread, in order,
+/// and returns the shared batch result: one object for a single id, else a
+/// list where a failed item is `{"id", "error"}` and the rest keep going.
+async fn run_writes<P, F>(items: Vec<(String, P)>, many: bool, one: F)
+    -> Result<CallToolResult, McpError>
+where
+    P: Send + 'static,
+    F: Fn(String, P) -> Result<Value, ToolError> + Send + 'static,
+{
+    let ids: Vec<String> = items.iter().map(|(id, _)| id.clone()).collect();
+    let results = run_blocking(move || {
+        Ok(items.into_iter().map(|(id, p)| one(id, p)).collect::<Vec<_>>())
+    })
+    .await?;
+    batch_content(&ids, many, results, merge_id)
 }
 
 /// A batch item's result with the id it answers first: `{"id", ...v}`.
@@ -88,21 +249,6 @@ fn merge_id(id: &str, v: Value) -> Value {
     out
 }
 
-/// `move_events`' result: the per-move results, plus `undo.moves`, the
-/// moves that put each successfully moved event back (by its id after the
-/// move: an occurrence's new occurrence_id).
-fn move_events_result(results: Vec<Value>) -> Value {
-    let undo: Vec<Value> = results
-        .iter()
-        .filter(|r| r.get("error").is_none())
-        .map(|r| json!({
-            "event_id": r.get("occurrence_id").unwrap_or(&r["id"]),
-            "start": r["previous_start"], "end": r["previous_end"],
-        }))
-        .collect();
-    json!({"results": results, "undo": {"moves": undo}})
-}
-
 #[derive(Clone)]
 pub struct OutlookMcpServer {
     client: Arc<dyn OutlookClient>,
@@ -112,6 +258,13 @@ impl OutlookMcpServer {
     pub fn new(client: Arc<dyn OutlookClient>) -> Self {
         Self { client }
     }
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ListFoldersParams {
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -171,11 +324,14 @@ pub struct ListEmailsParams {
     /// Deprecated: use importance: "high" instead.
     #[serde(default)]
     pub high_importance: bool,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 fn default_folder() -> String { "inbox".to_string() }
 fn default_count() -> i32 { DEFAULT_EMAIL_COUNT }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct GetEmailParams {
     /// One email id, or a list of ids to read in one call (alias `email_ids`).
     /// A list returns a list in the same order, where an id that fails
@@ -327,9 +483,13 @@ pub struct ReplyEmailParams {
 }
 fn default_true() -> bool { true }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct UpdateEmailParams {
-    pub email_id: String,
+    /// One email id, or a list of ids to apply the same changes to each
+    /// (the result is then a list in the same order; an id that fails
+    /// becomes {"id", "error"}). Omit it when passing `updates`.
+    #[serde(default, alias = "email_ids")]
+    pub email_id: Option<OneOrMany<String>>,
     /// Destination folder name (e.g. "Archive"). Applied last; changes the id.
     #[serde(default)]
     pub move_to: Option<String>,
@@ -348,14 +508,20 @@ pub struct UpdateEmailParams {
     /// "low" | "normal" | "high".
     #[serde(default)]
     pub importance: Option<String>,
+    /// Several updates in one call, each a complete set of this tool's
+    /// parameters with its own `email_id` (results in the same order).
+    /// Pass the `undo` objects of earlier results here to roll them back.
+    #[serde(default)]
+    pub updates: Option<Vec<UpdateEmailParams>>,
 }
 
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 pub struct UpdateDraftParams {
-    /// Id of an unsent draft (e.g. from create_draft or reply_email with send=false).
-    /// `draft_id` is accepted as a deprecated alias.
-    #[serde(alias = "draft_id")]
-    pub email_id: String,
+    /// One email id, or a list of ids to apply the same changes to each
+    /// (the result is then a list in the same order; an id that fails
+    /// becomes {"id", "error"}). Omit it when passing `updates`.
+    #[serde(default, alias = "draft_id", alias = "email_ids")]
+    pub email_id: Option<OneOrMany<String>>,
     /// New subject (replaces the current one).
     #[serde(default)]
     pub subject: Option<String>,
@@ -402,11 +568,19 @@ pub struct UpdateDraftParams {
     /// true = send the draft after applying the changes (default false: only save).
     #[serde(default)]
     pub send: bool,
+    /// Several updates in one call, each a complete set of this tool's
+    /// parameters with its own `email_id` (results in the same order).
+    /// Pass the `undo` objects of earlier results here to roll them back.
+    #[serde(default)]
+    pub updates: Option<Vec<UpdateDraftParams>>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct DeleteEmailParams {
-    pub email_id: String,
+    /// One email id, or a list of ids (the result is then a list in the same
+    /// order; an id that fails becomes {"id", "error"}).
+    #[serde(alias = "email_ids")]
+    pub email_id: OneOrMany<String>,
     /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
     /// moves the email to Deleted Items.
     #[serde(default)]
@@ -464,22 +638,12 @@ pub struct ListEventsParams {
     /// Email/name of another person whose shared calendar to view (default: your own).
     #[serde(default)]
     pub calendar_of: Option<String>,
-    /// false = skip meetings the organizer canceled (default true: list them,
-    /// with is_canceled: true).
-    #[serde(default = "default_true")]
-    pub include_canceled: bool,
-    /// Return only these fields per event (default: all). Valid: id, subject,
-    /// start, end, location, organizer, all_day, is_recurring, is_meeting,
-    /// is_canceled, categories, show_as, my_response, user_is_required,
-    /// user_is_optional, required_count, optional_count, required_attendees,
-    /// optional_attendees.
+    /// true = only canceled meetings; false = skip them (default: both).
     #[serde(default)]
-    pub fields: Option<Vec<String>>,
-    /// Shorthand for fields = id, subject, start, end, organizer,
-    /// is_recurring, my_response, show_as, user_is_required,
-    /// user_is_optional, required_count, optional_count. Not with fields.
-    #[serde(default)]
-    pub compact: bool,
+    pub is_canceled: Option<bool>,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
     /// Page size: default and max 250.
     #[serde(default = "default_event_count")]
     pub count: i32,
@@ -511,7 +675,7 @@ pub struct GetEventParams {
     pub output_dir: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RecurrenceParams {
     /// "daily" | "weekly" | "monthly" | "yearly".
     pub pattern: String,
@@ -571,7 +735,7 @@ pub struct CreateEventParams {
     pub recurrence: Option<RecurrenceParams>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RespondToMeetingParams {
     /// One event id (series id, occurrence_id, or a meeting request's id),
     /// or a list of ids (alias `event_ids`); a list returns a list in the
@@ -586,30 +750,13 @@ pub struct RespondToMeetingParams {
     pub send: bool,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct EventMoveParams {
-    /// A series id, one-off event id, or occurrence_id from list_events.
-    pub event_id: String,
-    /// New start (any date form, e.g. '2026-10-15T14:00' or 'tomorrow+14h').
-    pub start: String,
-    /// New end; omit to keep the event's duration.
-    #[serde(default)]
-    pub end: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MoveEventsParams {
-    /// The events to move, in order (at most 100).
-    pub moves: Vec<EventMoveParams>,
-    /// For meetings: notify attendees of the new time (default true).
-    /// false = change your own copy only. Ignored for personal appointments.
-    #[serde(default = "default_true")]
-    pub send_update: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct UpdateEventParams {
-    pub event_id: String,
+    /// One event id, or a list of ids to apply the same changes to each
+    /// (the result is then a list in the same order; an id that fails
+    /// becomes {"id", "error"}). Omit it when passing `updates`.
+    #[serde(default, alias = "event_ids")]
+    pub event_id: Option<OneOrMany<String>>,
     #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]
@@ -657,11 +804,19 @@ pub struct UpdateEventParams {
     /// occurrence. Mutually exclusive with `recurrence`.
     #[serde(default)]
     pub clear_recurrence: bool,
+    /// Several updates in one call, each a complete set of this tool's
+    /// parameters with its own `event_id` (results in the same order).
+    /// Pass the `undo` objects of earlier results here to roll them back.
+    #[serde(default)]
+    pub updates: Option<Vec<UpdateEventParams>>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct DeleteEventParams {
-    pub event_id: String,
+    /// One event id, or a list of ids (the result is then a list in the same
+    /// order; an id that fails becomes {"id", "error"}).
+    #[serde(alias = "event_ids")]
+    pub event_id: OneOrMany<String>,
     /// If you organize the meeting, notify attendees of the cancellation (default true).
     /// Independent of `permanent`: the cancellation is sent before the delete.
     #[serde(default = "default_true")]
@@ -696,6 +851,9 @@ pub struct ListAttachmentsParams {
     /// {"id", "error"} for an id that fails.
     #[serde(alias = "email_ids")]
     pub email_id: OneOrMany<String>,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -762,6 +920,9 @@ pub struct ListTasksParams {
     /// Matches to skip before this page starts (default 0).
     #[serde(default)]
     pub offset: i32,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 fn default_task_count() -> i32 { MAX_TASK_COUNT }
 
@@ -790,9 +951,13 @@ pub struct CreateTaskParams {
 }
 fn default_importance() -> String { "normal".to_string() }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct UpdateTaskParams {
-    pub task_id: String,
+    /// One task id, or a list of ids to apply the same changes to each
+    /// (the result is then a list in the same order; an id that fails
+    /// becomes {"id", "error"}). Omit it when passing `updates`.
+    #[serde(default, alias = "task_ids")]
+    pub task_id: Option<OneOrMany<String>>,
     /// true = mark complete (100%), false = reopen.
     #[serde(default)]
     pub mark_complete: Option<bool>,
@@ -819,6 +984,11 @@ pub struct UpdateTaskParams {
     pub percent_complete: Option<i32>,
     #[serde(default)]
     pub reminder_time: Option<String>,
+    /// Several updates in one call, each a complete set of this tool's
+    /// parameters with its own `task_id` (results in the same order).
+    /// Pass the `undo` objects of earlier results here to roll them back.
+    #[serde(default)]
+    pub updates: Option<Vec<UpdateTaskParams>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -843,9 +1013,12 @@ pub struct GetTaskParams {
     pub output_dir: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct DeleteTaskParams {
-    pub task_id: String,
+    /// One task id, or a list of ids (the result is then a list in the same
+    /// order; an id that fails becomes {"id", "error"}).
+    #[serde(alias = "task_ids")]
+    pub task_id: OneOrMany<String>,
     /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
     /// moves the task to Deleted Items.
     #[serde(default)]
@@ -875,6 +1048,9 @@ pub struct ListNotesParams {
     /// Matches to skip before this page starts (default 0).
     #[serde(default)]
     pub offset: i32,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 fn default_note_count() -> i32 { MAX_NOTE_COUNT }
 
@@ -916,9 +1092,13 @@ pub struct CreateNoteParams {
     pub color: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct UpdateNoteParams {
-    pub note_id: String,
+    /// One note id, or a list of ids to apply the same changes to each
+    /// (the result is then a list in the same order; an id that fails
+    /// becomes {"id", "error"}). Omit it when passing `updates`.
+    #[serde(default, alias = "note_ids")]
+    pub note_id: Option<OneOrMany<String>>,
     /// New text. Not with body_file.
     #[serde(default)]
     pub body: Option<String>,
@@ -932,11 +1112,19 @@ pub struct UpdateNoteParams {
     /// "blue" | "green" | "pink" | "yellow" | "white".
     #[serde(default)]
     pub color: Option<String>,
+    /// Several updates in one call, each a complete set of this tool's
+    /// parameters with its own `note_id` (results in the same order).
+    /// Pass the `undo` objects of earlier results here to roll them back.
+    #[serde(default)]
+    pub updates: Option<Vec<UpdateNoteParams>>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct DeleteNoteParams {
-    pub note_id: String,
+    /// One note id, or a list of ids (the result is then a list in the same
+    /// order; an id that fails becomes {"id", "error"}).
+    #[serde(alias = "note_ids")]
+    pub note_id: OneOrMany<String>,
     /// true = hard delete (like shift+delete); IRREVERSIBLE. Default false
     /// moves the note to Deleted Items.
     #[serde(default)]
@@ -999,22 +1187,27 @@ pub fn email_query(p: ListEmailsParams) -> Result<EmailQuery, ToolError> {
 
 #[tool_router]
 impl OutlookMcpServer {
-    #[tool(description = "List Outlook mail folders (name, path, item counts).")]
-    pub async fn list_folders(&self) -> Result<CallToolResult, McpError> {
+    #[tool(description = "List Outlook mail folders (name, path, item counts). fields picks the fields of each row (name, path, items, unread); compact=true returns path and unread. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    pub async fn list_folders(
+        &self,
+        Parameters(p): Parameters<ListFoldersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = p.rows.resolve("list_folders", rows::FOLDER_ROWS)?;
         let client = self.client.clone();
         let result = run_blocking(move || client.list_folders()).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
-    #[tool(description = "Find emails in a folder (newest first). Filters (all optional, ANDed): query; from / to / category (one value or a list, matching any); item_type (as get_email reports it, e.g. [\"email\"] to skip meeting invites and bounces); importance; flag (follow_up/complete/clear, as in update_email); unread_only; has_attachments; received_after / received_before. `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). query syntax (shared by all list_* tools): space-separated terms that must all match, case-insensitive, any language; \"quoted phrase\" keeps words together; * is a wildcard (status*report); field:term limits a term to subject, from, to or body. Dates accept ISO ('2026-06-10'), keywords ('today', 'start_of_week') or offsets ('-14d'). Paging: count (default 10, max 200) and offset; to page, call again with offset += count until fewer than count results come back. Deprecated: since_days (use received_after: \"-14d\"), flagged (use flag), high_importance (use importance).")]
+    #[tool(description = "Find emails in a folder (newest first). Filters (all optional, ANDed): query; from / to / category (one value or a list, matching any); item_type (as get_email reports it, e.g. [\"email\"] to skip meeting invites and bounces); importance; flag (follow_up/complete/clear, as in update_email); unread_only; has_attachments; received_after / received_before. `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). query syntax (shared by all list_* tools): space-separated terms that must all match, case-insensitive, any language; \"quoted phrase\" keeps words together; * is a wildcard (status*report); field:term limits a term to subject, from, to or body. Dates accept ISO ('2026-06-10'), keywords ('today', 'start_of_week') or offsets ('-14d'). Paging: count (default 10, max 200) and offset; to page, call again with offset += count until fewer than count results come back. Deprecated: since_days (use received_after: \"-14d\"), flagged (use flag), high_importance (use importance). fields picks the fields of each row (id, subject, sender, sender_email, to, received, unread, has_attachments, categories); compact=true returns id, subject, sender, received, unread, has_attachments. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_emails(
         &self,
-        Parameters(p): Parameters<ListEmailsParams>,
+        Parameters(mut p): Parameters<ListEmailsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let out = std::mem::take(&mut p.rows).resolve("list_emails", rows::EMAIL_ROWS)?;
         let client = self.client.clone();
         let q = email_query(p)?;
         let result = run_blocking(move || client.list_emails(q)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
     #[tool(description = "Get one email by id, or several (email_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"} instead of failing the call). Returns the headers, item_type, is_meeting, plus the optional fields picked by `include` (any of \"body\", \"html_body\", \"attachments\" (file names), \"meeting\"; default [\"body\", \"attachments\", \"meeting\"]; [] = metadata only). body_format \"html\" (the deprecated prefer_html=true) also returns html_body. Each returned body reports *_truncated and *_length (full original length in characters): body_truncated/body_length, html_truncated/html_length. Inline bodies are cut at max_body_chars characters (default 100,000; allowed 1,000-5,000,000); if a *_truncated flag is true the cut may fall mid-tag or mid-image-data: call again with max_body_chars of at least the reported length, or use output_dir. output_dir writes each body in full to a file in that directory (created if missing) and returns body_file / html_body_file (absolute paths) instead of the text; re-reading the same email overwrites the same files. resolve_inline_images=true (implies html_body) replaces every cid: reference in html_body with the referenced attachment's base64 data: URI so the HTML is self-contained; Content-ID matching is case-insensitive, references with no matching attachment, or whose image is over 10 MB or unreadable, are left as cid: and listed in inline_images_unresolved (inline_images_resolved counts the replaced ones). Resolved HTML is usually large: combine it with output_dir.")]
@@ -1094,28 +1287,28 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Update an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, or set importance. Combine any of these in one call.")]
+    #[tool(description = "Update an existing email: move to a folder, mark read/unread, flag (follow_up/complete/clear), add/remove categories, or set importance. Combine any of these in one call. Several items in one call: email_id as a list applies the same changes to each, or updates: [{email_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_email call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
     pub async fn update_email(
         &self,
         Parameters(p): Parameters<UpdateEmailParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let u = EmailUpdate {
-            email_id: p.email_id, move_to: p.move_to, mark_read: p.mark_read,
+        run_writes(items, many, move |email_id, p| client.update_email(EmailUpdate {
+            email_id, move_to: p.move_to, mark_read: p.mark_read,
             flag: p.flag, add_categories: p.add_categories,
             remove_categories: p.remove_categories, importance: p.importance,
-        };
-        let result = run_blocking(move || client.update_email(u)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        })).await
     }
 
-    #[tool(description = "Edit an existing unsent draft (e.g. one from create_draft or reply_email with send=false) by `email_id` (`draft_id` is a deprecated alias), save it, and optionally send it (send=true; default false). Only the fields you pass change: subject; the body, as at most one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies), replaces the current body; to/cc/bcc replace that recipient line entirely (an empty list clears it); attachments are local file paths appended to the existing ones; add_categories/remove_categories; importance (low/normal/high). `data:` image URIs in a new HTML body become hidden Content-ID attachments, and `inline_images` (needs an HTML body) adds images referenced as <img src=\"cid:CONTENT_ID\">. send=true alone sends the draft as is. Sent or received emails are rejected. Returns the draft id and the list of changed fields (status \"draft_updated\"), or status \"sent\" when sent.")]
+    #[tool(description = "Edit an existing unsent draft (e.g. one from create_draft or reply_email with send=false) by `email_id` (`draft_id` is a deprecated alias), save it, and optionally send it (send=true; default false). Only the fields you pass change: subject; the body, as at most one of `body` (plain text), `html_body`, `body_file` or `html_body_file` (local UTF-8 file paths; use these for large bodies), replaces the current body; to/cc/bcc replace that recipient line entirely (an empty list clears it); attachments are local file paths appended to the existing ones; add_categories/remove_categories; importance (low/normal/high). `data:` image URIs in a new HTML body become hidden Content-ID attachments, and `inline_images` (needs an HTML body) adds images referenced as <img src=\"cid:CONTENT_ID\">. send=true alone sends the draft as is. Sent or received emails are rejected. Returns the draft id and the list of changed fields (status \"draft_updated\"), or status \"sent\" when sent. Several items in one call: email_id as a list applies the same changes to each, or updates: [{email_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_draft call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
     pub async fn update_draft(
         &self,
         Parameters(p): Parameters<UpdateDraftParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let result = run_blocking(move || {
+        run_writes(items, many, move |email_id, p| {
             let body = resolve_mail_body(BodyInputs {
                 body: p.body, html_body: p.html_body, body_file: p.body_file,
                 html_body_file: p.html_body_file, html: None,
@@ -1126,24 +1319,23 @@ impl OutlookMcpServer {
                 None => (None, None),
             };
             client.update_draft(DraftUpdate {
-                email_id: p.email_id, subject: p.subject, body, html_body,
+                email_id, subject: p.subject, body, html_body,
                 to: p.to, cc: p.cc, bcc: p.bcc, attachments: p.attachments,
                 inline_images: p.inline_images, add_categories: p.add_categories,
                 remove_categories: p.remove_categories, importance: p.importance,
                 send: p.send,
             })
-        }).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        }).await
     }
 
-    #[tool(description = "Delete an email. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
+    #[tool(description = "Delete an email. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass email_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
     pub async fn delete_email(
         &self,
-        Parameters(DeleteEmailParams { email_id, permanent }): Parameters<DeleteEmailParams>,
+        Parameters(p): Parameters<DeleteEmailParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let result = run_blocking(move || client.delete_email(email_id, permanent)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        run_writes(items, many, move |id, p| client.delete_email(id, p.permanent)).await
     }
 
     #[tool(description = "Permanently delete EVERYTHING in the default mailbox's Deleted Items folder (items and subfolders). IRREVERSIBLE: refuses unless confirm=true; only pass confirm=true when the user has explicitly asked to empty Deleted Items. Returns counts of items and folders deleted and failures. On Exchange/Microsoft 365 with retention, items may still be held in Recoverable Items per server policy.")]
@@ -1158,12 +1350,12 @@ impl OutlookMcpServer {
 
     // ---- Calendar ----
 
-    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; include_canceled=false skips meetings the organizer canceled. calendar_of views another person's shared calendar. Recurring events are expanded: each occurrence's id is the SERIES id (acting on it acts on the whole series) and occurrence_id names just that occurrence; pass occurrence_id to get_event / respond_to_meeting / update_event / delete_event to act on one date. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists (a meeting you organize or a personal appointment counts as required; both false = not found among the attendees, use my_response); and required_count / optional_count. To save tokens, compact=true returns only id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields. Paging: count (default and max 250) and offset.")]
+    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; is_canceled (false skips meetings the organizer canceled, true lists only those). calendar_of views another person's shared calendar. Recurring events are expanded: each occurrence's id is the SERIES id (acting on it acts on the whole series) and occurrence_id names just that occurrence; pass occurrence_id to get_event / respond_to_meeting / update_event / delete_event to act on one date. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists, nested up to 10 levels within a per-call budget (a meeting you organize or a personal appointment counts as required; both false = not among the attendees, use my_response; both null = unknown, because a list couldn't be expanded within the budget); and required_count / optional_count. To save tokens, compact=true returns only id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields (as on every list_* tool). Paging: count (default and max 250) and offset. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let fields = event_rows::event_fields(p.fields, p.compact)?;
+        let out = p.rows.resolve("list_events", rows::EVENT_ROWS)?;
         let client = self.client.clone();
         let q = EventQuery {
             start_after: p.start_after, start_before: p.start_before, query: p.query,
@@ -1172,16 +1364,12 @@ impl OutlookMcpServer {
             my_response: normalize_choices(list(p.my_response), "my_response", filters::MY_RESPONSES)?,
             attendees: list_values(p.attendees), attendee_role: p.attendee_role,
             meetings_only: p.meetings_only, all_day: p.all_day,
-            calendar_of: p.calendar_of, include_canceled: p.include_canceled,
-            user_role: event_rows::wants_user_role(fields.as_deref()),
+            calendar_of: p.calendar_of, is_canceled: p.is_canceled,
+            user_role: rows::wants_any(out.fields(), rows::USER_ROLE_FIELDS),
             count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_events(q)).await?;
-        let rows = serde_json::to_value(&result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![json_content(&event_rows::select_fields(
-            rows, fields.as_deref(),
-        ))?]))
+        out.content(&result)
     }
 
     #[tool(description = "Get the full details of one calendar event by id (a series id, or an occurrence_id from list_events for one occurrence), or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
@@ -1230,67 +1418,35 @@ impl OutlookMcpServer {
     #[tool(description = "Respond to one or more meeting invites: accept, decline, or tentative. event_id (one id, or a list: the result is then a list in the same order, and an id that fails becomes {\"id\", \"error\"} without stopping the rest) is a calendar id from list_events (a series id answers the whole series; an occurrence_id answers just that occurrence) or a meeting request's id from list_emails. send=false records the response in your calendar without emailing the organizer.")]
     pub async fn respond_to_meeting(
         &self,
-        Parameters(RespondToMeetingParams { event_id, response, comment, send }): Parameters<RespondToMeetingParams>,
+        Parameters(p): Parameters<RespondToMeetingParams>,
     ) -> Result<CallToolResult, McpError> {
-        let (ids, many) = batch_ids(event_id, "event_id")?;
-        if crate::constants::meeting_response_to_id(&response.trim().to_lowercase()).is_none() {
+        if crate::constants::meeting_response_to_id(&p.response.trim().to_lowercase()).is_none() {
             return Err(ToolError::new(format!(
-                "Invalid response {response:?}: use 'accept', 'decline' or 'tentative'."
+                "Invalid response {:?}: use 'accept', 'decline' or 'tentative'.", p.response
             )).into());
         }
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let batch = ids.clone();
-        let results = run_blocking(move || {
-            Ok(batch
-                .into_iter()
-                .map(|id| client.respond_to_meeting(id, response.clone(), comment.clone(), send))
-                .collect::<Vec<_>>())
-        })
-        .await?;
-        batch_content(&ids, many, results, merge_id)
+        run_writes(items, many, move |id, p| {
+            client.respond_to_meeting(id, p.response, p.comment, p.send)
+        }).await
     }
 
-    #[tool(description = "Move several calendar events in one call. moves: [{event_id, start, end?}] (at most 100); end omitted keeps the event's duration; dates take any date form. event_id may be a series id (moves the whole series), a one-off event's id, or an occurrence_id (moves just that occurrence). send_update (default true) notifies a meeting's attendees; false changes your own copy only. Each event is moved independently: results[i] is {id, occurrence_id (for an occurrence: its NEW id), subject, previous_start, previous_end, start, end, notified} or {event_id, error}, and a failure doesn't stop the rest. undo.moves holds the moves that put every successfully moved event back: pass it to move_events again to roll back.")]
-    pub async fn move_events(
-        &self,
-        Parameters(p): Parameters<MoveEventsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if p.moves.is_empty() || p.moves.len() > MAX_EVENT_MOVES {
-            return Err(ToolError::new(format!(
-                "moves must list between 1 and {MAX_EVENT_MOVES} events."
-            )).into());
-        }
-        let client = self.client.clone();
-        let send_update = p.send_update;
-        let results = run_blocking(move || {
-            Ok(p.moves
-                .into_iter()
-                .map(|m| {
-                    let event_id = m.event_id.clone();
-                    client
-                        .move_event(EventMove { event_id: m.event_id, start: m.start, end: m.end, send_update })
-                        .unwrap_or_else(|e| json!({"event_id": event_id, "error": e.0}))
-                })
-                .collect::<Vec<_>>())
-        })
-        .await?;
-        Ok(CallToolResult::success(vec![json_content(&move_events_result(results))?]))
-    }
-
-    #[tool(description = "Update an existing calendar event: subject, start/end, location, body (or body_file: a local UTF-8 text file path), show_as, add/remove categories, add/remove attendees, reminder, all_day, recurrence (set/replace) or clear_recurrence (remove it). Adding an attendee converts a personal appointment into a meeting. A series id (an event's id) edits the whole series; an occurrence_id from list_events edits just that occurrence (recurrence / clear_recurrence need the series id) and the result carries the occurrence's new occurrence_id, since moving it changes its start. send_update (default true) notifies attendees if the event is a meeting.")]
+    #[tool(description = "Update an existing calendar event: subject, start/end, location, body (or body_file: a local UTF-8 text file path), show_as, add/remove categories, add/remove attendees, reminder, all_day, recurrence (set/replace) or clear_recurrence (remove it). Adding an attendee converts a personal appointment into a meeting. A series id (an event's id) edits the whole series; an occurrence_id from list_events edits just that occurrence (recurrence / clear_recurrence need the series id) and the result carries the occurrence's new occurrence_id, since moving it changes its start. send_update (default true) notifies attendees if the event is a meeting. Several items in one call: event_id as a list applies the same changes to each, or updates: [{event_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_event call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
     pub async fn update_event(
         &self,
         Parameters(p): Parameters<UpdateEventParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
+        run_writes(items, many, move |event_id, p| {
         let recurrence = p.recurrence.map(|r| RecurrenceInput {
             pattern: r.pattern, interval: r.interval, days_of_week: r.days_of_week,
             day_of_month: r.day_of_month, until: r.until, occurrences: r.occurrences,
         });
-        let (body, body_file) = (p.body, p.body_file);
-        let body = run_blocking(move || resolve_text_input(body, body_file, "body", "body_file")).await?;
+        let body = resolve_text_input(p.body, p.body_file, "body", "body_file")?;
         let u = EventUpdate {
-            event_id: p.event_id, subject: p.subject, start: p.start, end: p.end,
+            event_id, subject: p.subject, start: p.start, end: p.end,
             location: p.location, body, all_day: p.all_day,
             reminder_minutes: p.reminder_minutes, show_as: p.show_as,
             add_categories: p.add_categories, remove_categories: p.remove_categories,
@@ -1299,20 +1455,20 @@ impl OutlookMcpServer {
             remove_attendees: p.remove_attendees, send_update: p.send_update,
             recurrence, clear_recurrence: p.clear_recurrence,
         };
-        let result = run_blocking(move || client.update_event(u)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        client.update_event(u)
+        }).await
     }
 
-    #[tool(description = "Delete/cancel a calendar event. If you organize the meeting, send_cancellation (default true) notifies attendees; if false, it's canceled quietly; this is independent of permanent (the cancellation is sent first). For a recurring event, a series id (an event's id from list_events) deletes the whole series; an occurrence_id deletes just that occurrence (it is removed from the series, never moved to Deleted Items, so permanent has no effect on it). By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
+    #[tool(description = "Delete/cancel a calendar event. If you organize the meeting, send_cancellation (default true) notifies attendees; if false, it's canceled quietly; this is independent of permanent (the cancellation is sent first). For a recurring event, a series id (an event's id from list_events) deletes the whole series; an occurrence_id deletes just that occurrence (it is removed from the series, never moved to Deleted Items, so permanent has no effect on it). By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass event_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
     pub async fn delete_event(
         &self,
-        Parameters(DeleteEventParams { event_id, send_cancellation, permanent }):
-            Parameters<DeleteEventParams>,
+        Parameters(p): Parameters<DeleteEventParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let result =
-            run_blocking(move || client.delete_event(event_id, send_cancellation, permanent)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        run_writes(items, many, move |id, p| {
+            client.delete_event(id, p.send_cancellation, p.permanent)
+        }).await
     }
 
     #[tool(description = "Check free/busy availability for one or more people over a time window. Returns each person's raw status per time slot (never event details) plus common_free: the windows where everyone is available. treat_as_free (default [\"free\"]) controls which statuses count as available when computing common_free; a person whose address can't be resolved, or who resolves but has no loadable free/busy data, is marked resolved:false with empty slots and doesn't fail the call.")]
@@ -1329,16 +1485,20 @@ impl OutlookMcpServer {
 
     // ---- Attachments ----
 
-    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden). email_id may be a list: the result is then a list in the same order of {\"id\", \"attachments\": [...]}, or {\"id\", \"error\"} for an id that fails.")]
+    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden). email_id may be a list: the result is then a list in the same order of {\"id\", \"attachments\": [...]}, or {\"id\", \"error\"} for an id that fails. fields picks the fields of each attachment (index, filename, size, type, content_id, mime_type, hidden, is_inline); compact=true returns index, filename, size, is_inline. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_attachments(
         &self,
-        Parameters(ListAttachmentsParams { email_id }): Parameters<ListAttachmentsParams>,
+        Parameters(ListAttachmentsParams { email_id, rows: row_params }): Parameters<ListAttachmentsParams>,
     ) -> Result<CallToolResult, McpError> {
         let (ids, many) = batch_ids(email_id, "email_id")?;
+        let out = row_params.resolve("list_attachments", rows::ATTACHMENT_ROWS)?;
         let client = self.client.clone();
         let batch = ids.clone();
         let results = run_blocking(move || client.list_attachments(batch)).await?;
-        batch_content(&ids, many, results, |id, v| json!({"id": id, "attachments": v}))
+        let results = results.into_iter().map(|r| r.map(|atts| {
+            rows::select_fields(serde_json::to_value(atts).unwrap_or_default(), out.fields())
+        })).collect();
+        out.content_value(batch_value(&ids, many, results, |id, v| json!({"id": id, "attachments": v}))?)
     }
 
     #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Pass `inline: false` to save only regular attachments and skip inline images (`is_inline`), e.g. when re-sending an email whose HTML already carries its images (get_email with resolve_inline_images) so they aren't attached twice; `inline: true` saves only the inline images. Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.")]
@@ -1380,11 +1540,12 @@ impl OutlookMcpServer {
 
     // ---- Tasks ----
 
-    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filters (all optional, ANDed): category and importance (one value or a list, matching any); due_after / due_before (any date form, e.g. 'end_of_week'); query (shared list query syntax; field scopes subject and body; unscoped terms search both). Paging: count (default and max 500) and offset.")]
+    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filters (all optional, ANDed): category and importance (one value or a list, matching any); due_after / due_before (any date form, e.g. 'end_of_week'); query (shared list query syntax; field scopes subject and body; unscoped terms search both). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, due_date, complete, status, importance, categories); compact=true returns id, subject, due_date, status, importance. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_tasks(
         &self,
         Parameters(p): Parameters<ListTasksParams>,
     ) -> Result<CallToolResult, McpError> {
+        let out = p.rows.resolve("list_tasks", rows::TASK_ROWS)?;
         let client = self.client.clone();
         let q = TaskQuery {
             include_completed: p.include_completed, category: list_values(p.category),
@@ -1393,7 +1554,7 @@ impl OutlookMcpServer {
             count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_tasks(q)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
     #[tool(description = "Create a new task. body (plain text) or body_file (a local UTF-8 text file path, for large text), not both. reminder_time (ISO datetime) is an absolute reminder time, unlike appointment reminders which are minutes-before-start.")]
@@ -1427,42 +1588,43 @@ impl OutlookMcpServer {
         batch_content(&ids, many, results, |_, v| v)
     }
 
-    #[tool(description = "Update an existing task: mark_complete (true=complete, false=reopen), subject, body (or body_file: a local UTF-8 text file path), due_date, start_date, importance, add/remove categories, percent_complete, reminder_time. Combine any of these in one call. Note: mark_complete is applied last and both complete/reopen set percent_complete themselves, so mark_complete:false always resets percent_complete to 0 even if you also pass an explicit percent_complete in the same call — set it in a separate call afterward if you need it to stick.")]
+    #[tool(description = "Update an existing task: mark_complete (true=complete, false=reopen), subject, body (or body_file: a local UTF-8 text file path), due_date, start_date, importance, add/remove categories, percent_complete, reminder_time. Combine any of these in one call. Note: mark_complete is applied last and both complete/reopen set percent_complete themselves, so mark_complete:false always resets percent_complete to 0 even if you also pass an explicit percent_complete in the same call — set it in a separate call afterward if you need it to stick. Several items in one call: task_id as a list applies the same changes to each, or updates: [{task_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_task call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
     pub async fn update_task(
         &self,
         Parameters(p): Parameters<UpdateTaskParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let result = run_blocking(move || {
+        run_writes(items, many, move |task_id, p| {
             let body = resolve_text_input(p.body, p.body_file, "body", "body_file")?;
             client.update_task(TaskUpdate {
-                task_id: p.task_id, mark_complete: p.mark_complete, subject: p.subject,
+                task_id, mark_complete: p.mark_complete, subject: p.subject,
                 body, due_date: p.due_date, start_date: p.start_date,
                 importance: p.importance, add_categories: p.add_categories,
                 remove_categories: p.remove_categories, percent_complete: p.percent_complete,
                 reminder_time: p.reminder_time,
             })
-        }).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        }).await
     }
 
-    #[tool(description = "Delete a task. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
+    #[tool(description = "Delete a task. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass task_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
     pub async fn delete_task(
         &self,
-        Parameters(DeleteTaskParams { task_id, permanent }): Parameters<DeleteTaskParams>,
+        Parameters(p): Parameters<DeleteTaskParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let result = run_blocking(move || client.delete_task(task_id, permanent)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        run_writes(items, many, move |id, p| client.delete_task(id, p.permanent)).await
     }
 
     // ---- Notes ----
 
-    #[tool(description = "List Outlook notes. Filters (all optional, ANDed): category (one value or a list, matching any); created_after / created_before (any date form); query (shared list query syntax; field scopes subject, i.e. the first line, and body; unscoped terms search the body). Paging: count (default and max 500) and offset.")]
+    #[tool(description = "List Outlook notes. Filters (all optional, ANDed): category (one value or a list, matching any); created_after / created_before (any date form); query (shared list query syntax; field scopes subject, i.e. the first line, and body; unscoped terms search the body). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, created, categories); compact=true returns id, subject, created. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_notes(
         &self,
         Parameters(p): Parameters<ListNotesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let out = p.rows.resolve("list_notes", rows::NOTE_ROWS)?;
         let client = self.client.clone();
         let q = NoteQuery {
             category: list_values(p.category), query: p.query,
@@ -1470,7 +1632,7 @@ impl OutlookMcpServer {
             count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_notes(q)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
     #[tool(description = "Get the full body of one note by id, or several (note_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = subject, dates and categories only). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
@@ -1504,30 +1666,30 @@ impl OutlookMcpServer {
         Ok(CallToolResult::success(vec![json_content(&result)?]))
     }
 
-    #[tool(description = "Update an existing note: body (or body_file: a local UTF-8 text file path), add/remove categories, color. Combine any of these in one call.")]
+    #[tool(description = "Update an existing note: body (or body_file: a local UTF-8 text file path), add/remove categories, color. Combine any of these in one call. Several items in one call: note_id as a list applies the same changes to each, or updates: [{note_id, ...}] gives each item its own changes (at most 100); the result is then a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest. Each result has undo: the update_note call that reverts it (addressed by the current id); pass a batch's undo objects as updates to roll it back. not_undoable lists changes undo can't revert (bodies, attachments, recurrence, removed attendees).")]
     pub async fn update_note(
         &self,
         Parameters(p): Parameters<UpdateNoteParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let result = run_blocking(move || {
+        run_writes(items, many, move |note_id, p| {
             let body = resolve_text_input(p.body, p.body_file, "body", "body_file")?;
             client.update_note(NoteUpdate {
-                note_id: p.note_id, body, add_categories: p.add_categories,
+                note_id, body, add_categories: p.add_categories,
                 remove_categories: p.remove_categories, color: p.color,
             })
-        }).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        }).await
     }
 
-    #[tool(description = "Delete a note. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy.")]
+    #[tool(description = "Delete a note. By default (permanent=false) it moves to Deleted Items and is recoverable. With permanent=true it is hard-deleted like Outlook's shift+delete (moved to Deleted Items, then deleted from there): IRREVERSIBLE, it cannot be recovered from Deleted Items. On Exchange/Microsoft 365 with retention, it may still be held in Recoverable Items per server policy. Pass note_id as a list to delete several (at most 100): the result is a list in the same order, and a failed item becomes {\"id\", \"error\"} without stopping the rest.")]
     pub async fn delete_note(
         &self,
-        Parameters(DeleteNoteParams { note_id, permanent }): Parameters<DeleteNoteParams>,
+        Parameters(p): Parameters<DeleteNoteParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (items, many) = write_items(p)?;
         let client = self.client.clone();
-        let result = run_blocking(move || client.delete_note(note_id, permanent)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        run_writes(items, many, move |id, p| client.delete_note(id, p.permanent)).await
     }
 }
 

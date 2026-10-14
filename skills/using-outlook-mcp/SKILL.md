@@ -22,7 +22,6 @@ unless they already asked for that exact send in this conversation:
 | `reply_email` | `send` (default true) | `send: false` saves a draft |
 | `create_event` with attendees | `send` (default true) | `send: false` saves unsent |
 | `update_event` on a meeting | `send_update` (default true) | `send_update: false` |
-| `move_events` with meetings | `send_update` (default true) | `send_update: false` |
 | `delete_event` you organize | `send_cancellation` (default true; independent of `permanent`) | `send_cancellation: false` |
 | `respond_to_meeting` | `send` (default true) | `send: false` |
 | `update_draft` | only with `send: true` | omit `send` (default false) |
@@ -42,11 +41,23 @@ with `send: true`, which needs the same go-ahead as `send_email`.
 Use `permanent` or `empty_deleted_items` only when the user explicitly asks for a
 permanent delete. Never set `confirm: true` on your own initiative.
 
+## Batches and undo
+
+- Every `update_*` / `delete_*` tool and `respond_to_meeting` take a **list of ids** (the same change to each).
+  - `update_*` tools also take `updates: [{id, …}]` (a different change per item).
+  - Use these instead of many single calls.
+- Every update result has `undo`. Keep it when changing several things for the user: passing the `undo` objects as `updates` reverts the batch. `not_undoable` lists what it can't revert (e.g. bodies).
+
 ## Ids
 
 - Take ids only from a tool result (`list_*`, `create_*`). Never build or guess one.
-- Moving an email (`update_email` with `move_to`) or deleting it **changes its id**.
-  From then on, use the `id` in that call's result, or find the item again.
+- Some writes **change an item's id**:
+  - moving an email (`update_email` with `move_to`);
+  - accepting a meeting;
+  - moving one occurrence;
+  - deleting.
+
+  Every tool that changes an item and leaves it in place returns its current `id` (and `occurrence_id` for an occurrence). From then on, use the ids in that call's result, or find the item again.
 
 ## Quick reference
 
@@ -104,8 +115,10 @@ permanent delete. Never set `confirm: true` on your own initiative.
   - `start_after`/`start_before` bound the event start; the default window is today plus 7 days. `count` default and max 250, page with `offset`.
   - Recurring events are expanded.
   - `calendar_of` opens someone's shared calendar.
-  - To scan a week or more, pass `compact: true` (or `fields: [...]`): full rows carry long attendee strings and can overflow the context. `include_canceled: false` drops canceled meetings.
-  - Use `user_is_required` / `user_is_optional` to tell whether the user must attend. They are computed on the server, including through distribution lists; don't guess from the attendee strings. Both false means the user isn't listed (fall back to `my_response`).
+  - To scan a week or more, pass `compact: true` (or `fields: [...]`): full rows carry long attendee strings and can overflow the context. `is_canceled: false` drops canceled meetings.
+  - Use `user_is_required` / `user_is_optional` to tell whether the user must attend. They are computed on the server, including through distribution lists; don't guess from the attendee strings.
+    - Both `false`: the user isn't listed (fall back to `my_response`).
+    - Both `null`: unknown, because a list was too big or slow to expand; ask the user if it matters.
 - **`check_availability`:**
   - Shows free/busy only, never event details, in `interval_minutes` slots (default 30).
   - `common_free` lists the windows where everyone resolved is free.
@@ -115,8 +128,9 @@ permanent delete. Never set `confirm: true` on your own initiative.
   - `get_task` returns one task's body, start/completion dates, percent complete and reminder.
   - `update_task` with `mark_complete` completes or reopens a task.
   - Deleting a task, note or event moves it to Deleted Items, where it can be recovered, unless `permanent: true` (see above).
-  - Batch calendar writes: `respond_to_meeting` takes a list of ids (one `response` for all), and `move_events` moves many events at once. Keep `move_events`' `undo.moves`: passing it back to `move_events` restores every moved event.
   - A recurring event's `id` names the whole series: deleting, answering or editing it affects every occurrence. Use the row's `occurrence_id` to act on one date only. After moving an occurrence, use the new `occurrence_id` that `update_event` returns.
+
+- **Every `list_*` tool** takes `fields` / `compact` to return less per row, and `output_dir` to write the rows to a JSON Lines file (`{rows_file, count}`) instead of the context. Use them whenever a list is long.
 
 ## Common mistakes
 

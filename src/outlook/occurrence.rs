@@ -8,7 +8,7 @@
 //! with `GetRecurrencePattern().GetOccurrence(start)`, falling back to the
 //! series' `Exceptions` for an occurrence that was moved. It stays valid
 //! until that occurrence is moved again (its start, and so its id, changes;
-//! `update_event` / `move_events` return the new one).
+//! `update_event` and `respond_to_meeting` return the new one).
 
 use chrono::NaiveDateTime;
 
@@ -80,6 +80,18 @@ pub fn parse_event_id(id: &str) -> Result<EventId, ToolError> {
     }
 }
 
+/// The ids a calendar write returns for the item it changed, read back
+/// after the change (accepting a meeting or moving an occurrence changes
+/// them): `{"id": <series or event id>}`, plus `"occurrence_id"` when the
+/// call acted on one occurrence (`occurrence_start` is its start now).
+pub fn current_ids(entry_id: &str, store_id: &str, occurrence_start: Option<&str>) -> serde_json::Value {
+    let id = make_item_id(entry_id, store_id);
+    match occurrence_start {
+        Some(start) => serde_json::json!({"occurrence_id": make_occurrence_id(&id, start), "id": id}),
+        None => serde_json::json!({"id": id}),
+    }
+}
+
 /// The error for an occurrence id that no longer resolves.
 pub fn occurrence_not_found(id: &str) -> ToolError {
     ToolError::new(format!(
@@ -129,6 +141,13 @@ mod tests {
         let e = parse_item_id("E1|S1|2026-10-14T09:30:00").unwrap_err().to_string();
         assert!(e.contains("occurrence"), "{e}");
         assert!(parse_item_id("E1|S1").is_ok());
+    }
+
+    #[test]
+    fn current_ids_name_the_series_and_the_occurrence() {
+        assert_eq!(current_ids("E2", "S1", None), serde_json::json!({"id": "E2|S1"}));
+        assert_eq!(current_ids("E2", "S1", Some("2026-10-14T11:00:00")),
+            serde_json::json!({"id": "E2|S1", "occurrence_id": "E2|S1|2026-10-14T11:00:00"}));
     }
 
     #[test]

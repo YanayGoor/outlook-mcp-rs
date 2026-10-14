@@ -16,7 +16,7 @@ on the machine, signed in as you.
   it inherits your existing session, accounts, and shared-folder permissions. There are no
   tokens to manage and no separate authentication step — if you can see it in Outlook, so can
   the server.
-- **31 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
+- **30 tools across five areas** — email, calendar, attachments, tasks, and notes (full list
   below).
 - **Deliberate about side effects.** The handful of tools that actually send mail or meeting
   responses are explicit and opt-in, and the test suite is built so nothing is delivered by
@@ -56,7 +56,7 @@ For example, in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Restart the client after editing its config. The server connects to whatever Outlook is
-already running, and the 31 tools below become available.
+already running, and the 30 tools below become available.
 
 ## Remote / network mode (connect from another machine)
 
@@ -78,7 +78,7 @@ outlook-mcp-rs.exe --http --port 8080 --token YOUR_SECRET
 ```
 
 It prints `outlook-mcp-rs listening on http://0.0.0.0:8080/mcp` and serves the
-same 31 tools as stdio mode. Outlook must be running and signed in, as usual.
+same 30 tools as stdio mode. Outlook must be running and signed in, as usual.
 
 Find this machine's name (the client connects to it):
 
@@ -130,7 +130,7 @@ The Outlook tools then appear in that client.
 
 ## Available tools
 
-31 MCP tools, grouped by category:
+30 MCP tools, grouped by category:
 
 **Email**
 - `list_folders` — list mail folders (name, path, item counts)
@@ -145,12 +145,11 @@ The Outlook tools then appear in that client.
 - `empty_deleted_items` — **permanently** delete everything in Deleted Items (items and subfolders); **irreversible**, refuses unless `confirm=true`. On Exchange/Microsoft 365, retention policy may still keep items in Recoverable Items
 
 **Calendar**
-- `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `include_canceled=false` skips canceled meetings; `count` default and max 250, page with `offset`. Recurring events are expanded; each occurrence has the series' `id` plus its own `occurrence_id` (see "Recurring meetings"). Each row says whether you're a required or optional attendee (`user_is_required`/`user_is_optional`, see below) and how many attendees each tier has. `compact=true` or `fields=[...]` returns only the fields you need
+- `list_events` — list/search calendar events by start (`start_after`/`start_before`, default today plus 7 days), text (subject/location), category, show_as, your response, or attendees; view meetings-only or all-day; or open another person's shared calendar with `calendar_of`; `is_canceled` filters canceled meetings; `count` default and max 250, page with `offset`. Recurring events are expanded; each occurrence has the series' `id` plus its own `occurrence_id` (see "Recurring meetings"). Each row says whether you're a required or optional attendee (`user_is_required`/`user_is_optional`, see below) and how many attendees each tier has. `compact=true` or `fields=[...]` returns only the fields you need
 - `get_event` — get the full details of one calendar event by id (or `occurrence_id`), or several in one call (same output options as `get_email`, plain-text body only)
 - `create_event` — create a calendar event; supports two tiers of attendees, categories, `show_as`, and recurrence, with `send` controlling whether invites actually go out; `body` or `body_file`
 - `update_event` — change an existing event (subject, times, location, body or `body_file`, attendees, reminder, recurrence…); optionally notify attendees. With an `occurrence_id` it changes just that occurrence and returns its new `occurrence_id`
 - `respond_to_meeting` — respond to a meeting invite (accept, decline, or tentative): a whole series, or one occurrence with its `occurrence_id`; pass a list of ids to answer several invites in one call (per-item results; one failure doesn't stop the rest). `send=false` records the answer without emailing the organizer
-- `move_events` — move several events in one call: `moves: [{event_id, start, end?}]` (up to 100; `end` omitted keeps the duration; series, one-off or occurrence ids). Each result has `previous_start`/`previous_end`, and `undo.moves` is ready to pass back to `move_events` to roll everything back. `send_update` (default true) notifies a meeting's attendees
 - `delete_event` — delete/cancel an event (moves it to Deleted Items), or hard-delete it with `permanent=true` (**irreversible**); for a meeting you organize, `send_cancellation` (default true) notifies attendees first, independent of `permanent`. A recurring event's `id` names the whole series, so the whole series is deleted; an `occurrence_id` deletes just that occurrence
 - `check_availability` — check free/busy for one or more people over a time window; returns each person's per-slot status plus the windows where everyone is free
 
@@ -183,6 +182,8 @@ The Outlook tools then appear in that client.
   - `*` matches any run of characters: `status*report`;
   - `field:term` limits a term to one field: `subject:invoice`, `from:"Ada Lovelace"`. Fields: `subject`, `from`, `to`, `body` (emails); `subject`, `location`, `organizer`, `attendees` (events); `subject`, `body` (tasks and notes). Any other `word:` is plain text, so `10:30` still matches literally.
 - **Date ranges** are `<field>_after` / `<field>_before`, both inclusive: `received_*` (emails), `start_*` (events; `start_date`/`end_date` still work), `due_*` (tasks), `created_*` (notes). A bare date in `*_before` includes that whole day.
+- **Fields:** `fields: [...]` returns only those fields of each row, and `compact: true` returns each tool's preset of the fields needed to triage a list (e.g. events: id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required/optional, attendee counts). Use them on long lists to save tokens; an unknown field is an error that lists the valid ones. This applies to `list_folders` and `list_attachments` too.
+- **Output to file:** `output_dir` writes the rows (after `fields`/`compact`) to a new JSON Lines file in that directory, one row per line, and returns `{rows_file, count}` instead of the rows. It is the same parameter name as on the `get_*` tools. Each call writes its own file, so paging leaves one file per page.
 - **Paging:** `count` and `offset` on every list tool. Caps: emails 200 (default 10), events 250, tasks 500, notes 500 (default = cap). Call again with `offset += count` until a page comes back short.
 - **Deprecated** (still accepted): `since_days` (use `received_after: "-14d"`), `flagged` (use `flag`), `high_importance` (use `importance: "high"`).
 
@@ -190,15 +191,47 @@ The Outlook tools then appear in that client.
 
 `list_events` rows (and `get_event`) carry these fields alongside the subject, times and attendee strings:
 
-- **`user_is_required` / `user_is_optional`:** whether the calendar's owner (you, or the `calendar_of` person) is a required or an optional attendee. Computed on the server from the meeting's recipients, matched by address (never by display name) and through distribution lists, including nested ones (up to 3 levels). A meeting you organize, or a personal appointment, counts as required. If both are `false`, you weren't found among the attendees (e.g. a forwarded invite, or a list that can't be expanded): use `my_response`.
+- **`user_is_required` / `user_is_optional`:** whether the calendar's owner (you, or the `calendar_of` person) is a required or an optional attendee.
+  - Computed on the server from the meeting's recipients. Matching is by address, never by display name, and goes through distribution lists, including nested ones up to 10 levels.
+  - A meeting you organize, or a personal appointment, counts as required.
+  - Both `false`: you weren't found among the attendees (e.g. a forwarded invite); use `my_response`.
+  - Both `null`: unknown, because a list couldn't be expanded within the call's bounds.
+
+  Expanding lists is bounded per call, because each member is an Outlook lookup and a large list may go to the server:
+  - lists are expanded only when no direct match decides, and each list at most once per call;
+  - at most 5,000 list members are read across the whole call;
+  - list expansion stops after 3 seconds;
+  - each recipient address is checked for being a list only once per call.
 - **`required_count` / `optional_count`:** how many attendees each tier names.
-- **`is_canceled`:** the organizer canceled the meeting. `include_canceled=false` leaves those out (before paging).
+- **`is_canceled`:** the organizer canceled the meeting. As with every enum filter, `is_canceled: false` leaves those out (before paging).
 
-A week of a busy calendar is large. To cut tokens:
-- `compact=true` returns only `id`, `subject`, `start`, `end`, `organizer`, `is_recurring`, `my_response`, `show_as`, `user_is_required`, `user_is_optional`, `required_count`, `optional_count`;
-- or `fields=[...]` picks exactly the fields you want.
+If neither `user_is_*` field is requested (see `fields` under [List tool conventions](#list-tool-conventions)), the server skips reading the recipients, which makes the call faster.
 
-If neither `user_is_*` field is requested, the server also skips reading the recipients, which makes the call faster.
+### Batch writes and undo
+
+Every write tool that takes an item id can act on several items in one call:
+- **Many ids, same change:** pass the id parameter (`email_id`, `event_id`, `task_id`, `note_id`) as a list.
+  - This covers every `update_*` and `delete_*` tool and `respond_to_meeting`.
+  - E.g. `delete_email` with `email_id: [a, b, c]`, or `respond_to_meeting` with `event_id: [x, y]` and one `response`.
+- **Different changes per item:** pass `updates` to an `update_*` tool. It's a list of complete calls, each with its own id.
+  - E.g. `update_event` with `updates: [{event_id: a, start: …, end: …}, {event_id: b, subject: …}]`.
+
+At most 100 items per call. A list comes back as a list in the same order. A failed item becomes `{"id", "error"}` and doesn't stop the rest. Outlook can't make a batch atomic, so every `update_*` result instead carries:
+- **`undo`:** the update that puts back what it changed, in the same tool's parameters and addressed by the item's current id (an event's undo keeps its `send_update`). Pass a batch's `undo` objects as `updates` to roll the whole batch back.
+- **`not_undoable`:** changes `undo` can't revert: bodies, attachments, inline images, recurrence, removed attendees, a reminder or date that wasn't set before.
+
+### Ids after a write
+
+Ids can change when an item changes:
+- moving an email to another folder;
+- accepting or tentatively accepting a meeting (Outlook replaces the calendar item with a copy);
+- moving one occurrence of a recurring meeting.
+
+So **every tool that changes an item and leaves it in place returns the item's current `id`**, plus `occurrence_id` when it acted on one occurrence:
+- `create_*`, `update_*` and `respond_to_meeting`;
+- `reply_email` and `update_draft` when they save a draft.
+
+Use that id from then on. Tools whose item doesn't stay in place return no id: anything that sends (the mail moves to Sent Items) and deletes.
 
 ### Recurring meetings
 
@@ -210,7 +243,7 @@ If neither `user_is_*` field is requested, the server also skips reading the rec
 | `occurrence_id` | this one occurrence: the series id plus its start, `"{id}\|2026-10-14T09:30:00"` | read, answer, move or delete just that date |
 
 `get_event`, `respond_to_meeting`, `update_event` and `delete_event` accept either. Notes:
-- An `occurrence_id` stays valid until that occurrence is moved. `update_event` returns the new `occurrence_id` after a move. If you get "Occurrence not found", the occurrence was moved or deleted elsewhere: call `list_events` for that day again and match on the series `id` and the start.
+- An `occurrence_id` stays valid until that occurrence is moved. `update_event` and `respond_to_meeting` return the occurrence's current `occurrence_id` (see "Ids after a write"). If you get "Occurrence not found", the occurrence was moved or deleted elsewhere: call `list_events` for that day again and match on the series `id` and the start.
 - `recurrence` / `clear_recurrence` always need the series `id`.
 - Deleting an occurrence removes just that date from the series. It never goes to Deleted Items, so `permanent` has no effect.
 - Other tools (`get_email`, `update_email`, …) reject an `occurrence_id`.
@@ -343,7 +376,7 @@ A few tools have real, outbound effects, and these are also explicit in the tool
 
 - `send_email` delivers mail, as do `reply_email` (unless `send=false`) and `update_draft` with `send=true`;
 - `respond_to_meeting` notifies an organizer (unless `send=false`);
-- `create_event`, `update_event`, `move_events` and `delete_event` notify attendees when their send/update/cancellation flag is set.
+- `create_event`, `update_event` and `delete_event` notify attendees when their send/update/cancellation flag is set.
 
 `update_draft` edits a draft and only sends it when `send=true` is passed. [`TESTING.md`](TESTING.md) spells out exactly which behaviors are
 covered by automated tests versus verified by hand precisely because they send real mail.

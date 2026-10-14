@@ -26,6 +26,7 @@ use crate::outlook::com::{
 use crate::outlook::types::*;
 use crate::outlook::attendance::{self, Attendee, Identity, ListCache, UserRole};
 use crate::outlook::occurrence::{self, EventId};
+use crate::outlook::undo::{self, Undo};
 use chrono::Datelike;
 use crate::outlook::filters::{self, DateRange};
 use crate::outlook::text_query::TextQuery;
@@ -35,7 +36,7 @@ use crate::outlook::{
     parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
     CheckAvailabilityInput, permanent_delete_needs_move, require_empty_confirm, CreateEventInput,
     deleted_note, delete_event_note, delete_occurrence_note, meeting_is_canceled,
-    validate_occurrence_update, moved_times, EventMove,
+    validate_occurrence_update,
     EmailQuery, EmailUpdate, EventQuery, EventUpdate, NoteQuery, NoteUpdate, OutlookClient,
     RecurrenceInput, TaskQuery, TaskUpdate, text_before_cid, draft_update_changes,
     validate_draft_update, DraftUpdate, InlineImageSource, ValidatedInlineImage, MailBody,
@@ -61,8 +62,12 @@ const MAX_INLINE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// non-ASCII query comes back empty (see `list_emails`).
 const MAX_SCAN_ITEMS: i32 = 2000;
 /// Upper bound on the recipients of one event read for `user_is_required` /
-/// `user_is_optional`; a meeting with more is judged on the first ones.
+/// `user_is_optional`; past it the role is unknown unless the first ones
+/// already show the owner as required.
 const ROLE_RECIPIENT_LIMIT: i32 = 1000;
+/// Time one tool call may spend expanding distribution lists, across every
+/// event. Past it, roles that depend on an unexpanded list are unknown.
+const LIST_EXPANSION_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Lets `?` turn a `windows::core::Error` into a [`ToolError`] anywhere in
 /// this module, so COM-plumbing calls (`call_method`, `get_property`, …) and
@@ -340,11 +345,19 @@ struct EventRows {
     /// Distribution-list address entries seen so far, by lowercased address,
     /// so `attendance::user_role` can ask for a list's members by address.
     list_entries: HashMap<String, IDispatch>,
+    /// Whether each recipient address seen so far is a list, so the same
+    /// attendees across a week of meetings cost one `AddressEntry` read each.
+    is_list: HashMap<String, bool>,
+    /// When list expansion stops for this call (set when it first starts).
+    expansion_deadline: Option<std::time::Instant>,
 }
 
 impl EventRows {
     fn new(calendar_store_id: Option<String>, owner: Option<Identity>) -> Self {
-        Self { calendar_store_id, owner, lists: ListCache::default(), list_entries: HashMap::new() }
+        Self {
+            calendar_store_id, owner, lists: ListCache::default(), list_entries: HashMap::new(),
+            is_list: HashMap::new(), expansion_deadline: None,
+        }
     }
 }
 
@@ -385,12 +398,17 @@ fn is_list_entry(entry: &IDispatch) -> bool {
 }
 
 /// The members of a distribution list's address entry, registering nested
-/// lists in `list_entries`. `AddressEntry.Members` covers both kinds of
-/// list; an Exchange list that doesn't expose it falls back to
+/// lists in `list_entries` / `is_list`. `AddressEntry.Members` covers both
+/// kinds of list; an Exchange list that doesn't expose it falls back to
 /// `GetExchangeDistributionList().GetExchangeDistributionListMembers()`.
-/// `None` if neither works (a dynamic list, or no permission).
-fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>)
-    -> Option<Vec<Attendee>> {
+/// `None` if neither works (a dynamic list, or no permission), or if the
+/// call's time budget runs out before the list is read: the caller then
+/// reports the role as unknown instead of guessing.
+fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>,
+    is_list: &mut HashMap<String, bool>, deadline: std::time::Instant) -> Option<Vec<Attendee>> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
     let members = get_property(entry, "Members")
         .ok()
         .and_then(|v| to_disp(v).ok())
@@ -403,8 +421,15 @@ fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>
                 .and_then(|v| to_disp(v).ok())
         })?;
     let n = variant_to_i32(&get_property(&members, "Count").unwrap_or_default()).unwrap_or(0);
+    // More members than the whole call may read: no point reading any.
+    if n as usize > attendance::MAX_LIST_MEMBERS_PER_CALL {
+        return None;
+    }
     let mut out = Vec::new();
-    for i in 1..=n.min(attendance::MAX_LIST_MEMBERS as i32) {
+    for i in 1..=n {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         let Some(m) = call_method(&members, "Item", &mut [variant_from_i32(i)])
             .ok()
             .and_then(|v| to_disp(v).ok())
@@ -412,32 +437,41 @@ fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>
             continue;
         };
         let address = variant_to_string(&get_property(&m, "Address").unwrap_or_default());
-        let is_list = is_list_entry(&m);
-        if is_list {
-            list_entries.insert(address.trim().to_lowercase(), m);
+        let key = address.trim().to_lowercase();
+        let list = match is_list.get(&key) {
+            Some(&known) => known,
+            None => {
+                let known = is_list_entry(&m);
+                is_list.insert(key.clone(), known);
+                known
+            }
+        };
+        if list {
+            list_entries.entry(key).or_insert(m);
         }
         // A member's kind is irrelevant: it takes its list's type.
-        out.push(Attendee { kind: 0, address, is_list });
+        out.push(Attendee { kind: 0, address, is_list: list });
     }
     Some(out)
 }
 
 /// `user_is_required` / `user_is_optional` for one event. Reads each
 /// required/optional recipient's type and address; only if no recipient
-/// matches the owner directly does it look at which recipients are
-/// distribution lists, and expand those (see `attendance::user_role`).
+/// matches the owner directly as required does it look at which recipients
+/// are distribution lists (remembered per address for the whole call), and
+/// expand those within the call's bounds (see `outlook::attendance`).
 fn event_user_role(item: &IDispatch, is_meeting: bool, organizer_is_owner: bool,
     rows: &mut EventRows) -> UserRole {
-    let Some(owner) = rows.owner.as_ref() else { return UserRole::default() };
+    let Some(owner) = rows.owner.as_ref() else { return UserRole::UNKNOWN };
     if !is_meeting || organizer_is_owner {
-        return attendance::user_role(is_meeting, organizer_is_owner, &[], owner,
-            &mut rows.lists, |_| None);
+        return UserRole::REQUIRED;
     }
     let Some(recipients) = get_property(item, "Recipients").ok().and_then(|v| to_disp(v).ok())
     else {
-        return UserRole::default();
+        return UserRole::UNKNOWN;
     };
     let n = variant_to_i32(&get_property(&recipients, "Count").unwrap_or_default()).unwrap_or(0);
+    let truncated = n > ROLE_RECIPIENT_LIMIT;
     let mut attendees = Vec::new();
     let mut entries = Vec::new();
     for i in 1..=n.min(ROLE_RECIPIENT_LIMIT) {
@@ -456,23 +490,34 @@ fn event_user_role(item: &IDispatch, is_meeting: bool, organizer_is_owner: bool,
         entries.push(r);
     }
     let direct = attendance::user_role(true, false, &attendees, owner, &mut rows.lists, |_| None);
-    if direct.user_is_required {
+    if direct == UserRole::REQUIRED {
         return direct;
     }
     // No direct required match: find the lists among the recipients.
-    let EventRows { lists, list_entries, .. } = rows;
+    let EventRows { lists, list_entries, is_list, expansion_deadline, .. } = rows;
     for (attendee, r) in attendees.iter_mut().zip(&entries) {
-        if let Some(entry) = get_property(r, "AddressEntry").ok().and_then(|v| to_disp(v).ok())
-            && is_list_entry(&entry)
-        {
-            attendee.is_list = true;
-            list_entries.insert(attendee.address.trim().to_lowercase(), entry);
-        }
+        let key = attendee.address.trim().to_lowercase();
+        attendee.is_list = match is_list.get(&key) {
+            Some(&known) => known,
+            None => {
+                let entry = get_property(r, "AddressEntry").ok().and_then(|v| to_disp(v).ok());
+                let known = entry.as_ref().is_some_and(is_list_entry);
+                is_list.insert(key.clone(), known);
+                if let Some(entry) = entry.filter(|_| known) {
+                    list_entries.insert(key, entry);
+                }
+                known
+            }
+        };
     }
-    attendance::user_role(true, false, &attendees, owner, lists, |address| {
+    let role = attendance::user_role(true, false, &attendees, owner, lists, |address| {
+        let deadline = *expansion_deadline
+            .get_or_insert_with(|| std::time::Instant::now() + LIST_EXPANSION_TIME_BUDGET);
         let entry = list_entries.get(&address.trim().to_lowercase())?.clone();
-        list_members(&entry, list_entries)
-    })
+        list_members(&entry, list_entries, is_list, deadline)
+    });
+    // Recipients past the limit weren't read: only a "required" is certain.
+    if truncated && role != UserRole::REQUIRED { UserRole::UNKNOWN } else { role }
 }
 
 /// `client.py::_event_summary`, enriched for v2 with show_as/my_response and the
@@ -1161,11 +1206,29 @@ fn resolve_occurrence(master: &IDispatch, start: &chrono::NaiveDateTime) -> Opti
     })
 }
 
-/// An appointment's `Start` / `End` as a datetime.
-fn item_datetime(item: &IDispatch, prop: &str) -> Result<chrono::NaiveDateTime, ToolError> {
-    variant_to_iso_string(&get_property(item, prop)?)
-        .and_then(|s| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S").ok())
-        .ok_or_else(|| ToolError::new(format!("could not read the event's {prop}")))
+/// The ids of a calendar item after a write (see `occurrence::current_ids`),
+/// read back from the item: a write can change them (accepting a meeting
+/// replaces the item; moving an occurrence changes its start). The store
+/// comes from the id the caller passed, since an occurrence's
+/// `Parent.StoreID` is unreliable (see `event_summary`).
+fn event_ids_after(item: &IDispatch, parsed: &EventId) -> Result<Value, ToolError> {
+    let entry_id = variant_to_string(&get_property(item, "EntryID")?);
+    let start = if parsed.is_occurrence() {
+        Some(variant_to_iso_string(&get_property(item, "Start")?)
+            .ok_or_else(|| ToolError::new("could not read the occurrence's start"))?)
+    } else {
+        None
+    };
+    Ok(occurrence::current_ids(&entry_id, &parsed.store_id, start.as_deref()))
+}
+
+/// Adds `ids` (an object) in front of `rest`'s fields.
+fn with_ids(ids: Value, rest: Value) -> Value {
+    let mut out = ids;
+    if let (Some(o), Value::Object(fields)) = (out.as_object_mut(), rest) {
+        o.extend(fields);
+    }
+    out
 }
 
 /// One `get_event` result.
@@ -1839,10 +1902,13 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             let item = get_item(&ns, &u.email_id)?;
             let mut changed: Vec<&str> = Vec::new();
+            let mut undo = Undo::new();
 
             // ---- state changes first (they address the item by its current id) ----
 
             if let Some(read) = u.mark_read {
+                let was_unread = variant_to_bool(&get_property(&item, "UnRead")?).unwrap_or(false);
+                undo.set("mark_read", !was_unread);
                 // UnRead is the inverse of "read". Save so a mark_read-only
                 // update persists even when no later Save/Move follows.
                 put_property(&item, "UnRead", variant_from_bool(!read))?;
@@ -1851,6 +1917,8 @@ impl OutlookClient for WindowsOutlookClient {
             }
 
             if let Some(flag) = &u.flag {
+                let old = variant_to_i32(&get_property(&item, "FlagStatus")?).unwrap_or(c::OL_NO_FLAG);
+                undo.set("flag", undo::flag_word(old));
                 match flag.to_lowercase().as_str() {
                     "follow_up" => {
                         // MarkAsTask flags for follow-up with no due date.
@@ -1877,6 +1945,7 @@ impl OutlookClient for WindowsOutlookClient {
             // so tagging never wipes existing categories.
             if u.add_categories.is_some() || u.remove_categories.is_some() {
                 let mut cats = get_item_categories(&item);
+                undo.categories(&cats, u.add_categories.as_deref(), u.remove_categories.as_deref());
                 if let Some(add) = &u.add_categories {
                     for a in add {
                         if !cats.iter().any(|c| c.eq_ignore_ascii_case(a)) {
@@ -1894,6 +1963,8 @@ impl OutlookClient for WindowsOutlookClient {
             }
 
             if let Some(imp) = &u.importance {
+                let old = variant_to_i32(&get_property(&item, "Importance")?).unwrap_or(c::OL_IMPORTANCE_NORMAL);
+                undo.set("importance", crate::friendly::importance_word(old));
                 let id = c::importance_name_to_id(imp).ok_or_else(|| {
                     ToolError::new(format!(
                         "invalid importance {imp:?}: expected \"low\", \"normal\", or \"high\""
@@ -1907,6 +1978,8 @@ impl OutlookClient for WindowsOutlookClient {
             // ---- move last (Move changes the EntryID) ----
 
             let id = if let Some(dest) = &u.move_to {
+                let parent = to_disp(get_property(&item, "Parent")?)?;
+                undo.set("move_to", undo::move_to_path(&variant_to_string(&get_property(&parent, "FolderPath")?)));
                 let target = resolve_folder(&ns, Some(dest))?;
                 let moved = to_disp(call_method(
                     &item, "Move", &mut [VARIANT::from(target.clone())],
@@ -1914,10 +1987,11 @@ impl OutlookClient for WindowsOutlookClient {
                 changed.push("move_to");
                 make_id(&moved)? // EntryID changed — return the new id.
             } else {
-                u.email_id.clone()
+                make_id(&item)?
             };
 
-            Ok(json!({"status": "updated", "id": id, "changed": changed}))
+            let result = json!({"status": "updated", "id": id, "changed": changed});
+            Ok(undo::merged(result, undo.finish("email_id", &id, &[])))
         })
     }
 
@@ -1945,33 +2019,40 @@ impl OutlookClient for WindowsOutlookClient {
                 ));
             }
 
+            let mut undo = Undo::new();
             if let Some(subject) = &u.subject {
+                undo.set("subject", variant_to_string(&get_property(&item, "Subject")?));
                 put_property(&item, "Subject", variant_from_str(subject))?;
             }
             if let Some(body) = &u.body {
+                undo.not_undoable("body");
                 set_mail_body(&item, &MailBody::Text(body.clone()))?;
             }
             if let Some(html) = html_body {
+                undo.not_undoable("html_body");
                 set_mail_body(&item, &MailBody::Html(html))?;
             }
             // Recipients replace that whole line; an empty list clears it.
-            if let Some(to) = &u.to {
-                put_property(&item, "To", variant_from_str(&to.join("; ")))?;
-            }
-            if let Some(cc) = &u.cc {
-                put_property(&item, "CC", variant_from_str(&cc.join("; ")))?;
-            }
-            if let Some(bcc) = &u.bcc {
-                put_property(&item, "BCC", variant_from_str(&bcc.join("; ")))?;
+            for (param, prop, new) in [("to", "To", &u.to), ("cc", "CC", &u.cc), ("bcc", "BCC", &u.bcc)] {
+                if let Some(list) = new {
+                    undo.set(param, undo::recipient_list(&variant_to_string(&get_property(&item, prop)?)));
+                    put_property(&item, prop, variant_from_str(&list.join("; ")))?;
+                }
             }
             // Appended; existing attachments are kept.
             if let Some(atts) = u.attachments.as_deref().filter(|a| !a.is_empty()) {
+                undo.not_undoable("attachments");
                 attach_files(&item, atts)?;
+            }
+            if !explicit.is_empty() || !images.is_empty() {
+                undo.not_undoable("inline_images");
             }
             // Dropped at the end of this closure: temp files outlive Save/Send.
             let mut temp = InlineTempDirs::default();
             attach_draft_inline_images(&item, &images, explicit.len(), &mut temp)?;
             if u.add_categories.is_some() || u.remove_categories.is_some() {
+                undo.categories(&get_item_categories(&item), u.add_categories.as_deref(),
+                    u.remove_categories.as_deref());
                 let cats = merge_categories(
                     get_item_categories(&item),
                     u.add_categories.as_deref().unwrap_or(&[]),
@@ -1980,6 +2061,8 @@ impl OutlookClient for WindowsOutlookClient {
                 set_item_categories(&item, &cats)?;
             }
             if let Some(id) = importance {
+                let old = variant_to_i32(&get_property(&item, "Importance")?).unwrap_or(c::OL_IMPORTANCE_NORMAL);
+                undo.set("importance", crate::friendly::importance_word(old));
                 put_property(&item, "Importance", variant_from_i32(id))?;
             }
 
@@ -1987,7 +2070,8 @@ impl OutlookClient for WindowsOutlookClient {
             let id = make_id(&item)?;
             let changed = draft_update_changes(&u);
             if !u.send {
-                return Ok(json!({"status": "draft_updated", "id": id, "changed": changed}));
+                let result = json!({"status": "draft_updated", "id": id, "changed": changed});
+                return Ok(undo::merged(result, undo.finish("email_id", &id, &[])));
             }
             let recipients = to_disp(get_property(&item, "Recipients")?)?;
             if variant_to_i32(&get_property(&recipients, "Count")?).unwrap_or(0) == 0 {
@@ -2241,7 +2325,7 @@ impl OutlookClient for WindowsOutlookClient {
         })?;
         self.with_com(|| {
             let (_app, ns) = mapi()?;
-            let (mut item, _) = open_event(&ns, &event_id)?;
+            let (mut item, mut parsed) = open_event(&ns, &event_id)?;
             // A meeting request from the inbox resolves to a MeetingItem; get
             // its appointment. Calendar ids resolve straight to appointments.
             if has_member(&item, "GetAssociatedAppointment") {
@@ -2250,6 +2334,9 @@ impl OutlookClient for WindowsOutlookClient {
                     "GetAssociatedAppointment",
                     &mut [variant_from_bool(true)],
                 )?)?;
+                // The result names the calendar item, not the request.
+                let (entry_id, store_id) = parse_item_id(&make_id(&item)?)?;
+                parsed = EventId { entry_id, store_id, occurrence_start: None };
             }
             let resp = call_method(
                 &item,
@@ -2268,7 +2355,9 @@ impl OutlookClient for WindowsOutlookClient {
             }
             let subject = variant_to_string(&get_property(&item, "Subject")?);
             let status = format!("{response_key}{}", if send { "_sent" } else { "_saved" });
-            Ok(json!({"status": status, "subject": subject}))
+            // Accepting replaces the item with a copy under a new EntryID
+            // (AppointmentItem.Respond docs): return the id it has now.
+            Ok(with_ids(event_ids_after(&item, &parsed)?, json!({"status": status, "subject": subject})))
         })
     }
 
@@ -2279,10 +2368,23 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             let (item, parsed) = open_event(&ns, &u.event_id)?;
             let mut changed: Vec<&str> = Vec::new();
+            let mut undo = Undo::new();
+            let old_str = |prop: &str| -> Result<String, ToolError> {
+                Ok(variant_to_string(&get_property(&item, prop)?))
+            };
+            let old_iso = |prop: &str| -> Result<Value, ToolError> {
+                Ok(json!(variant_to_iso_string(&get_property(&item, prop)?)))
+            };
 
             if let Some(subject) = &u.subject {
+                undo.set("subject", old_str("Subject")?);
                 put_property(&item, "Subject", variant_from_str(subject))?;
                 changed.push("subject");
+            }
+            if u.start.is_some() || u.end.is_some() {
+                // Setting Start also shifts End, so put both back together.
+                undo.set("start", old_iso("Start")?);
+                undo.set("end", old_iso("End")?);
             }
             if let Some(start) = &u.start {
                 put_property(&item, "Start", variant_from_datetime(&parse_dt(start, "start")?)?)?;
@@ -2293,23 +2395,34 @@ impl OutlookClient for WindowsOutlookClient {
                 changed.push("end");
             }
             if let Some(location) = &u.location {
+                undo.set("location", old_str("Location")?);
                 put_property(&item, "Location", variant_from_str(location))?;
                 changed.push("location");
             }
             if let Some(body) = &u.body {
+                undo.not_undoable("body");
                 put_property(&item, "Body", variant_from_str(body))?;
                 changed.push("body");
             }
             if let Some(all_day) = u.all_day {
+                undo.set("all_day", variant_to_bool(&get_property(&item, "AllDayEvent")?).unwrap_or(false));
                 put_property(&item, "AllDayEvent", variant_from_bool(all_day))?;
                 changed.push("all_day");
             }
             if let Some(minutes) = u.reminder_minutes {
+                if variant_to_bool(&get_property(&item, "ReminderSet")?).unwrap_or(false) {
+                    undo.set("reminder_minutes",
+                        variant_to_i32(&get_property(&item, "ReminderMinutesBeforeStart")?).unwrap_or(15));
+                } else {
+                    undo.not_undoable("reminder_minutes"); // There was no reminder to restore.
+                }
                 put_property(&item, "ReminderSet", variant_from_bool(true))?;
                 put_property(&item, "ReminderMinutesBeforeStart", variant_from_i32(minutes))?;
                 changed.push("reminder_minutes");
             }
             if let Some(show_as) = u.show_as.as_deref().filter(|s| !s.is_empty()) {
+                undo.set("show_as", crate::friendly::busy_status_word(
+                    variant_to_i32(&get_property(&item, "BusyStatus")?).unwrap_or(c::OL_BUSY)));
                 let busy_status = crate::friendly::busy_status_to_id(show_as).ok_or_else(|| {
                     ToolError::new(format!(
                         "invalid show_as {show_as:?}: expected \"free\", \"tentative\", \"busy\", \"out_of_office\", or \"working_elsewhere\""
@@ -2320,6 +2433,7 @@ impl OutlookClient for WindowsOutlookClient {
             }
             if u.add_categories.is_some() || u.remove_categories.is_some() {
                 let mut cats = get_item_categories(&item);
+                undo.categories(&cats, u.add_categories.as_deref(), u.remove_categories.as_deref());
                 if let Some(add) = &u.add_categories {
                     for a in add {
                         if !cats.iter().any(|c| c.eq_ignore_ascii_case(a)) {
@@ -2341,6 +2455,9 @@ impl OutlookClient for WindowsOutlookClient {
             let adding_attendees = u.add_required_attendees.as_ref().is_some_and(|v| !v.is_empty())
                 || u.add_optional_attendees.as_ref().is_some_and(|v| !v.is_empty());
             if adding_attendees {
+                let added: Vec<String> = u.add_required_attendees.iter().flatten()
+                    .chain(u.add_optional_attendees.iter().flatten()).cloned().collect();
+                undo.set("remove_attendees", added);
                 let current_status =
                     variant_to_i32(&get_property(&item, "MeetingStatus")?).unwrap_or(c::OL_NONMEETING);
                 if current_status == c::OL_NONMEETING {
@@ -2358,6 +2475,7 @@ impl OutlookClient for WindowsOutlookClient {
                 if u.add_optional_attendees.is_some() { changed.push("add_optional_attendees"); }
             }
             if let Some(remove) = u.remove_attendees.as_ref().filter(|v| !v.is_empty()) {
+                undo.not_undoable("remove_attendees");
                 let recipients = to_disp(get_property(&item, "Recipients")?)?;
                 remove_meeting_recipients(&recipients, remove)?;
                 changed.push("remove_attendees");
@@ -2365,10 +2483,12 @@ impl OutlookClient for WindowsOutlookClient {
 
             validate_recurrence_update(&u)?;
             if let Some(recurrence) = u.recurrence.as_ref() {
+                undo.not_undoable("recurrence");
                 apply_recurrence(&item, recurrence)?;
                 changed.push("recurrence");
             }
             if u.clear_recurrence {
+                undo.not_undoable("clear_recurrence");
                 call_method(&item, "ClearRecurrencePattern", &mut [])?;
                 changed.push("clear_recurrence");
             }
@@ -2384,52 +2504,12 @@ impl OutlookClient for WindowsOutlookClient {
                 call_method(&item, "Save", &mut [])?;
             }
 
-            if parsed.is_occurrence() {
-                // Moving an occurrence changes its id: return the new one.
-                let start = variant_to_iso_string(&get_property(&item, "Start")?)
-                    .ok_or_else(|| ToolError::new("could not read the occurrence's new start"))?;
-                return Ok(json!({
-                    "status": "updated", "id": parsed.series_id(),
-                    "occurrence_id": occurrence::make_occurrence_id(&parsed.series_id(), &start),
-                    "changed": changed,
-                }));
-            }
-            Ok(json!({"status": "updated", "id": u.event_id, "changed": changed}))
-        })
-    }
-
-    fn move_event(&self, m: EventMove) -> Result<Value, ToolError> {
-        let new_start = parse_dt(&m.start, "start")?;
-        let new_end = m.end.as_deref().map(|e| parse_dt(e, "end")).transpose()?;
-        self.with_com(|| {
-            let (_app, ns) = mapi()?;
-            let (item, parsed) = open_event(&ns, &m.event_id)?;
-            let prev_start = item_datetime(&item, "Start")?;
-            let prev_end = item_datetime(&item, "End")?;
-            let (start, end) = moved_times(prev_start, prev_end, new_start, new_end)?;
-            // Setting Start shifts End by the old duration; End is then set explicitly.
-            put_property(&item, "Start", variant_from_datetime(&start)?)?;
-            put_property(&item, "End", variant_from_datetime(&end)?)?;
-            let is_meeting =
-                variant_to_i32(&get_property(&item, "MeetingStatus")?).unwrap_or(c::OL_NONMEETING)
-                    != c::OL_NONMEETING;
-            let notified = is_meeting && m.send_update;
-            if notified {
-                call_method(&item, "Send", &mut [])?;
-            } else {
-                call_method(&item, "Save", &mut [])?;
-            }
-            let fmt = occurrence::format_start;
-            let mut out = json!({
-                "id": parsed.series_id(),
-                "subject": variant_to_string(&get_property(&item, "Subject")?),
-                "previous_start": fmt(&prev_start), "previous_end": fmt(&prev_end),
-                "start": fmt(&start), "end": fmt(&end), "notified": notified,
-            });
-            if parsed.is_occurrence() {
-                out["occurrence_id"] = json!(occurrence::occurrence_id_at(&parsed.series_id(), &start));
-            }
-            Ok(out)
+            // Moving an occurrence changes its id: return the ids it has now.
+            let ids = event_ids_after(&item, &parsed)?;
+            // The undo addresses the occurrence (or event) by its id now.
+            let undo_id = ids.get("occurrence_id").unwrap_or(&ids["id"]).as_str().unwrap_or_default().to_string();
+            let undo = undo.finish("event_id", &undo_id, &[("send_update", json!(u.send_update))]);
+            Ok(undo::merged(with_ids(ids, json!({"status": "updated", "changed": changed})), undo))
         })
     }
 
@@ -2768,24 +2848,40 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             let task = get_item(&ns, &u.task_id)?;
             let mut changed: Vec<&str> = Vec::new();
+            let mut undo = Undo::new();
+            // A date the task has, as the undo value; Outlook's "none" date
+            // (4501-01-01) can't be restored by an update, so it's not undoable.
+            let old_date = |undo: &mut Undo, param: &str, prop: &str| -> Result<(), ToolError> {
+                match variant_to_iso_string(&get_property(&task, prop)?).filter(|d| !d.starts_with("4501")) {
+                    Some(d) => undo.set(param, d),
+                    None => undo.not_undoable(param),
+                }
+                Ok(())
+            };
 
             if let Some(subject) = &u.subject {
+                undo.set("subject", variant_to_string(&get_property(&task, "Subject")?));
                 put_property(&task, "Subject", variant_from_str(subject))?;
                 changed.push("subject");
             }
             if let Some(body) = &u.body {
+                undo.not_undoable("body");
                 put_property(&task, "Body", variant_from_str(body))?;
                 changed.push("body");
             }
             if let Some(due) = &u.due_date {
+                old_date(&mut undo, "due_date", "DueDate")?;
                 put_property(&task, "DueDate", variant_from_datetime(&parse_dt(due, "due_date")?)?)?;
                 changed.push("due_date");
             }
             if let Some(start) = &u.start_date {
+                old_date(&mut undo, "start_date", "StartDate")?;
                 put_property(&task, "StartDate", variant_from_datetime(&parse_dt(start, "start_date")?)?)?;
                 changed.push("start_date");
             }
             if let Some(imp) = &u.importance {
+                undo.set("importance", crate::friendly::importance_word(
+                    variant_to_i32(&get_property(&task, "Importance")?).unwrap_or(c::OL_IMPORTANCE_NORMAL)));
                 let id = c::importance_name_to_id(imp).ok_or_else(|| {
                     ToolError::new(format!(
                         "invalid importance {imp:?}: expected \"low\", \"normal\", or \"high\""
@@ -2796,6 +2892,7 @@ impl OutlookClient for WindowsOutlookClient {
             }
             if u.add_categories.is_some() || u.remove_categories.is_some() {
                 let mut cats = get_item_categories(&task);
+                undo.categories(&cats, u.add_categories.as_deref(), u.remove_categories.as_deref());
                 if let Some(add) = &u.add_categories {
                     for a in add {
                         if !cats.iter().any(|c| c.eq_ignore_ascii_case(a)) {
@@ -2810,11 +2907,20 @@ impl OutlookClient for WindowsOutlookClient {
                 }
                 set_item_categories(&task, &cats)?;
             }
+            if u.percent_complete.is_some() || u.mark_complete.is_some() {
+                undo.set("percent_complete",
+                    variant_to_i32(&get_property(&task, "PercentComplete")?).unwrap_or(0));
+            }
             if let Some(pct) = u.percent_complete {
                 put_property(&task, "PercentComplete", variant_from_i32(pct))?;
                 changed.push("percent_complete");
             }
             if let Some(reminder) = &u.reminder_time {
+                if variant_to_bool(&get_property(&task, "ReminderSet")?).unwrap_or(false) {
+                    old_date(&mut undo, "reminder_time", "ReminderTime")?;
+                } else {
+                    undo.not_undoable("reminder_time"); // There was no reminder to restore.
+                }
                 put_property(&task, "ReminderSet", variant_from_bool(true))?;
                 put_property(&task, "ReminderTime", variant_from_datetime(&parse_dt(reminder, "reminder_time")?)?)?;
                 changed.push("reminder_time");
@@ -2824,6 +2930,7 @@ impl OutlookClient for WindowsOutlookClient {
             // and Status=olTaskComplete), so apply any field edits above
             // to the task's live state first, then finish/reopen it.
             if let Some(complete) = u.mark_complete {
+                undo.set("mark_complete", variant_to_bool(&get_property(&task, "Complete")?).unwrap_or(false));
                 if complete {
                     call_method(&task, "MarkComplete", &mut [])?;
                 } else {
@@ -2835,7 +2942,9 @@ impl OutlookClient for WindowsOutlookClient {
             }
 
             call_method(&task, "Save", &mut [])?;
-            Ok(json!({"status": "updated", "id": u.task_id, "changed": changed}))
+            let id = make_id(&task)?;
+            let result = json!({"status": "updated", "id": id, "changed": changed});
+            Ok(undo::merged(result, undo.finish("task_id", &id, &[])))
         })
     }
 
@@ -2931,13 +3040,16 @@ impl OutlookClient for WindowsOutlookClient {
             let (_app, ns) = mapi()?;
             let note = get_item(&ns, &u.note_id)?;
             let mut changed: Vec<&str> = Vec::new();
+            let mut undo = Undo::new();
 
             if let Some(body) = &u.body {
+                undo.not_undoable("body");
                 put_property(&note, "Body", variant_from_str(body))?;
                 changed.push("body");
             }
             if u.add_categories.is_some() || u.remove_categories.is_some() {
                 let mut cats = get_item_categories(&note);
+                undo.categories(&cats, u.add_categories.as_deref(), u.remove_categories.as_deref());
                 if let Some(add) = &u.add_categories {
                     for a in add {
                         if !cats.iter().any(|c| c.eq_ignore_ascii_case(a)) {
@@ -2953,6 +3065,8 @@ impl OutlookClient for WindowsOutlookClient {
                 set_item_categories(&note, &cats)?;
             }
             if let Some(color) = &u.color {
+                undo.set("color", crate::friendly::note_color_word(
+                    variant_to_i32(&get_property(&note, "Color")?).unwrap_or(c::OL_NOTE_COLOR_YELLOW)));
                 let id = c::note_color_to_id(color).ok_or_else(|| {
                     ToolError::new(format!(
                         "invalid color {color:?}: expected \"blue\", \"green\", \"pink\", \"yellow\", or \"white\""
@@ -2963,7 +3077,9 @@ impl OutlookClient for WindowsOutlookClient {
             }
 
             call_method(&note, "Save", &mut [])?;
-            Ok(json!({"status": "updated", "id": u.note_id, "changed": changed}))
+            let id = make_id(&note)?;
+            let result = json!({"status": "updated", "id": id, "changed": changed});
+            Ok(undo::merged(result, undo.finish("note_id", &id, &[])))
         })
     }
 

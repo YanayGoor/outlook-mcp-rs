@@ -2,13 +2,14 @@ pub mod attendance;
 pub mod client;
 pub mod com;
 pub mod dates;
-pub mod event_rows;
 pub mod occurrence;
+pub mod rows;
 pub mod fake;
 pub mod filters;
 pub mod read;
 pub mod text_query;
 pub mod types;
+pub mod undo;
 
 use crate::error::ToolError;
 use serde_json::Value;
@@ -246,8 +247,8 @@ pub struct EventQuery {
     pub meetings_only: bool,
     pub all_day: Option<bool>,
     pub calendar_of: Option<String>,
-    /// false = skip meetings the organizer canceled (before paging).
-    pub include_canceled: bool,
+    /// Some(true) = only canceled meetings, Some(false) = skip them.
+    pub is_canceled: Option<bool>,
     /// Compute `user_is_required` / `user_is_optional` (a `Recipients` walk
     /// per event). When false both are reported false.
     pub user_role: bool,
@@ -261,7 +262,7 @@ impl Default for EventQuery {
             start_after: None, start_before: None, query: None, category: Vec::new(),
             show_as: Vec::new(), my_response: Vec::new(), attendees: Vec::new(),
             attendee_role: None, meetings_only: false, all_day: None, calendar_of: None,
-            include_canceled: true, user_role: true, count: MAX_EVENT_COUNT, offset: 0,
+            is_canceled: None, user_role: true, count: MAX_EVENT_COUNT, offset: 0,
         }
     }
 }
@@ -373,35 +374,6 @@ pub struct EventUpdate {
     pub clear_recurrence: bool,
 }
 
-/// One entry of `move_events`.
-#[derive(Debug, Clone)]
-pub struct EventMove {
-    pub event_id: String,
-    pub start: String,
-    /// `None` keeps the event's duration.
-    pub end: Option<String>,
-    /// Notify attendees if the event is a meeting.
-    pub send_update: bool,
-}
-
-/// Most entries one `move_events` call takes.
-pub const MAX_EVENT_MOVES: usize = 100;
-
-/// The new `(start, end)` of a moved event: `new_end` if given (not before
-/// `new_start`), else `new_start` plus the event's current duration.
-pub fn moved_times(prev_start: chrono::NaiveDateTime, prev_end: chrono::NaiveDateTime,
-    new_start: chrono::NaiveDateTime,
-    new_end: Option<chrono::NaiveDateTime>)
-    -> Result<(chrono::NaiveDateTime, chrono::NaiveDateTime), ToolError> {
-    match new_end {
-        Some(end) if end < new_start => Err(ToolError::new(format!(
-            "end ({end}) is before start ({new_start})."
-        ))),
-        Some(end) => Ok((new_start, end)),
-        None => Ok((new_start, new_start + (prev_end - prev_start))),
-    }
-}
-
 /// One recurrence pattern for `create_event`/`update_event`. `pattern`
 /// selects which of the other fields matter: `"weekly"` requires
 /// `days_of_week`; `"monthly"` requires `day_of_month`; `"yearly"` derives
@@ -443,15 +415,6 @@ pub trait OutlookClient: Send + Sync {
     fn respond_to_meeting(&self, event_id: String, response: String,
         comment: Option<String>, send: bool) -> Result<Value, ToolError>;
     fn update_event(&self, u: EventUpdate) -> Result<Value, ToolError>;
-    /// Moves one event (series, one-off or occurrence) to `m.start`, keeping
-    /// its duration unless `m.end` is given. Returns `id` (plus the new
-    /// `occurrence_id` for an occurrence), `subject`, `previous_start`,
-    /// `previous_end`, `start` and `end` (ISO), and whether attendees were
-    /// `notified`.
-    fn move_event(&self, m: EventMove) -> Result<Value, ToolError>;
-    /// `permanent` as in [`OutlookClient::delete_email`]. For a meeting you
-    /// organize, `send_cancellation` (independent of `permanent`) decides
-    /// whether attendees are notified before your copy is deleted.
     fn delete_event(&self, event_id: String, send_cancellation: bool, permanent: bool)
         -> Result<Value, ToolError>;
     fn check_availability(&self, input: CheckAvailabilityInput) -> Result<AvailabilityResult, ToolError>;
@@ -1467,23 +1430,9 @@ mod tests {
         parse_freebusy_slots, take_page, validate_recurrence, validate_recurrence_update,
         EventUpdate, RecurrenceInput, permanent_delete_needs_move, require_empty_confirm,
         deleted_note, delete_event_note, delete_occurrence_note, validate_occurrence_update,
-        moved_times,
         draft_update_changes, validate_draft_update, DraftUpdate, InlineImage, merge_categories,
         parse_importance,
     };
-
-    #[test]
-    fn moved_times_keep_the_duration_unless_an_end_is_given() {
-        let t = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").unwrap();
-        let (s, e) = moved_times(t("2026-10-14T09:00"), t("2026-10-14T09:45"), t("2026-10-15T13:00"), None).unwrap();
-        assert_eq!((s, e), (t("2026-10-15T13:00"), t("2026-10-15T13:45")));
-        let (_, e) = moved_times(t("2026-10-14T09:00"), t("2026-10-14T09:45"), t("2026-10-15T13:00"),
-            Some(t("2026-10-15T14:00"))).unwrap();
-        assert_eq!(e, t("2026-10-15T14:00"));
-        let err = moved_times(t("2026-10-14T09:00"), t("2026-10-14T09:45"), t("2026-10-15T13:00"),
-            Some(t("2026-10-15T12:00"))).unwrap_err();
-        assert!(err.to_string().contains("before start"));
-    }
 
     #[test]
     fn occurrence_delete_note_says_only_that_date_went() {

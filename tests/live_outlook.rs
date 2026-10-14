@@ -11,7 +11,7 @@
 use outlook_mcp_rs::outlook::client::WindowsOutlookClient;
 use outlook_mcp_rs::outlook::read::single;
 use outlook_mcp_rs::outlook::ReadOptions;
-use outlook_mcp_rs::outlook::{MailBody, NewEmail, ReplyInput, CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventMove, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
+use outlook_mcp_rs::outlook::{MailBody, NewEmail, ReplyInput, CheckAvailabilityInput, CreateEventInput, DraftUpdate, EmailQuery, EventQuery, OutlookClient, EmailUpdate, EventUpdate, NoteQuery, NoteUpdate, RecurrenceInput, TaskQuery, TaskUpdate, InlineImage};
 
 fn client() -> WindowsOutlookClient {
     WindowsOutlookClient::new()
@@ -455,15 +455,20 @@ fn list_events_user_role_and_compact_fields_on_a_real_week() {
     // both true; the counts match the attendee strings.
     use outlook_mcp_rs::outlook::attendance::attendee_count;
     let c = client();
+    let started = std::time::Instant::now();
     let events = c.list_events(EventQuery {
         start_after: Some("start_of_week".to_string()),
         start_before: Some("end_of_week".to_string()),
         ..Default::default()
     }).expect("list_events");
+    let with_roles = started.elapsed();
     for e in &events {
-        assert!(!(e.user_is_required && e.user_is_optional), "{}: both flags set", e.subject);
+        assert!(!(e.user_is_required == Some(true) && e.user_is_optional == Some(true)),
+            "{}: both flags set", e.subject);
+        assert_eq!(e.user_is_required.is_none(), e.user_is_optional.is_none(),
+            "{}: unknown is all-or-nothing", e.subject);
         if !e.is_meeting || e.my_response == "organizer" {
-            assert!(e.user_is_required, "{}: own event must be required", e.subject);
+            assert_eq!(e.user_is_required, Some(true), "{}: own event must be required", e.subject);
         }
         assert_eq!(e.required_count, attendee_count(&e.required_attendees));
         assert_eq!(e.optional_count, attendee_count(&e.optional_attendees));
@@ -471,9 +476,10 @@ fn list_events_user_role_and_compact_fields_on_a_real_week() {
     let invited = events.iter().filter(|e| e.is_meeting && e.my_response != "organizer").count();
     let found = events.iter()
         .filter(|e| e.is_meeting && e.my_response != "organizer")
-        .filter(|e| e.user_is_required || e.user_is_optional)
+        .filter(|e| e.user_is_required == Some(true) || e.user_is_optional == Some(true))
         .count();
-    eprintln!("{invited} invites this week, the user was found on {found}");
+    let unknown = events.iter().filter(|e| e.user_is_required.is_none()).count();
+    eprintln!("{invited} invites this week, the user was found on {found}, unknown on {unknown}");
 
     // Without the role fields, nothing is computed and both are false.
     let lean = c.list_events(EventQuery {
@@ -483,13 +489,19 @@ fn list_events_user_role_and_compact_fields_on_a_real_week() {
         ..Default::default()
     }).expect("list_events without user_role");
     assert_eq!(lean.len(), events.len());
-    assert!(lean.iter().all(|e| !e.user_is_required && !e.user_is_optional));
+    assert!(lean.iter().all(|e| e.user_is_required.is_none() && e.user_is_optional.is_none()));
+    // Distribution-list expansion is bounded: it adds at most its time
+    // budget (3 s) plus the recipient reads over the same week without roles.
+    let without_roles = started.elapsed() - with_roles;
+    eprintln!("list_events with roles: {with_roles:?}, without: {without_roles:?}");
+    assert!(with_roles < without_roles * 4 + std::time::Duration::from_secs(10),
+        "user roles made list_events too slow: {with_roles:?} vs {without_roles:?}");
 
-    // include_canceled=false drops exactly the canceled ones.
+    // is_canceled=false drops exactly the canceled ones.
     let kept = c.list_events(EventQuery {
         start_after: Some("start_of_week".to_string()),
         start_before: Some("end_of_week".to_string()),
-        include_canceled: false,
+        is_canceled: Some(false),
         user_role: false,
         ..Default::default()
     }).expect("list_events without canceled");
@@ -1217,36 +1229,54 @@ fn occurrence_ids_act_on_one_occurrence_only() {
 
 #[test]
 #[ignore]
-fn move_event_keeps_duration_and_undo_restores_it() {
+fn update_event_undo_restores_the_previous_values() {
     // A far-future personal appointment: nothing is sent.
     let c = client();
     let created = c.create_event(CreateEventInput {
-        subject: "outlook-mcp-rs move_events probe".to_string(),
+        subject: "outlook-mcp-rs undo probe".to_string(),
         start: "2099-04-06T09:00".to_string(),
         end: "2099-04-06T09:45".to_string(),
-        body: None, location: None, required_attendees: None, optional_attendees: None,
-        all_day: false, reminder_minutes: None, categories: None, show_as: None,
-        send: false, recurrence: None,
+        body: None, location: Some("Room A".to_string()), required_attendees: None,
+        optional_attendees: None, all_day: false, reminder_minutes: None,
+        categories: Some(vec!["Blue".to_string()]), show_as: None, send: false, recurrence: None,
     }).expect("create_event");
     let id = created["id"].as_str().unwrap().to_string();
-    let moved = c.move_event(EventMove {
-        event_id: id.clone(), start: "2099-04-07T13:00".to_string(), end: None, send_update: true,
-    }).expect("move_event");
-    assert_eq!(moved["previous_start"], "2099-04-06T09:00:00");
-    assert_eq!(moved["previous_end"], "2099-04-06T09:45:00");
-    assert_eq!(moved["end"], "2099-04-07T13:45:00");
-    assert_eq!(moved["notified"], false, "a personal appointment never notifies");
-    let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event");
-    assert_eq!(detail.summary.start.as_deref(), Some("2099-04-07T13:00:00"));
+    let mut u = no_op_event_update(&id);
+    u.start = Some("2099-04-07T13:00".to_string());
+    u.end = Some("2099-04-07T13:45".to_string());
+    u.location = Some("Room B".to_string());
+    u.show_as = Some("free".to_string());
+    u.add_categories = Some(vec!["Green".to_string()]);
+    u.remove_categories = Some(vec!["Blue".to_string()]);
+    u.body = Some("new body".to_string());
+    let updated = c.update_event(u).expect("update_event");
+    let undo = &updated["undo"];
+    assert_eq!(undo["event_id"], updated["id"]);
+    assert_eq!(undo["start"], "2099-04-06T09:00:00");
+    assert_eq!(undo["end"], "2099-04-06T09:45:00");
+    assert_eq!(undo["location"], "Room A");
+    assert_eq!(undo["show_as"], "busy");
+    assert_eq!(undo["remove_categories"], serde_json::json!(["Green"]));
+    assert_eq!(undo["add_categories"], serde_json::json!(["Blue"]));
+    assert_eq!(updated["not_undoable"], serde_json::json!(["body"]));
 
-    // Undo: move back to the previous times.
-    c.move_event(EventMove {
-        event_id: id.clone(), start: "2099-04-06T09:00".to_string(),
-        end: Some("2099-04-06T09:45".to_string()), send_update: false,
-    }).expect("undo move");
+    // Applying the undo puts everything (but the body) back.
+    let mut back = no_op_event_update(undo["event_id"].as_str().unwrap());
+    let field = |k: &str| undo[k].as_str().map(String::from);
+    let list = |k: &str| undo[k].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect());
+    back.start = field("start");
+    back.end = field("end");
+    back.location = field("location");
+    back.show_as = field("show_as");
+    back.add_categories = list("add_categories");
+    back.remove_categories = list("remove_categories");
+    c.update_event(back).expect("apply undo");
     let detail = single(c.get_event(vec![id.clone()], &ReadOptions::default())).expect("get_event");
     assert_eq!(detail.summary.start.as_deref(), Some("2099-04-06T09:00:00"));
     assert_eq!(detail.summary.end.as_deref(), Some("2099-04-06T09:45:00"));
+    assert_eq!(detail.summary.location, "Room A");
+    assert_eq!(detail.summary.show_as, "busy");
+    assert_eq!(detail.summary.categories, vec!["Blue".to_string()]);
     c.delete_event(id, false, false).expect("cleanup");
 }
 
