@@ -23,6 +23,8 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - This changelog; every PR adds its entry under Unreleased ([#56](https://github.com/adamkopelman/outlook-mcp-rs/pull/56)).
 - Content-writing tools share one input convention: exactly one of `body` / `html_body` / `body_file` / `html_body_file` on the mail tools, `body_file` on event, task and note tools; `categories` / `importance` on `send_email`, `create_draft`, `reply_email` and `update_draft`; `inline_images` on `reply_email` and `update_draft`; `update_draft` can `send`. ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37))
 - `data:` image URIs in an HTML body become inline attachments on every mail-writing tool ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
+- Read tools share one set of output controls: batch ids on `get_email`, `get_event`, `get_note`, `get_task`, `list_attachments` and `get_inline_image` (per-item errors); `include`, `body_format`, `max_body_chars` with `*_truncated` / `*_length`, and `output_dir` on every body-reading tool ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
+- `get_task` tool; `get_email` `resolve_inline_images` (`cid:` → `data:`); `save_attachments` `inline` filter ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
 
 ### Changed
 
@@ -31,6 +33,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 ### Deprecated
 
 - `send_email` / `create_draft` `html: bool` (use `html_body`), and `update_draft`'s `draft_id` (use `email_id`) ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
+- `get_email` `prefer_html` (use `body_format: "html"`) ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
 
 ### Fixed
 
