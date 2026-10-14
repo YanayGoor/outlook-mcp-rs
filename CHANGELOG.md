@@ -25,6 +25,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 ### Fixed
 
 - `list_emails` search with Hebrew or other non-ASCII text returned nothing; it now falls back to a client-side match ([#15](https://github.com/adamkopelman/outlook-mcp-rs/pull/15)).
+- Date filters on day-first Windows locales returned the wrong range: bounds are now written so no regional format can misread them, and items are filtered exactly on their real dates ([#42](https://github.com/adamkopelman/outlook-mcp-rs/pull/42)).
 
 ## [0.3.0] - 2026-07-18
 
