@@ -25,15 +25,19 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - `data:` image URIs in an HTML body become inline attachments on every mail-writing tool ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
 - Read tools share one set of output controls: batch ids on `get_email`, `get_event`, `get_note`, `get_task`, `list_attachments` and `get_inline_image` (per-item errors); `include`, `body_format`, `max_body_chars` with `*_truncated` / `*_length`, and `output_dir` on every body-reading tool ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
 - `get_task` tool; `get_email` `resolve_inline_images` (`cid:` → `data:`); `save_attachments` `inline` filter ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
+- One date grammar for every date parameter (ISO, keywords such as `start_of_week`, offsets such as `-14d`), and `<field>_after` / `<field>_before` range filters on every list tool ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
+- Shared `list_*` conventions: one `query` syntax (phrases, wildcards, `field:` scopes), list-valued filters, enum filters that mirror output fields (`item_type`, `importance`, `flag`), and `count` / `offset` paging on every list tool ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
 
 ### Changed
 
 - HTTP mode answers a request body over 64 MiB with `413` and a compressed body with `415`, instead of a generic error ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
+- A multi-word unquoted `query` matches all words in any order; a bare date in `*_before` includes that whole day; tasks and notes page at 500 ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
 
 ### Deprecated
 
 - `send_email` / `create_draft` `html: bool` (use `html_body`), and `update_draft`'s `draft_id` (use `email_id`) ([#37](https://github.com/adamkopelman/outlook-mcp-rs/pull/37)).
 - `get_email` `prefer_html` (use `body_format: "html"`) ([#38](https://github.com/adamkopelman/outlook-mcp-rs/pull/38)).
+- `list_emails` `since_days`, `flagged`, `high_importance`, and `list_events` `start_date` / `end_date` ([#39](https://github.com/adamkopelman/outlook-mcp-rs/pull/39)).
 
 ### Fixed
 
