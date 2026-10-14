@@ -9,7 +9,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::error::ToolError;
-use crate::outlook::event_rows;
+use crate::outlook::rows;
 use crate::outlook::filters::{self, normalize_choices};
 use crate::outlook::read::{read_options, ReadRequest, ReadTool};
 use crate::outlook::{DEFAULT_EMAIL_COUNT, MAX_EVENT_COUNT, MAX_NOTE_COUNT, MAX_TASK_COUNT};
@@ -56,12 +56,22 @@ fn batch_content<T: serde::Serialize>(
     results: Vec<Result<T, ToolError>>,
     ok_item: impl Fn(&str, Value) -> Value,
 ) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::success(vec![json_content(&batch_value(ids, many, results, ok_item)?)?]))
+}
+
+/// [`batch_content`]'s JSON value.
+fn batch_value<T: serde::Serialize>(
+    ids: &[String],
+    many: bool,
+    results: Vec<Result<T, ToolError>>,
+    ok_item: impl Fn(&str, Value) -> Value,
+) -> Result<Value, McpError> {
     if !many {
         let one = results
             .into_iter()
             .next()
             .unwrap_or_else(|| Err(ToolError::new("no result returned for the requested id")))?;
-        return Ok(CallToolResult::success(vec![json_content(&one)?]));
+        return serde_json::to_value(one).map_err(|e| McpError::internal_error(e.to_string(), None));
     }
     let items = ids
         .iter()
@@ -73,7 +83,65 @@ fn batch_content<T: serde::Serialize>(
             Err(e) => Ok(json!({"id": id, "error": e.0})),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(CallToolResult::success(vec![json_content(&items)?]))
+    Ok(Value::Array(items))
+}
+
+/// `fields` / `compact`, shared by every `list_*` tool (see `outlook::rows`).
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct RowParams {
+    /// Return only these fields per row (default: all). An unknown name is an
+    /// error that lists the valid ones.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Return only the tool's compact preset of fields (see its description).
+    /// Not with fields.
+    #[serde(default)]
+    pub compact: bool,
+    /// Write the rows to a new JSON Lines file (one row per line) in this
+    /// directory, created if missing, and return {rows_file, count} instead
+    /// of the rows. For long lists; each page gets its own file.
+    #[serde(default)]
+    pub output_dir: Option<String>,
+}
+
+/// A `list_*` tool's resolved output options.
+struct RowOutput {
+    tool: &'static str,
+    fields: Option<Vec<String>>,
+    output_dir: Option<String>,
+}
+
+impl RowParams {
+    fn resolve(self, tool: &'static str, spec: rows::RowSpec) -> Result<RowOutput, ToolError> {
+        Ok(RowOutput {
+            tool,
+            fields: rows::row_fields(spec, self.fields, self.compact)?,
+            output_dir: self.output_dir.filter(|d| !d.trim().is_empty()),
+        })
+    }
+}
+
+impl RowOutput {
+    fn fields(&self) -> Option<&[String]> {
+        self.fields.as_deref()
+    }
+
+    /// The tool result: the rows with only the requested fields, or, with
+    /// output_dir, {rows_file, count}.
+    fn content<T: serde::Serialize>(&self, rows: &T) -> Result<CallToolResult, McpError> {
+        let value = serde_json::to_value(rows)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.content_value(rows::select_fields(value, self.fields()))
+    }
+
+    /// As `content`, for rows already shaped.
+    fn content_value(&self, rows: Value) -> Result<CallToolResult, McpError> {
+        let out = match &self.output_dir {
+            Some(dir) => rows::write_rows_file(dir, self.tool, &rows)?,
+            None => rows,
+        };
+        Ok(CallToolResult::success(vec![json_content(&out)?]))
+    }
 }
 
 #[derive(Clone)]
@@ -85,6 +153,13 @@ impl OutlookMcpServer {
     pub fn new(client: Arc<dyn OutlookClient>) -> Self {
         Self { client }
     }
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ListFoldersParams {
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -144,6 +219,9 @@ pub struct ListEmailsParams {
     /// Deprecated: use importance: "high" instead.
     #[serde(default)]
     pub high_importance: bool,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 fn default_folder() -> String { "inbox".to_string() }
 fn default_count() -> i32 { DEFAULT_EMAIL_COUNT }
@@ -437,22 +515,12 @@ pub struct ListEventsParams {
     /// Email/name of another person whose shared calendar to view (default: your own).
     #[serde(default)]
     pub calendar_of: Option<String>,
-    /// false = skip meetings the organizer canceled (default true: list them,
-    /// with is_canceled: true).
-    #[serde(default = "default_true")]
-    pub include_canceled: bool,
-    /// Return only these fields per event (default: all). Valid: id, subject,
-    /// start, end, location, organizer, all_day, is_recurring, is_meeting,
-    /// is_canceled, categories, show_as, my_response, user_is_required,
-    /// user_is_optional, required_count, optional_count, required_attendees,
-    /// optional_attendees.
+    /// true = only canceled meetings; false = skip them (default: both).
     #[serde(default)]
-    pub fields: Option<Vec<String>>,
-    /// Shorthand for fields = id, subject, start, end, organizer,
-    /// is_recurring, my_response, show_as, user_is_required,
-    /// user_is_optional, required_count, optional_count. Not with fields.
-    #[serde(default)]
-    pub compact: bool,
+    pub is_canceled: Option<bool>,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
     /// Page size: default and max 250.
     #[serde(default = "default_event_count")]
     pub count: i32,
@@ -643,6 +711,9 @@ pub struct ListAttachmentsParams {
     /// {"id", "error"} for an id that fails.
     #[serde(alias = "email_ids")]
     pub email_id: OneOrMany<String>,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -709,6 +780,9 @@ pub struct ListTasksParams {
     /// Matches to skip before this page starts (default 0).
     #[serde(default)]
     pub offset: i32,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 fn default_task_count() -> i32 { MAX_TASK_COUNT }
 
@@ -822,6 +896,9 @@ pub struct ListNotesParams {
     /// Matches to skip before this page starts (default 0).
     #[serde(default)]
     pub offset: i32,
+    /// fields / compact: pick the fields of each row.
+    #[serde(flatten)]
+    pub rows: RowParams,
 }
 fn default_note_count() -> i32 { MAX_NOTE_COUNT }
 
@@ -946,22 +1023,27 @@ pub fn email_query(p: ListEmailsParams) -> Result<EmailQuery, ToolError> {
 
 #[tool_router]
 impl OutlookMcpServer {
-    #[tool(description = "List Outlook mail folders (name, path, item counts).")]
-    pub async fn list_folders(&self) -> Result<CallToolResult, McpError> {
+    #[tool(description = "List Outlook mail folders (name, path, item counts). fields picks the fields of each row (name, path, items, unread); compact=true returns path and unread. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
+    pub async fn list_folders(
+        &self,
+        Parameters(p): Parameters<ListFoldersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = p.rows.resolve("list_folders", rows::FOLDER_ROWS)?;
         let client = self.client.clone();
         let result = run_blocking(move || client.list_folders()).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
-    #[tool(description = "Find emails in a folder (newest first). Filters (all optional, ANDed): query; from / to / category (one value or a list, matching any); item_type (as get_email reports it, e.g. [\"email\"] to skip meeting invites and bounces); importance; flag (follow_up/complete/clear, as in update_email); unread_only; has_attachments; received_after / received_before. `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). query syntax (shared by all list_* tools): space-separated terms that must all match, case-insensitive, any language; \"quoted phrase\" keeps words together; * is a wildcard (status*report); field:term limits a term to subject, from, to or body. Dates accept ISO ('2026-06-10'), keywords ('today', 'start_of_week') or offsets ('-14d'). Paging: count (default 10, max 200) and offset; to page, call again with offset += count until fewer than count results come back. Deprecated: since_days (use received_after: \"-14d\"), flagged (use flag), high_importance (use importance).")]
+    #[tool(description = "Find emails in a folder (newest first). Filters (all optional, ANDed): query; from / to / category (one value or a list, matching any); item_type (as get_email reports it, e.g. [\"email\"] to skip meeting invites and bounces); importance; flag (follow_up/complete/clear, as in update_email); unread_only; has_attachments; received_after / received_before. `from` matches the sender name or address; `to` matches any To/CC recipient name or address (case-insensitive substring). query syntax (shared by all list_* tools): space-separated terms that must all match, case-insensitive, any language; \"quoted phrase\" keeps words together; * is a wildcard (status*report); field:term limits a term to subject, from, to or body. Dates accept ISO ('2026-06-10'), keywords ('today', 'start_of_week') or offsets ('-14d'). Paging: count (default 10, max 200) and offset; to page, call again with offset += count until fewer than count results come back. Deprecated: since_days (use received_after: \"-14d\"), flagged (use flag), high_importance (use importance). fields picks the fields of each row (id, subject, sender, sender_email, to, received, unread, has_attachments, categories); compact=true returns id, subject, sender, received, unread, has_attachments. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_emails(
         &self,
-        Parameters(p): Parameters<ListEmailsParams>,
+        Parameters(mut p): Parameters<ListEmailsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let out = std::mem::take(&mut p.rows).resolve("list_emails", rows::EMAIL_ROWS)?;
         let client = self.client.clone();
         let q = email_query(p)?;
         let result = run_blocking(move || client.list_emails(q)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
     #[tool(description = "Get one email by id, or several (email_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"} instead of failing the call). Returns the headers, item_type, is_meeting, plus the optional fields picked by `include` (any of \"body\", \"html_body\", \"attachments\" (file names), \"meeting\"; default [\"body\", \"attachments\", \"meeting\"]; [] = metadata only). body_format \"html\" (the deprecated prefer_html=true) also returns html_body. Each returned body reports *_truncated and *_length (full original length in characters): body_truncated/body_length, html_truncated/html_length. Inline bodies are cut at max_body_chars characters (default 100,000; allowed 1,000-5,000,000); if a *_truncated flag is true the cut may fall mid-tag or mid-image-data: call again with max_body_chars of at least the reported length, or use output_dir. output_dir writes each body in full to a file in that directory (created if missing) and returns body_file / html_body_file (absolute paths) instead of the text; re-reading the same email overwrites the same files. resolve_inline_images=true (implies html_body) replaces every cid: reference in html_body with the referenced attachment's base64 data: URI so the HTML is self-contained; Content-ID matching is case-insensitive, references with no matching attachment, or whose image is over 10 MB or unreadable, are left as cid: and listed in inline_images_unresolved (inline_images_resolved counts the replaced ones). Resolved HTML is usually large: combine it with output_dir.")]
@@ -1105,12 +1187,12 @@ impl OutlookMcpServer {
 
     // ---- Calendar ----
 
-    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; include_canceled=false skips meetings the organizer canceled. calendar_of views another person's shared calendar. Recurring events are expanded: each occurrence's id is the SERIES id (acting on it acts on the whole series) and occurrence_id names just that occurrence; pass occurrence_id to get_event / respond_to_meeting / update_event / delete_event to act on one date. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists (a meeting you organize or a personal appointment counts as required; both false = not found among the attendees, use my_response); and required_count / optional_count. To save tokens, compact=true returns only id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields. Paging: count (default and max 250) and offset.")]
+    #[tool(description = "List/search calendar events (sorted by start). start_after / start_before bound the event start (default: today 00:00 to 7 days later; start_date / end_date are deprecated aliases). Filters (all optional, ANDed): query (shared list query syntax; field scopes subject, location, organizer, attendees; unscoped terms search subject and location); category, show_as, my_response, attendees (one value or a list, matching any) with attendee_role; meetings_only; all_day; is_canceled (false skips meetings the organizer canceled, true lists only those). calendar_of views another person's shared calendar. Recurring events are expanded: each occurrence's id is the SERIES id (acting on it acts on the whole series) and occurrence_id names just that occurrence; pass occurrence_id to get_event / respond_to_meeting / update_event / delete_event to act on one date. Each row has user_is_required / user_is_optional: whether the calendar's owner (you, or the calendar_of person) is a required or optional attendee, matched by address and through distribution lists, nested up to 10 levels within a per-call budget (a meeting you organize or a personal appointment counts as required; both false = not among the attendees, use my_response; both null = unknown, because a list couldn't be expanded within the budget); and required_count / optional_count. To save tokens, compact=true returns only id, occurrence_id, subject, start, end, organizer, is_recurring, my_response, show_as, user_is_required, user_is_optional, required_count, optional_count; or pick exact fields with fields (as on every list_* tool). Paging: count (default and max 250) and offset. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let fields = event_rows::event_fields(p.fields, p.compact)?;
+        let out = p.rows.resolve("list_events", rows::EVENT_ROWS)?;
         let client = self.client.clone();
         let q = EventQuery {
             start_after: p.start_after, start_before: p.start_before, query: p.query,
@@ -1119,16 +1201,12 @@ impl OutlookMcpServer {
             my_response: normalize_choices(list(p.my_response), "my_response", filters::MY_RESPONSES)?,
             attendees: list_values(p.attendees), attendee_role: p.attendee_role,
             meetings_only: p.meetings_only, all_day: p.all_day,
-            calendar_of: p.calendar_of, include_canceled: p.include_canceled,
-            user_role: event_rows::wants_user_role(fields.as_deref()),
+            calendar_of: p.calendar_of, is_canceled: p.is_canceled,
+            user_role: rows::wants_any(out.fields(), rows::USER_ROLE_FIELDS),
             count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_events(q)).await?;
-        let rows = serde_json::to_value(&result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![json_content(&event_rows::select_fields(
-            rows, fields.as_deref(),
-        ))?]))
+        out.content(&result)
     }
 
     #[tool(description = "Get the full details of one calendar event by id (a series id, or an occurrence_id from list_events for one occurrence), or several (event_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = details without the body). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]
@@ -1236,16 +1314,20 @@ impl OutlookMcpServer {
 
     // ---- Attachments ----
 
-    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden). email_id may be a list: the result is then a list in the same order of {\"id\", \"attachments\": [...]}, or {\"id\", \"error\"} for an id that fails.")]
+    #[tool(description = "List an email's attachments. Each entry has `index` (1-based position), `filename`, `size` (bytes), `type` (\"file\", \"link\", \"item\", \"ole\" or \"unknown\"), `content_id` (the Content-ID an HTML body references as `cid:...`, without `<>`; null if none), `mime_type` (from the attachment, else guessed from the extension; may be null), `hidden`, and `is_inline` (true for inline content an HTML body shows via `cid:` rather than a standalone attachment: it has a `content_id` and is either referenced as `cid:<content_id>` in the HTML body or hidden). email_id may be a list: the result is then a list in the same order of {\"id\", \"attachments\": [...]}, or {\"id\", \"error\"} for an id that fails. fields picks the fields of each attachment (index, filename, size, type, content_id, mime_type, hidden, is_inline); compact=true returns index, filename, size, is_inline. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_attachments(
         &self,
-        Parameters(ListAttachmentsParams { email_id }): Parameters<ListAttachmentsParams>,
+        Parameters(ListAttachmentsParams { email_id, rows: row_params }): Parameters<ListAttachmentsParams>,
     ) -> Result<CallToolResult, McpError> {
         let (ids, many) = batch_ids(email_id, "email_id")?;
+        let out = row_params.resolve("list_attachments", rows::ATTACHMENT_ROWS)?;
         let client = self.client.clone();
         let batch = ids.clone();
         let results = run_blocking(move || client.list_attachments(batch)).await?;
-        batch_content(&ids, many, results, |id, v| json!({"id": id, "attachments": v}))
+        let results = results.into_iter().map(|r| r.map(|atts| {
+            rows::select_fields(serde_json::to_value(atts).unwrap_or_default(), out.fields())
+        })).collect();
+        out.content_value(batch_value(&ids, many, results, |id, v| json!({"id": id, "attachments": v}))?)
     }
 
     #[tool(description = "Save an email's attachments to a local directory. Pass attachment_names to save only specific files (case-insensitive). Pass `inline: false` to save only regular attachments and skip inline images (`is_inline`), e.g. when re-sending an email whose HTML already carries its images (get_email with resolve_inline_images) so they aren't attached twice; `inline: true` saves only the inline images. Each result carries the same metadata as list_attachments, including `is_inline` (`index` is the original position even when filtering) plus `saved_to` and `status` (\"saved\"), or `status` \"failed\" with `error`.")]
@@ -1287,11 +1369,12 @@ impl OutlookMcpServer {
 
     // ---- Tasks ----
 
-    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filters (all optional, ANDed): category and importance (one value or a list, matching any); due_after / due_before (any date form, e.g. 'end_of_week'); query (shared list query syntax; field scopes subject and body; unscoped terms search both). Paging: count (default and max 500) and offset.")]
+    #[tool(description = "List Outlook tasks (default: not-yet-completed only). Filters (all optional, ANDed): category and importance (one value or a list, matching any); due_after / due_before (any date form, e.g. 'end_of_week'); query (shared list query syntax; field scopes subject and body; unscoped terms search both). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, due_date, complete, status, importance, categories); compact=true returns id, subject, due_date, status, importance. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_tasks(
         &self,
         Parameters(p): Parameters<ListTasksParams>,
     ) -> Result<CallToolResult, McpError> {
+        let out = p.rows.resolve("list_tasks", rows::TASK_ROWS)?;
         let client = self.client.clone();
         let q = TaskQuery {
             include_completed: p.include_completed, category: list_values(p.category),
@@ -1300,7 +1383,7 @@ impl OutlookMcpServer {
             count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_tasks(q)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
     #[tool(description = "Create a new task. body (plain text) or body_file (a local UTF-8 text file path, for large text), not both. reminder_time (ISO datetime) is an absolute reminder time, unlike appointment reminders which are minutes-before-start.")]
@@ -1365,11 +1448,12 @@ impl OutlookMcpServer {
 
     // ---- Notes ----
 
-    #[tool(description = "List Outlook notes. Filters (all optional, ANDed): category (one value or a list, matching any); created_after / created_before (any date form); query (shared list query syntax; field scopes subject, i.e. the first line, and body; unscoped terms search the body). Paging: count (default and max 500) and offset.")]
+    #[tool(description = "List Outlook notes. Filters (all optional, ANDed): category (one value or a list, matching any); created_after / created_before (any date form); query (shared list query syntax; field scopes subject, i.e. the first line, and body; unscoped terms search the body). Paging: count (default and max 500) and offset. fields picks the fields of each row (id, subject, created, categories); compact=true returns id, subject, created. output_dir writes the rows to a new JSON Lines file there (one row per line) and returns {rows_file, count} instead, for long lists.")]
     pub async fn list_notes(
         &self,
         Parameters(p): Parameters<ListNotesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let out = p.rows.resolve("list_notes", rows::NOTE_ROWS)?;
         let client = self.client.clone();
         let q = NoteQuery {
             category: list_values(p.category), query: p.query,
@@ -1377,7 +1461,7 @@ impl OutlookMcpServer {
             count: p.count, offset: p.offset,
         };
         let result = run_blocking(move || client.list_notes(q)).await?;
-        Ok(CallToolResult::success(vec![json_content(&result)?]))
+        out.content(&result)
     }
 
     #[tool(description = "Get the full body of one note by id, or several (note_id as a list: the result is a list in the same order, and an id that fails becomes {\"id\", \"error\"}). `include` picks the optional fields: \"body\" (default [\"body\"]; [] = subject, dates and categories only). The body reports body_truncated and body_length (full length in characters) and is cut at max_body_chars (default 100,000; allowed 1,000-5,000,000). output_dir writes the full body to a file there and returns body_file (absolute path) instead. body_format accepts only \"text\".")]

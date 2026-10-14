@@ -173,7 +173,7 @@ pub fn event_matches(summary: &EventSummary, q: &EventQuery, text: &TextQuery) -
     if q.meetings_only && !summary.is_meeting {
         return false;
     }
-    if !q.include_canceled && summary.is_canceled {
+    if q.is_canceled.is_some_and(|want| summary.is_canceled != want) {
         return false;
     }
     if q.all_day.is_some_and(|want| summary.all_day != want) {
@@ -320,7 +320,7 @@ mod tests {
             location: "Room 4".into(), organizer: "Ada Lovelace".into(), all_day: false,
             is_recurring: false, is_meeting: true, is_canceled: false, categories: s(&["Work"]),
             show_as: "busy".into(), my_response: "accepted".into(),
-            user_is_required: true, user_is_optional: false, required_count: 2, optional_count: 1,
+            user_is_required: Some(true), user_is_optional: Some(false), required_count: 2, optional_count: 1,
             required_attendees: "Ada Lovelace; Bob Smith".into(), optional_attendees: "Carol".into(),
         }
     }
@@ -350,13 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn include_canceled_false_skips_canceled_meetings() {
+    fn is_canceled_filters_like_the_output_field() {
         let mut e = event();
         let check = |e: &EventSummary, f: fn(&mut EventQuery)| { let (q, t) = eq(f); event_matches(e, &q, &t) };
-        assert!(check(&e, |q| q.include_canceled = false));
+        assert!(check(&e, |q| q.is_canceled = Some(false)));
+        assert!(!check(&e, |q| q.is_canceled = Some(true)));
         e.is_canceled = true;
         assert!(check(&e, |_| {}), "canceled meetings are listed by default");
-        assert!(!check(&e, |q| q.include_canceled = false));
+        assert!(!check(&e, |q| q.is_canceled = Some(false)));
+        assert!(check(&e, |q| q.is_canceled = Some(true)));
     }
 
     #[test]
@@ -447,8 +449,8 @@ mod event_filter_tests {
             categories: vec!["Work".to_string()],
             show_as: "busy".to_string(),
             my_response: "accepted".to_string(),
-            user_is_required: true,
-            user_is_optional: false,
+            user_is_required: Some(true),
+            user_is_optional: Some(false),
             required_count: 2,
             optional_count: 2,
             required_attendees: "Alice Smith; alice@example.com".to_string(),

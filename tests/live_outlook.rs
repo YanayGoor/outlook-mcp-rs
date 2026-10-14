@@ -455,15 +455,20 @@ fn list_events_user_role_and_compact_fields_on_a_real_week() {
     // both true; the counts match the attendee strings.
     use outlook_mcp_rs::outlook::attendance::attendee_count;
     let c = client();
+    let started = std::time::Instant::now();
     let events = c.list_events(EventQuery {
         start_after: Some("start_of_week".to_string()),
         start_before: Some("end_of_week".to_string()),
         ..Default::default()
     }).expect("list_events");
+    let with_roles = started.elapsed();
     for e in &events {
-        assert!(!(e.user_is_required && e.user_is_optional), "{}: both flags set", e.subject);
+        assert!(!(e.user_is_required == Some(true) && e.user_is_optional == Some(true)),
+            "{}: both flags set", e.subject);
+        assert_eq!(e.user_is_required.is_none(), e.user_is_optional.is_none(),
+            "{}: unknown is all-or-nothing", e.subject);
         if !e.is_meeting || e.my_response == "organizer" {
-            assert!(e.user_is_required, "{}: own event must be required", e.subject);
+            assert_eq!(e.user_is_required, Some(true), "{}: own event must be required", e.subject);
         }
         assert_eq!(e.required_count, attendee_count(&e.required_attendees));
         assert_eq!(e.optional_count, attendee_count(&e.optional_attendees));
@@ -471,9 +476,10 @@ fn list_events_user_role_and_compact_fields_on_a_real_week() {
     let invited = events.iter().filter(|e| e.is_meeting && e.my_response != "organizer").count();
     let found = events.iter()
         .filter(|e| e.is_meeting && e.my_response != "organizer")
-        .filter(|e| e.user_is_required || e.user_is_optional)
+        .filter(|e| e.user_is_required == Some(true) || e.user_is_optional == Some(true))
         .count();
-    eprintln!("{invited} invites this week, the user was found on {found}");
+    let unknown = events.iter().filter(|e| e.user_is_required.is_none()).count();
+    eprintln!("{invited} invites this week, the user was found on {found}, unknown on {unknown}");
 
     // Without the role fields, nothing is computed and both are false.
     let lean = c.list_events(EventQuery {
@@ -483,13 +489,19 @@ fn list_events_user_role_and_compact_fields_on_a_real_week() {
         ..Default::default()
     }).expect("list_events without user_role");
     assert_eq!(lean.len(), events.len());
-    assert!(lean.iter().all(|e| !e.user_is_required && !e.user_is_optional));
+    assert!(lean.iter().all(|e| e.user_is_required.is_none() && e.user_is_optional.is_none()));
+    // Distribution-list expansion is bounded: it adds at most its time
+    // budget (3 s) plus the recipient reads over the same week without roles.
+    let without_roles = started.elapsed() - with_roles;
+    eprintln!("list_events with roles: {with_roles:?}, without: {without_roles:?}");
+    assert!(with_roles < without_roles * 4 + std::time::Duration::from_secs(10),
+        "user roles made list_events too slow: {with_roles:?} vs {without_roles:?}");
 
-    // include_canceled=false drops exactly the canceled ones.
+    // is_canceled=false drops exactly the canceled ones.
     let kept = c.list_events(EventQuery {
         start_after: Some("start_of_week".to_string()),
         start_before: Some("end_of_week".to_string()),
-        include_canceled: false,
+        is_canceled: Some(false),
         user_role: false,
         ..Default::default()
     }).expect("list_events without canceled");
