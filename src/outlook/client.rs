@@ -59,8 +59,12 @@ const MAX_INLINE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// non-ASCII query comes back empty (see `list_emails`).
 const MAX_SCAN_ITEMS: i32 = 2000;
 /// Upper bound on the recipients of one event read for `user_is_required` /
-/// `user_is_optional`; a meeting with more is judged on the first ones.
+/// `user_is_optional`; past it the role is unknown unless the first ones
+/// already show the owner as required.
 const ROLE_RECIPIENT_LIMIT: i32 = 1000;
+/// Time one tool call may spend expanding distribution lists, across every
+/// event. Past it, roles that depend on an unexpanded list are unknown.
+const LIST_EXPANSION_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Lets `?` turn a `windows::core::Error` into a [`ToolError`] anywhere in
 /// this module, so COM-plumbing calls (`call_method`, `get_property`, …) and
@@ -338,11 +342,19 @@ struct EventRows {
     /// Distribution-list address entries seen so far, by lowercased address,
     /// so `attendance::user_role` can ask for a list's members by address.
     list_entries: HashMap<String, IDispatch>,
+    /// Whether each recipient address seen so far is a list, so the same
+    /// attendees across a week of meetings cost one `AddressEntry` read each.
+    is_list: HashMap<String, bool>,
+    /// When list expansion stops for this call (set when it first starts).
+    expansion_deadline: Option<std::time::Instant>,
 }
 
 impl EventRows {
     fn new(calendar_store_id: Option<String>, owner: Option<Identity>) -> Self {
-        Self { calendar_store_id, owner, lists: ListCache::default(), list_entries: HashMap::new() }
+        Self {
+            calendar_store_id, owner, lists: ListCache::default(), list_entries: HashMap::new(),
+            is_list: HashMap::new(), expansion_deadline: None,
+        }
     }
 }
 
@@ -383,12 +395,17 @@ fn is_list_entry(entry: &IDispatch) -> bool {
 }
 
 /// The members of a distribution list's address entry, registering nested
-/// lists in `list_entries`. `AddressEntry.Members` covers both kinds of
-/// list; an Exchange list that doesn't expose it falls back to
+/// lists in `list_entries` / `is_list`. `AddressEntry.Members` covers both
+/// kinds of list; an Exchange list that doesn't expose it falls back to
 /// `GetExchangeDistributionList().GetExchangeDistributionListMembers()`.
-/// `None` if neither works (a dynamic list, or no permission).
-fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>)
-    -> Option<Vec<Attendee>> {
+/// `None` if neither works (a dynamic list, or no permission), or if the
+/// call's time budget runs out before the list is read: the caller then
+/// reports the role as unknown instead of guessing.
+fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>,
+    is_list: &mut HashMap<String, bool>, deadline: std::time::Instant) -> Option<Vec<Attendee>> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
     let members = get_property(entry, "Members")
         .ok()
         .and_then(|v| to_disp(v).ok())
@@ -401,8 +418,15 @@ fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>
                 .and_then(|v| to_disp(v).ok())
         })?;
     let n = variant_to_i32(&get_property(&members, "Count").unwrap_or_default()).unwrap_or(0);
+    // More members than the whole call may read: no point reading any.
+    if n as usize > attendance::MAX_LIST_MEMBERS_PER_CALL {
+        return None;
+    }
     let mut out = Vec::new();
-    for i in 1..=n.min(attendance::MAX_LIST_MEMBERS as i32) {
+    for i in 1..=n {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         let Some(m) = call_method(&members, "Item", &mut [variant_from_i32(i)])
             .ok()
             .and_then(|v| to_disp(v).ok())
@@ -410,32 +434,41 @@ fn list_members(entry: &IDispatch, list_entries: &mut HashMap<String, IDispatch>
             continue;
         };
         let address = variant_to_string(&get_property(&m, "Address").unwrap_or_default());
-        let is_list = is_list_entry(&m);
-        if is_list {
-            list_entries.insert(address.trim().to_lowercase(), m);
+        let key = address.trim().to_lowercase();
+        let list = match is_list.get(&key) {
+            Some(&known) => known,
+            None => {
+                let known = is_list_entry(&m);
+                is_list.insert(key.clone(), known);
+                known
+            }
+        };
+        if list {
+            list_entries.entry(key).or_insert(m);
         }
         // A member's kind is irrelevant: it takes its list's type.
-        out.push(Attendee { kind: 0, address, is_list });
+        out.push(Attendee { kind: 0, address, is_list: list });
     }
     Some(out)
 }
 
 /// `user_is_required` / `user_is_optional` for one event. Reads each
 /// required/optional recipient's type and address; only if no recipient
-/// matches the owner directly does it look at which recipients are
-/// distribution lists, and expand those (see `attendance::user_role`).
+/// matches the owner directly as required does it look at which recipients
+/// are distribution lists (remembered per address for the whole call), and
+/// expand those within the call's bounds (see `outlook::attendance`).
 fn event_user_role(item: &IDispatch, is_meeting: bool, organizer_is_owner: bool,
     rows: &mut EventRows) -> UserRole {
-    let Some(owner) = rows.owner.as_ref() else { return UserRole::default() };
+    let Some(owner) = rows.owner.as_ref() else { return UserRole::UNKNOWN };
     if !is_meeting || organizer_is_owner {
-        return attendance::user_role(is_meeting, organizer_is_owner, &[], owner,
-            &mut rows.lists, |_| None);
+        return UserRole::REQUIRED;
     }
     let Some(recipients) = get_property(item, "Recipients").ok().and_then(|v| to_disp(v).ok())
     else {
-        return UserRole::default();
+        return UserRole::UNKNOWN;
     };
     let n = variant_to_i32(&get_property(&recipients, "Count").unwrap_or_default()).unwrap_or(0);
+    let truncated = n > ROLE_RECIPIENT_LIMIT;
     let mut attendees = Vec::new();
     let mut entries = Vec::new();
     for i in 1..=n.min(ROLE_RECIPIENT_LIMIT) {
@@ -454,23 +487,34 @@ fn event_user_role(item: &IDispatch, is_meeting: bool, organizer_is_owner: bool,
         entries.push(r);
     }
     let direct = attendance::user_role(true, false, &attendees, owner, &mut rows.lists, |_| None);
-    if direct.user_is_required {
+    if direct == UserRole::REQUIRED {
         return direct;
     }
     // No direct required match: find the lists among the recipients.
-    let EventRows { lists, list_entries, .. } = rows;
+    let EventRows { lists, list_entries, is_list, expansion_deadline, .. } = rows;
     for (attendee, r) in attendees.iter_mut().zip(&entries) {
-        if let Some(entry) = get_property(r, "AddressEntry").ok().and_then(|v| to_disp(v).ok())
-            && is_list_entry(&entry)
-        {
-            attendee.is_list = true;
-            list_entries.insert(attendee.address.trim().to_lowercase(), entry);
-        }
+        let key = attendee.address.trim().to_lowercase();
+        attendee.is_list = match is_list.get(&key) {
+            Some(&known) => known,
+            None => {
+                let entry = get_property(r, "AddressEntry").ok().and_then(|v| to_disp(v).ok());
+                let known = entry.as_ref().is_some_and(is_list_entry);
+                is_list.insert(key.clone(), known);
+                if let Some(entry) = entry.filter(|_| known) {
+                    list_entries.insert(key, entry);
+                }
+                known
+            }
+        };
     }
-    attendance::user_role(true, false, &attendees, owner, lists, |address| {
+    let role = attendance::user_role(true, false, &attendees, owner, lists, |address| {
+        let deadline = *expansion_deadline
+            .get_or_insert_with(|| std::time::Instant::now() + LIST_EXPANSION_TIME_BUDGET);
         let entry = list_entries.get(&address.trim().to_lowercase())?.clone();
-        list_members(&entry, list_entries)
-    })
+        list_members(&entry, list_entries, is_list, deadline)
+    });
+    // Recipients past the limit weren't read: only a "required" is certain.
+    if truncated && role != UserRole::REQUIRED { UserRole::UNKNOWN } else { role }
 }
 
 /// `client.py::_event_summary`, enriched for v2 with show_as/my_response and the

@@ -6,7 +6,7 @@ use outlook_mcp_rs::server::{
     DeleteEmailParams, DeleteEventParams, DeleteNoteParams, DeleteTaskParams, GetEmailParams,
     GetEventParams, GetInlineImageParams, GetNoteParams, GetTaskParams, ListAttachmentsParams,
     EmptyDeletedItemsParams,
-    ListEmailsParams, ListEventsParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
+    ListEmailsParams, ListEventsParams, ListFoldersParams, ListNotesParams, ListTasksParams, OutlookMcpServer,
     RecurrenceParams, ReplyEmailParams, RespondToMeetingParams, SaveAttachmentsParams,
     SendEmailParams, UpdateDraftParams, UpdateEmailParams, UpdateEventParams, UpdateNoteParams, UpdateTaskParams,
 };
@@ -45,7 +45,7 @@ fn result_json(result: &CallToolResult) -> Value {
 async fn list_folders_records_call() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
-    server.list_folders().await.unwrap();
+    server.list_folders(Parameters(ListFoldersParams::default())).await.unwrap();
     assert_eq!(fake.calls(), vec![("list_folders".to_string(), json!({}))]);
 }
 
@@ -1564,6 +1564,76 @@ async fn list_events_filters_accept_lists_and_single_values() {
     assert!(err.message.contains("Invalid show_as \"away\""), "{}", err.message);
 }
 
+/// Calls one list tool with `args` and returns its JSON rows.
+async fn list_rows(server: &OutlookMcpServer, tool: &str, args: Value) -> Value {
+    let result = match tool {
+        "list_folders" => server.list_folders(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_emails" => server.list_emails(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_events" => server.list_events(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_tasks" => server.list_tasks(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_notes" => server.list_notes(Parameters(serde_json::from_value(args).unwrap())).await,
+        "list_attachments" => {
+            let mut args = args;
+            args["email_id"] = json!(EMAIL_ID);
+            server.list_attachments(Parameters(serde_json::from_value(args).unwrap())).await
+        }
+        other => panic!("not a list tool: {other}"),
+    };
+    result_json(&result.unwrap())
+}
+
+#[tokio::test]
+async fn every_list_tool_supports_fields_and_compact() {
+    use outlook_mcp_rs::outlook::rows::*;
+    let specs = [("list_folders", FOLDER_ROWS), ("list_emails", EMAIL_ROWS),
+        ("list_events", EVENT_ROWS), ("list_tasks", TASK_ROWS), ("list_notes", NOTE_ROWS),
+        ("list_attachments", ATTACHMENT_ROWS)];
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    for (tool, spec) in specs {
+        // The table lists exactly the fields a row has.
+        let rows = list_rows(&server, tool, json!({})).await;
+        let mut keys: Vec<&str> = rows[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut all = spec.all.to_vec();
+        keys.sort();
+        all.sort();
+        assert_eq!(keys, all, "{tool}: rows::*_ROWS.all is out of date");
+
+        let rows = list_rows(&server, tool, json!({"compact": true})).await;
+        let mut keys: Vec<&str> = rows[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut compact = spec.compact.to_vec();
+        keys.sort();
+        compact.sort();
+        assert_eq!(keys, compact, "{tool}: compact");
+
+        let first = spec.all[0];
+        let rows = list_rows(&server, tool, json!({"fields": [first]})).await;
+        assert_eq!(rows[0].as_object().unwrap().len(), 1, "{tool}: fields");
+        assert!(rows[0].get(first).is_some(), "{tool}: fields");
+    }
+    // A batch of list_attachments applies fields inside each item.
+    let v = result_json(&server.list_attachments(Parameters(serde_json::from_value(
+        json!({"email_id": [EMAIL_ID], "fields": ["filename"]})).unwrap())).await.unwrap());
+    assert_eq!(v[0]["attachments"][0].as_object().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn every_list_tool_can_write_its_rows_to_a_json_lines_file() {
+    let server = OutlookMcpServer::new(Arc::new(FakeOutlookClient::new()));
+    let dir = std::env::temp_dir().join(format!("omcp-list-rows-{}", std::process::id()));
+    let dir_s = dir.to_str().unwrap().to_string();
+    for tool in ["list_folders", "list_emails", "list_events", "list_tasks", "list_notes", "list_attachments"] {
+        let inline = list_rows(&server, tool, json!({"compact": true})).await;
+        let v = list_rows(&server, tool, json!({"compact": true, "output_dir": dir_s})).await;
+        let path = v["rows_file"].as_str().unwrap_or_else(|| panic!("{tool}: {v}"));
+        assert!(path.contains(tool) && path.ends_with(".jsonl"), "{path}");
+        let lines: Vec<Value> = std::fs::read_to_string(path).unwrap().lines()
+            .map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(v["count"], lines.len(), "{tool}");
+        assert_eq!(Value::Array(lines), inline, "{tool}: the file holds the same rows");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn list_events_returns_every_field_by_default() {
     let fake = Arc::new(FakeOutlookClient::new());
@@ -1571,15 +1641,15 @@ async fn list_events_returns_every_field_by_default() {
     let params: ListEventsParams = serde_json::from_value(json!({})).unwrap();
     let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
     let row = v[0].as_object().unwrap();
-    for field in outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS {
+    for field in outlook_mcp_rs::outlook::rows::EVENT_ROWS.all {
         assert!(row.contains_key(*field), "missing {field}");
     }
-    assert_eq!(row.len(), outlook_mcp_rs::outlook::event_rows::EVENT_FIELDS.len());
+    assert_eq!(row.len(), outlook_mcp_rs::outlook::rows::EVENT_ROWS.all.len());
     assert_eq!(v[0]["user_is_required"], true);
     assert_eq!(v[0]["user_is_optional"], false);
     assert_eq!(v[0]["is_canceled"], false);
     let (_, args) = fake.calls().pop().unwrap();
-    assert_eq!(args["include_canceled"], true);
+    assert_eq!(args["is_canceled"], Value::Null);
     assert_eq!(args["user_role"], true);
 }
 
@@ -1590,7 +1660,7 @@ async fn list_events_compact_returns_the_preset_fields() {
     let params: ListEventsParams = serde_json::from_value(json!({"compact": true})).unwrap();
     let v = result_json(&server.list_events(Parameters(params)).await.unwrap());
     let mut keys: Vec<&str> = v[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    let mut want = outlook_mcp_rs::outlook::event_rows::COMPACT_EVENT_FIELDS.to_vec();
+    let mut want = outlook_mcp_rs::outlook::rows::EVENT_ROWS.compact.to_vec();
     keys.sort();
     want.sort();
     assert_eq!(keys, want);
@@ -1619,13 +1689,13 @@ async fn list_events_fields_pick_exact_fields_and_skip_unneeded_work() {
 }
 
 #[tokio::test]
-async fn list_events_forwards_include_canceled() {
+async fn list_events_forwards_the_is_canceled_filter() {
     let fake = Arc::new(FakeOutlookClient::new());
     let server = OutlookMcpServer::new(fake.clone());
     let params: ListEventsParams =
-        serde_json::from_value(json!({"include_canceled": false})).unwrap();
+        serde_json::from_value(json!({"is_canceled": false})).unwrap();
     server.list_events(Parameters(params)).await.unwrap();
-    assert_eq!(fake.calls().pop().unwrap().1["include_canceled"], false);
+    assert_eq!(fake.calls().pop().unwrap().1["is_canceled"], false);
 }
 
 #[tokio::test]

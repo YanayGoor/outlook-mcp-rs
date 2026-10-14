@@ -102,10 +102,12 @@ pub struct EventSummary {
     pub my_response: String,
     /// The calendar's owner is a required attendee: directly, through a
     /// distribution list, as the organizer, or because it's a personal
-    /// appointment. See `attendance::user_role`.
-    pub user_is_required: bool,
-    /// The calendar's owner is an optional (and not a required) attendee.
-    pub user_is_optional: bool,
+    /// appointment. `None` (null) = unknown: a list couldn't be expanded
+    /// within the call's bounds. See `attendance::user_role`.
+    pub user_is_required: Option<bool>,
+    /// The calendar's owner is an optional (and not a required) attendee;
+    /// `None` as above.
+    pub user_is_optional: Option<bool>,
     /// How many people `required_attendees` / `optional_attendees` name.
     pub required_count: usize,
     pub optional_count: usize,

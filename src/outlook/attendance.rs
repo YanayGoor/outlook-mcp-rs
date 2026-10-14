@@ -3,6 +3,18 @@
 //! required or an optional attendee, matching by address (never by display
 //! name) and looking through distribution lists, including nested ones.
 //!
+//! Expanding lists can be expensive (each member is an Outlook call, and a
+//! big list may go to the server), so the work is bounded per tool call:
+//! - lists nest at most [`MAX_LIST_DEPTH`] levels deep;
+//! - at most [`MAX_LIST_MEMBERS_PER_CALL`] members are read in total, shared
+//!   by every list of every event in the call;
+//! - the COM side adds a time budget (`members_of` returns `None` past it);
+//! - each list is expanded at most once per call ([`ListCache`]), and the
+//!   expansion is skipped entirely when a direct match already decides.
+//!
+//! When a bound stops the search before an answer is certain, the role is
+//! reported as unknown (`None`) rather than a guess.
+//!
 //! The COM side (`client.rs`) only reads the raw data, an item's
 //! `Recipients` and a list's `AddressEntry.Members`, and hands it to these
 //! functions.
@@ -11,12 +23,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::constants::{OL_RECIPIENT_OPTIONAL, OL_RECIPIENT_REQUIRED};
 
-/// How deep nested distribution lists are followed (a list in a list in a
-/// list is depth 3). Deeper members are not looked at.
-pub const MAX_LIST_DEPTH: usize = 3;
-/// Upper bound on the members read while expanding one top-level list,
-/// nested lists included, so one huge list can't stall `list_events`.
-pub const MAX_LIST_MEMBERS: usize = 5000;
+/// How deep nested distribution lists are followed: a list directly on the
+/// invite is depth 1, a list inside it depth 2, and so on.
+pub const MAX_LIST_DEPTH: usize = 10;
+/// Upper bound on list members read during one tool call, across every list
+/// and event, so a huge organization-wide list can't stall `list_events`.
+pub const MAX_LIST_MEMBERS_PER_CALL: usize = 5000;
 
 /// One entry of an item's `Recipients` collection, or one member of a list.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,20 +72,56 @@ impl Identity {
     }
 }
 
-/// `user_is_required` / `user_is_optional` for one event. Exactly one is
-/// true, or neither (the owner isn't found among the attendees, e.g. an
-/// invite forwarded to them or a list that can't be expanded).
+/// `user_is_required` / `user_is_optional` for one event. At most one is
+/// `Some(true)`. Both `Some(false)`: the owner is certainly not among the
+/// attendees (e.g. a forwarded invite). Both `None`: unknown, because a list
+/// couldn't be fully expanded within the bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UserRole {
-    pub user_is_required: bool,
-    pub user_is_optional: bool,
+    pub user_is_required: Option<bool>,
+    pub user_is_optional: Option<bool>,
 }
 
-/// Remembers which lists contain the owner, so a week of meetings sent to
-/// the same list expands it once. Lives for one tool call.
-#[derive(Debug, Default)]
+impl UserRole {
+    pub const REQUIRED: Self = Self { user_is_required: Some(true), user_is_optional: Some(false) };
+    pub const OPTIONAL: Self = Self { user_is_required: Some(false), user_is_optional: Some(true) };
+    pub const NOT_INVITED: Self = Self { user_is_required: Some(false), user_is_optional: Some(false) };
+    pub const UNKNOWN: Self = Self { user_is_required: None, user_is_optional: None };
+}
+
+/// Per-call state: which lists contain the owner (so a week of meetings sent
+/// to the same list expands it once) and the members still allowed to be
+/// read. Lives for one tool call.
+#[derive(Debug)]
 pub struct ListCache {
     contains: HashMap<String, bool>,
+    members_left: usize,
+}
+
+impl Default for ListCache {
+    fn default() -> Self {
+        Self::with_budget(MAX_LIST_MEMBERS_PER_CALL)
+    }
+}
+
+impl ListCache {
+    pub fn with_budget(members: usize) -> Self {
+        Self { contains: HashMap::new(), members_left: members }
+    }
+
+    /// Members that may still be read in this call.
+    pub fn members_left(&self) -> usize {
+        self.members_left
+    }
+}
+
+/// Whether a list contains the owner, or whether the bounds stopped the
+/// search first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    Yes,
+    No,
+    Unknown,
 }
 
 /// The owner's role on one event.
@@ -83,10 +131,12 @@ pub struct ListCache {
 /// - Otherwise a direct match on a required (optional) recipient makes the
 ///   owner required (optional), as does membership of a required (optional)
 ///   distribution list. Required wins if both apply.
+/// - Lists are only expanded when the direct matches leave the answer open.
 ///
 /// `members_of(list_address)` returns a list's members, or `None` if it
-/// can't be expanded (e.g. a dynamic list, or no permission). It's called
-/// only for lists that a direct match hasn't already decided.
+/// can't be expanded (a dynamic list, no permission, or the caller's time
+/// budget ran out); that makes the answer unknown unless something else
+/// decides it.
 pub fn user_role(
     is_meeting: bool,
     organizer_is_owner: bool,
@@ -96,98 +146,124 @@ pub fn user_role(
     mut members_of: impl FnMut(&str) -> Option<Vec<Attendee>>,
 ) -> UserRole {
     if !is_meeting || organizer_is_owner {
-        return UserRole { user_is_required: true, user_is_optional: false };
+        return UserRole::REQUIRED;
     }
     let direct = |kind: i32| {
         attendees.iter().any(|a| a.kind == kind && !a.is_list && owner.matches(&a.address))
     };
-    let mut required = direct(OL_RECIPIENT_REQUIRED);
-    let mut optional = !required && direct(OL_RECIPIENT_OPTIONAL);
-    for kind in [OL_RECIPIENT_REQUIRED, OL_RECIPIENT_OPTIONAL] {
-        if required || (optional && kind == OL_RECIPIENT_OPTIONAL) {
-            break;
+    if direct(OL_RECIPIENT_REQUIRED) {
+        return UserRole::REQUIRED;
+    }
+    let lists = |kind: i32| attendees.iter().filter(move |a| a.kind == kind && a.is_list);
+    // Required lists first: membership there decides even if the owner is
+    // also optional.
+    let mut required_unknown = false;
+    for list in lists(OL_RECIPIENT_REQUIRED) {
+        match list_contains(&list.address, owner, cache, &mut members_of) {
+            Membership::Yes => return UserRole::REQUIRED,
+            Membership::Unknown => required_unknown = true,
+            Membership::No => {}
         }
-        let in_list = attendees
-            .iter()
-            .filter(|a| a.kind == kind && a.is_list)
-            .any(|a| list_contains(&a.address, owner, cache, &mut members_of));
-        if in_list {
-            if kind == OL_RECIPIENT_REQUIRED {
-                required = true;
-                optional = false;
-            } else {
-                optional = true;
+    }
+    let mut optional = direct(OL_RECIPIENT_OPTIONAL);
+    let mut optional_unknown = false;
+    if !optional {
+        for list in lists(OL_RECIPIENT_OPTIONAL) {
+            match list_contains(&list.address, owner, cache, &mut members_of) {
+                Membership::Yes => {
+                    optional = true;
+                    break;
+                }
+                Membership::Unknown => optional_unknown = true,
+                Membership::No => {}
             }
         }
     }
-    UserRole { user_is_required: required, user_is_optional: optional }
+    match (required_unknown, optional, optional_unknown) {
+        (true, _, _) => UserRole::UNKNOWN,
+        (false, true, _) => UserRole::OPTIONAL,
+        (false, false, true) => UserRole::UNKNOWN,
+        (false, false, false) => UserRole::NOT_INVITED,
+    }
 }
 
 /// Whether the list at `address` contains the owner, directly or through
-/// nested lists (up to [`MAX_LIST_DEPTH`] and [`MAX_LIST_MEMBERS`]).
-/// Answers are cached per list address; a list being expanded is never
-/// re-entered, so a cycle of lists terminates.
+/// nested lists, within [`MAX_LIST_DEPTH`] and the call's member budget.
+/// Definite answers are cached per list address; a list being expanded is
+/// never re-entered, so a cycle of lists terminates.
 pub fn list_contains(
     address: &str,
     owner: &Identity,
     cache: &mut ListCache,
     members_of: &mut impl FnMut(&str) -> Option<Vec<Attendee>>,
-) -> bool {
-    let mut budget = MAX_LIST_MEMBERS;
+) -> Membership {
     let mut visiting = HashSet::new();
-    contains_inner(address, owner, cache, members_of, 1, &mut budget, &mut visiting)
+    contains_inner(address, owner, cache, members_of, 1, &mut visiting).0
 }
 
+/// The membership, and whether it may be cached. A "no" reached while a
+/// cycle cut the search short (some member list was already being searched
+/// higher up) only holds within that search, so it isn't cached.
 fn contains_inner(
     address: &str,
     owner: &Identity,
     cache: &mut ListCache,
     members_of: &mut impl FnMut(&str) -> Option<Vec<Attendee>>,
     depth: usize,
-    budget: &mut usize,
     visiting: &mut HashSet<String>,
-) -> bool {
+) -> (Membership, bool) {
     let key = address.trim().to_lowercase();
     if let Some(&hit) = cache.contains.get(&key) {
-        return hit;
+        return (if hit { Membership::Yes } else { Membership::No }, true);
     }
-    if depth > MAX_LIST_DEPTH || !visiting.insert(key.clone()) {
-        return false;
+    if !visiting.insert(key.clone()) {
+        return (Membership::No, false); // Already being searched higher up.
     }
-    let members = members_of(address).unwrap_or_default();
-    let mut found = false;
+    let (result, cacheable) = expand(address, owner, cache, members_of, depth, visiting);
+    visiting.remove(&key);
+    match result {
+        Membership::Yes => { cache.contains.insert(key, true); }
+        Membership::No if cacheable => { cache.contains.insert(key, false); }
+        _ => {}
+    }
+    (result, cacheable)
+}
+
+fn expand(
+    address: &str,
+    owner: &Identity,
+    cache: &mut ListCache,
+    members_of: &mut impl FnMut(&str) -> Option<Vec<Attendee>>,
+    depth: usize,
+    visiting: &mut HashSet<String>,
+) -> (Membership, bool) {
+    if depth > MAX_LIST_DEPTH || cache.members_left == 0 {
+        return (Membership::Unknown, false);
+    }
+    let Some(members) = members_of(address) else { return (Membership::Unknown, false) };
     let mut complete = true;
+    let mut cacheable = true;
     // Direct members first: the cheap answer for the common case.
     for m in &members {
-        if *budget == 0 {
+        if cache.members_left == 0 {
             complete = false;
             break;
         }
-        *budget -= 1;
+        cache.members_left -= 1;
         if !m.is_list && owner.matches(&m.address) {
-            found = true;
-            break;
+            return (Membership::Yes, true);
         }
     }
-    if !found {
-        for m in members.iter().filter(|m| m.is_list) {
-            if *budget == 0 || depth == MAX_LIST_DEPTH {
-                complete = false;
-                break;
-            }
-            if contains_inner(&m.address, owner, cache, members_of, depth + 1, budget, visiting) {
-                found = true;
-                break;
-            }
+    for m in members.iter().filter(|m| m.is_list) {
+        let (found, ok) = contains_inner(&m.address, owner, cache, members_of, depth + 1, visiting);
+        cacheable &= ok;
+        match found {
+            Membership::Yes => return (Membership::Yes, true),
+            Membership::Unknown => complete = false,
+            Membership::No => {}
         }
     }
-    visiting.remove(&key);
-    // A partial "no" (cut off by a cap) isn't cached, so another top-level
-    // list with fresh budget can still look.
-    if found || complete {
-        cache.contains.insert(key, found);
-    }
-    found
+    if complete { (Membership::No, cacheable) } else { (Membership::Unknown, false) }
 }
 
 /// How many attendees an Outlook `RequiredAttendees` / `OptionalAttendees`
@@ -225,67 +301,97 @@ mod tests {
         })
     }
 
-    const REQ: UserRole = UserRole { user_is_required: true, user_is_optional: false };
-    const OPT: UserRole = UserRole { user_is_required: false, user_is_optional: true };
-    const NEITHER: UserRole = UserRole { user_is_required: false, user_is_optional: false };
+    /// A chain of `n` nested lists l1 -> l2 -> ... -> ln, with the owner in ln.
+    fn chain(n: usize) -> Vec<(String, Vec<Attendee>)> {
+        (1..=n)
+            .map(|i| {
+                let member = if i == n { person(1, ME) } else { list(1, &format!("l{}", i + 1)) };
+                (format!("l{i}"), vec![member])
+            })
+            .collect()
+    }
+
+    fn role_in(attendees: &[Attendee], lists: &[(String, Vec<Attendee>)]) -> UserRole {
+        let mut cache = ListCache::default();
+        user_role(true, false, attendees, &me(), &mut cache, |a| {
+            lists.iter().find(|(k, _)| k == a).map(|(_, m)| m.clone())
+        })
+    }
 
     #[test]
     fn personal_appointment_and_own_meeting_are_required() {
         let mut cache = ListCache::default();
-        assert_eq!(user_role(false, false, &[], &me(), &mut cache, no_lists), REQ);
+        assert_eq!(user_role(false, false, &[], &me(), &mut cache, no_lists), UserRole::REQUIRED);
         let others = [person(1, "a@x.com")];
-        assert_eq!(user_role(true, true, &others, &me(), &mut cache, no_lists), REQ);
+        assert_eq!(user_role(true, true, &others, &me(), &mut cache, no_lists), UserRole::REQUIRED);
     }
 
     #[test]
     fn direct_match_by_address_caselessly() {
-        assert_eq!(role(&[person(1, "a@x.com"), person(1, "ME@example.com")], &[]), REQ);
-        assert_eq!(role(&[person(1, "a@x.com"), person(2, &ME.to_uppercase())], &[]), OPT);
-        assert_eq!(role(&[person(1, "a@x.com"), person(3, "me@example.com")], &[]), NEITHER);
-        assert_eq!(role(&[person(1, "Me")], &[]), NEITHER, "display names never match");
+        assert_eq!(role(&[person(1, "a@x.com"), person(1, "ME@example.com")], &[]), UserRole::REQUIRED);
+        assert_eq!(role(&[person(1, "a@x.com"), person(2, &ME.to_uppercase())], &[]), UserRole::OPTIONAL);
+        assert_eq!(role(&[person(1, "a@x.com"), person(3, "me@example.com")], &[]), UserRole::NOT_INVITED);
+        assert_eq!(role(&[person(1, "Me")], &[]), UserRole::NOT_INVITED, "display names never match");
     }
 
     #[test]
     fn required_wins_over_optional() {
         let a = [person(2, "me@example.com"), person(1, ME)];
-        assert_eq!(role(&a, &[]), REQ);
+        assert_eq!(role(&a, &[]), UserRole::REQUIRED);
         let a = [person(2, "me@example.com"), list(1, "team@x.com")];
-        assert_eq!(role(&a, &[("team@x.com", vec![person(1, ME)])]), REQ);
+        assert_eq!(role(&a, &[("team@x.com", vec![person(1, ME)])]), UserRole::REQUIRED);
     }
 
     #[test]
     fn membership_through_a_list_takes_the_list_type() {
         let lists = [("team@x.com", vec![person(1, "a@x.com"), person(1, "me@example.com")])];
-        assert_eq!(role(&[list(1, "team@x.com")], &lists), REQ);
-        assert_eq!(role(&[list(2, "team@x.com")], &lists), OPT);
-        assert_eq!(role(&[list(2, "other@x.com")], &lists), NEITHER, "unexpandable list");
+        assert_eq!(role(&[list(1, "team@x.com")], &lists), UserRole::REQUIRED);
+        assert_eq!(role(&[list(2, "team@x.com")], &lists), UserRole::OPTIONAL);
     }
 
     #[test]
-    fn nested_lists_are_followed_to_the_depth_cap() {
-        let lists = [
-            ("l1", vec![list(1, "l2")]),
-            ("l2", vec![list(1, "l3")]),
-            ("l3", vec![person(1, ME)]),
-        ];
-        assert_eq!(role(&[list(1, "l1")], &lists), REQ);
-        let lists = [
-            ("l0", vec![list(1, "l1")]),
-            ("l1", vec![list(1, "l2")]),
-            ("l2", vec![list(1, "l3")]),
-            ("l3", vec![person(1, ME)]),
-        ];
-        assert_eq!(role(&[list(1, "l0")], &lists), NEITHER);
+    fn an_unexpandable_list_makes_the_answer_unknown_unless_something_decides() {
+        let lists = [("team@x.com", vec![person(1, "a@x.com")])];
+        assert_eq!(role(&[list(2, "dynamic@x.com")], &lists), UserRole::UNKNOWN);
+        assert_eq!(role(&[list(1, "dynamic@x.com"), person(2, ME)], &lists), UserRole::UNKNOWN,
+            "required is open, so optional can't be confirmed");
+        assert_eq!(role(&[list(2, "dynamic@x.com"), person(1, ME)], &lists), UserRole::REQUIRED);
+        assert_eq!(role(&[list(1, "team@x.com"), list(2, "dynamic@x.com"), person(2, ME)], &lists),
+            UserRole::OPTIONAL);
+    }
+
+    #[test]
+    fn nested_lists_are_followed_to_depth_ten() {
+        assert_eq!(MAX_LIST_DEPTH, 10);
+        assert_eq!(role_in(&[list(1, "l1")], &chain(MAX_LIST_DEPTH)), UserRole::REQUIRED);
+        assert_eq!(role_in(&[list(1, "l1")], &chain(MAX_LIST_DEPTH + 1)), UserRole::UNKNOWN,
+            "past the depth bound the answer is unknown, not 'no'");
     }
 
     #[test]
     fn list_cycles_terminate() {
         let lists = [("a", vec![list(1, "b")]), ("b", vec![list(1, "a")])];
-        assert_eq!(role(&[list(1, "a")], &lists), NEITHER);
+        assert_eq!(role(&[list(1, "a")], &lists), UserRole::NOT_INVITED);
     }
 
     #[test]
-    fn a_list_is_expanded_once_per_cache() {
+    fn a_no_cut_short_by_a_cycle_is_not_cached() {
+        // a -> [b, c(owner)], b -> [a]: searching a visits b first, where the
+        // cycle back to a stops; b must not be remembered as "no", because b
+        // does reach the owner through a -> c.
+        let lists = [
+            ("a", vec![list(1, "b"), list(1, "c")]),
+            ("b", vec![list(1, "a")]),
+            ("c", vec![person(1, ME)]),
+        ];
+        let mut cache = ListCache::default();
+        let mut members = |a: &str| lists.iter().find(|(k, _)| *k == a).map(|(_, m)| m.clone());
+        assert_eq!(list_contains("a", &me(), &mut cache, &mut members), Membership::Yes);
+        assert_eq!(list_contains("b", &me(), &mut cache, &mut members), Membership::Yes);
+    }
+
+    #[test]
+    fn a_list_is_expanded_once_per_call() {
         let mut calls = 0;
         let mut cache = ListCache::default();
         let mut members = |_: &str| {
@@ -294,30 +400,38 @@ mod tests {
         };
         for _ in 0..3 {
             let r = user_role(true, false, &[list(2, "Team@x.com")], &me(), &mut cache, &mut members);
-            assert_eq!(r, OPT);
+            assert_eq!(r, UserRole::OPTIONAL);
         }
         let r = user_role(true, false, &[list(1, "team@X.com")], &me(), &mut cache, &mut members);
-        assert_eq!(r, REQ);
+        assert_eq!(r, UserRole::REQUIRED);
         assert_eq!(calls, 1);
     }
 
     #[test]
-    fn a_direct_match_skips_list_expansion() {
+    fn a_direct_required_match_skips_list_expansion() {
         let a = [person(1, ME), list(1, "team@x.com"), list(2, "team@x.com")];
         let mut cache = ListCache::default();
-        assert_eq!(user_role(true, false, &a, &me(), &mut cache, no_lists), REQ);
+        assert_eq!(user_role(true, false, &a, &me(), &mut cache, no_lists), UserRole::REQUIRED);
     }
 
     #[test]
-    fn member_budget_caps_a_huge_list_without_caching_a_partial_no() {
-        let big: Vec<Attendee> =
-            (0..MAX_LIST_MEMBERS + 10).map(|i| person(1, &format!("p{i}@x.com"))).collect();
-        let mut with_me = big.clone();
-        with_me.push(person(1, ME));
-        let mut cache = ListCache::default();
-        let mut members = |_: &str| Some(with_me.clone());
-        assert!(!list_contains("huge", &me(), &mut cache, &mut members));
-        assert!(!cache.contains.contains_key("huge"));
+    fn the_member_budget_is_shared_by_the_whole_call() {
+        let mut cache = ListCache::with_budget(5);
+        let mut members = |a: &str| {
+            Some((0..3).map(|i| person(1, &format!("{a}-{i}@x.com"))).collect::<Vec<_>>())
+        };
+        // First list: 3 members read, owner not there.
+        assert_eq!(list_contains("a", &me(), &mut cache, &mut members), Membership::No);
+        assert_eq!(cache.members_left(), 2);
+        // Second list: only 2 of 3 can be read, so the answer is unknown and not cached.
+        assert_eq!(list_contains("b", &me(), &mut cache, &mut members), Membership::Unknown);
+        assert_eq!(cache.members_left(), 0);
+        assert!(!cache.contains.contains_key("b"));
+        // Out of budget: nothing more is expanded.
+        let mut never = |_: &str| -> Option<Vec<Attendee>> { panic!("budget is spent") };
+        assert_eq!(list_contains("c", &me(), &mut cache, &mut never), Membership::Unknown);
+        // A cached answer is still free.
+        assert_eq!(list_contains("A", &me(), &mut cache, &mut never), Membership::No);
     }
 
     #[test]

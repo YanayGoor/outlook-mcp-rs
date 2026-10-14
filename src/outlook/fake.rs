@@ -152,7 +152,7 @@ impl FakeOutlookClient {
             location: self.t(""), organizer: self.t(""), all_day: false,
             is_recurring: false, is_meeting: false, is_canceled: false, categories: self.tv(&[]),
             show_as: "busy".into(), my_response: "accepted".into(),
-            user_is_required: true, user_is_optional: false, required_count: 0, optional_count: 0,
+            user_is_required: Some(true), user_is_optional: Some(false), required_count: 0, optional_count: 0,
             required_attendees: self.t(""), optional_attendees: self.t(""),
         }
     }
@@ -361,7 +361,7 @@ impl OutlookClient for FakeOutlookClient {
             "category": q.category, "show_as": q.show_as, "my_response": q.my_response,
             "attendees": q.attendees, "attendee_role": q.attendee_role,
             "meetings_only": q.meetings_only, "all_day": q.all_day,
-            "calendar_of": q.calendar_of, "include_canceled": q.include_canceled,
+            "calendar_of": q.calendar_of, "is_canceled": q.is_canceled,
             "user_role": q.user_role, "count": q.count, "offset": q.offset,
         }))?;
         Ok(vec![self.event_summary(EVENT_ID.into())])

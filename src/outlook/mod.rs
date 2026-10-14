@@ -2,7 +2,7 @@ pub mod attendance;
 pub mod client;
 pub mod com;
 pub mod dates;
-pub mod event_rows;
+pub mod rows;
 pub mod fake;
 pub mod filters;
 pub mod read;
@@ -245,8 +245,8 @@ pub struct EventQuery {
     pub meetings_only: bool,
     pub all_day: Option<bool>,
     pub calendar_of: Option<String>,
-    /// false = skip meetings the organizer canceled (before paging).
-    pub include_canceled: bool,
+    /// Some(true) = only canceled meetings, Some(false) = skip them.
+    pub is_canceled: Option<bool>,
     /// Compute `user_is_required` / `user_is_optional` (a `Recipients` walk
     /// per event). When false both are reported false.
     pub user_role: bool,
@@ -260,7 +260,7 @@ impl Default for EventQuery {
             start_after: None, start_before: None, query: None, category: Vec::new(),
             show_as: Vec::new(), my_response: Vec::new(), attendees: Vec::new(),
             attendee_role: None, meetings_only: false, all_day: None, calendar_of: None,
-            include_canceled: true, user_role: true, count: MAX_EVENT_COUNT, offset: 0,
+            is_canceled: None, user_role: true, count: MAX_EVENT_COUNT, offset: 0,
         }
     }
 }
