@@ -20,6 +20,7 @@ Notable changes to outlook-mcp-rs. The format follows [Keep a Changelog](https:/
 - `get_inline_image` tool: an attachment by Content-ID as a base64 `data:` URI ([#24](https://github.com/adamkopelman/outlook-mcp-rs/pull/24)), with optional `context_lines` (the text before the image) ([#25](https://github.com/adamkopelman/outlook-mcp-rs/pull/25)).
 - A system test for PRs #14–#25, and guidance for testing a batch of PRs ([#26](https://github.com/adamkopelman/outlook-mcp-rs/pull/26)).
 - User-facing skills (`using-outlook-mcp`, `troubleshooting-outlook-mcp`), and README / CONTRIBUTING brought up to date ([#27](https://github.com/adamkopelman/outlook-mcp-rs/pull/27)).
+- This changelog; every PR adds its entry under Unreleased ([#56](https://github.com/adamkopelman/outlook-mcp-rs/pull/56)).
 
 ### Fixed
 
